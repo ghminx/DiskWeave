@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="256" height="256" viewBox="0 0 256 256">
+  <title>DiskWeave_windows_icon_concept</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <path id="아이콘_바탕" data-name="아이콘 바탕" d="M68 15 L188 15 C217.271 15 241 38.729 241 68 L241 188 C241 217.271 217.271 241 188 241 L68 241 C38.729 241 15 217.271 15 188 L15 68 C15 38.729 38.729 15 68 15 Z" fill="#173147" stroke="#487797" stroke-width="2" stroke-miterlimit="10"/>
+    <path id="왼쪽_리본" data-name="왼쪽 리본" d="M56 79 L82 180 L128 116" fill="none" stroke="#75c6ff" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+    <path id="오른쪽_리본" data-name="오른쪽 리본" d="M128 116 L173 180 L200 79" fill="none" stroke="#7adcc5" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
