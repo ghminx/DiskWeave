@@ -74,23 +74,24 @@ impl ScanController {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// 새 완료 결과로 교체된 경우에만 true 반환.
+    pub fn poll(&mut self) -> bool {
         let Some(active) = self.active.as_ref() else {
-            return;
+            return false;
         };
         let result = match active.receiver.try_recv() {
             Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
                 self.status = ScanStatus::Failed("스캔 작업이 예기치 않게 종료됐습니다".to_owned());
                 self.active = None;
-                return;
+                return false;
             }
         };
         let active = self.active.take().expect("수신 중인 스캔 작업");
         if active.cancelled.load(Ordering::Relaxed) {
             self.status = ScanStatus::Cancelled;
-            return;
+            return false;
         }
         match result {
             Ok(result) => {
@@ -100,8 +101,12 @@ impl ScanController {
                     result,
                     elapsed: active.started.elapsed(),
                 });
+                true
             }
-            Err(error) => self.status = ScanStatus::Failed(error.to_string()),
+            Err(error) => {
+                self.status = ScanStatus::Failed(error.to_string());
+                false
+            }
         }
     }
 

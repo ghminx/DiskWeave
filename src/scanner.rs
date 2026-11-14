@@ -1,7 +1,9 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const MAX_REPORTED_ERRORS: usize = 20;
@@ -19,6 +21,14 @@ pub struct ScanIssue {
     pub error: io::Error,
 }
 
+pub struct FileEntry {
+    pub name: OsString,
+    pub parent: usize,
+    pub logical_bytes: u64,
+    /// 수정 시각 조회 실패 시 None 유지.
+    pub modified: Option<SystemTime>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanProgress {
     pub folders_scanned: u64,
@@ -27,7 +37,9 @@ pub struct ScanProgress {
 
 pub struct ScanResult {
     pub folders: Vec<Folder>,
+    pub files: Vec<FileEntry>,
     pub children: Vec<Vec<usize>>,
+    pub file_children: Vec<Vec<usize>>,
     pub error_count: u64,
     pub issues: Vec<ScanIssue>,
     pub skipped_reparse_points: u64,
@@ -122,6 +134,8 @@ pub fn scan_with_progress(
             folder_count: 0,
         }],
         children: Vec::new(),
+        files: Vec::new(),
+        file_children: Vec::new(),
         error_count: 0,
         issues: Vec::new(),
         skipped_reparse_points: 0,
@@ -183,6 +197,12 @@ pub fn scan_with_progress(
                 });
                 pending.push(child_index);
             } else if metadata.is_file() {
+                result.files.push(FileEntry {
+                    name: entry.file_name(),
+                    parent: folder_index,
+                    logical_bytes: metadata.len(),
+                    modified: metadata.modified().ok(),
+                });
                 let folder = &mut result.folders[folder_index];
                 folder.logical_bytes += metadata.len();
                 folder.file_count += 1;
@@ -204,6 +224,18 @@ pub fn scan_with_progress(
     }
 
     result.children = vec![Vec::new(); result.folders.len()];
+    result.file_children = vec![Vec::new(); result.folders.len()];
+    for (index, file) in result.files.iter().enumerate() {
+        result.file_children[file.parent].push(index);
+    }
+    for siblings in &mut result.file_children {
+        siblings.sort_unstable_by(|&a, &b| {
+            result.files[b]
+                .logical_bytes
+                .cmp(&result.files[a].logical_bytes)
+                .then_with(|| result.files[a].name.cmp(&result.files[b].name))
+        });
+    }
     for (index, folder) in result.folders.iter().enumerate().skip(1) {
         result.children[folder.parent.expect("루트 외 폴더의 부모")].push(index);
     }
@@ -226,6 +258,100 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn preserves_non_unicode_names_and_counts_hard_links_by_path() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("diskweave-paths-{}-{stamp}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let units = [0xd800, 0x002e, 0x0062, 0x0069, 0x006e];
+        let name = OsString::from_wide(&units);
+        fs::write(root.join(&name), [1, 2, 3]).unwrap();
+        fs::hard_link(root.join(&name), root.join("link.bin")).unwrap();
+        let result = scan(&root, || false).unwrap();
+        let original = result.files.iter().find(|file| file.name == name).unwrap();
+        assert_eq!(original.name.encode_wide().collect::<Vec<_>>(), units);
+        assert_eq!(
+            (
+                result.files.len(),
+                result.folders[0].file_count,
+                result.folders[0].logical_bytes
+            ),
+            (2, 2, 6)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_files_are_sorted_by_size_then_original_name() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-file-sort-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.bin"), [0]).unwrap();
+        fs::write(root.join("z.bin"), [0; 3]).unwrap();
+        fs::write(root.join("y.bin"), [0; 3]).unwrap();
+        let result = scan(&root, || false).unwrap();
+        let names: Vec<_> = result.file_children[0]
+            .iter()
+            .map(|&id| result.files[id].name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["y.bin", "z.bin", "a.bin"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retains_file_metadata_without_changing_folder_totals() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("diskweave-files-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("zero.bin"), []).unwrap();
+        fs::write(root.join("nested").join("한글.bin"), [1, 2, 3]).unwrap();
+
+        let result = scan(&root, || false).unwrap();
+        let nested = result.folder_index(Path::new("nested")).unwrap();
+        let file = result
+            .files
+            .iter()
+            .find(|file| file.name == "한글.bin")
+            .unwrap();
+        assert_eq!((file.parent, file.logical_bytes), (nested, 3));
+        assert_eq!(
+            file.modified.unwrap(),
+            fs::metadata(root.join("nested").join("한글.bin"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        let zero = &result.files[result.file_children[0][0]];
+        assert_eq!(
+            (&*zero.name, zero.logical_bytes),
+            (std::ffi::OsStr::new("zero.bin"), 0)
+        );
+        assert_eq!(
+            (
+                result.files.len(),
+                result.folders[0].logical_bytes,
+                result.folders[0].file_count
+            ),
+            (2, 3, 2)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn aggregates_nested_folders_and_files() {

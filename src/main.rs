@@ -1,3 +1,4 @@
+mod explorer;
 mod gui;
 mod scan_job;
 mod scanner;
