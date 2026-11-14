@@ -493,7 +493,15 @@ impl DiskWeaveApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("분석 대상");
-            ui.weak("폴더 선택 또는 탐색기에서 폴더 한 개 끌어놓기");
+            let mut detailed = self.scan.details_requested();
+            let option = ui.add_enabled(
+                !self.scan.is_running(),
+                egui::Checkbox::new(&mut detailed, "할당 크기·파일 ID 추가 수집"),
+            );
+            if option.on_hover_text("파일별 추가 조회로 스캔 시간이 늘어날 수 있습니다. 끄면 빠른 논리 스캔을 사용하며, 변경은 다음 스캔부터 적용됩니다. 기본 데이터 스트림 기준·ADS 미수집").changed() {
+                self.input_error = self.scan.configure(detailed).err().map(|e| e.to_string());
+            }
+            ui.weak("폴더 선택 · 폴더 드롭");
         });
         ui.horizontal(|ui| {
             let editable = !self.scan.is_running();
@@ -961,6 +969,7 @@ impl DiskWeaveApp {
                             item,
                             self.search.show_path,
                             self.search.show_modified,
+                            self.search.show_allocated,
                         );
                     });
                     if self.search.selection.contains(row) {
@@ -1008,6 +1017,26 @@ impl DiskWeaveApp {
         });
         if let Some(output) = &self.statistics.output {
             type_chart(ui, &output.stats);
+            for (label, total) in [
+                ("파일 할당 · 경로별", output.stats.allocation),
+                ("중복 제외 참고 합계", output.stats.unique_allocation),
+            ] {
+                let shown = crate::presentation::allocation_display(total);
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(label);
+                    ui.label(shown.text).on_hover_text(shown.exact);
+                });
+            }
+            if output.stats.identity_conflicts > 0 {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "동일 ID의 할당값 불일치 {}개 제외",
+                        output.stats.identity_conflicts
+                    ),
+                );
+            }
+            ui.small("기본 스트림 · ADS 미수집 · 회수 가능 공간 아님");
         } else {
             ui.weak(if self.statistics.running {
                 "집계 중…"
@@ -1048,8 +1077,23 @@ impl DiskWeaveApp {
         ui.add_space(5.0);
         ui.label(format!("논리 크기 {}", info.size.text))
             .on_hover_text(info.size.exact);
+        ui.label(format!("할당 크기 {}", info.allocated.text))
+            .on_hover_text(info.allocated.exact);
         ui.label(format!("부모 대비 {}", info.parent_percentage));
         ui.small(format!("수정 {}", info.modified));
+        ui.small(format!("생성 {}", info.created));
+        ui.small(format!("속성 {}", info.attributes));
+        if matches!(item, Item::File(_)) {
+            ui.small(format!("Hard Link {}", info.links));
+            if let Item::File(id) = item {
+                if scan.files[id].extra.links.value().is_some_and(|n| n > 1) {
+                    ui.small("같은 파일에 여러 이름이 있습니다. 경로별 합계에 중복될 수 있습니다");
+                }
+            }
+            ui.collapsing("OS 파일 ID", |ui| {
+                ui.add(egui::Label::new(&info.identity).wrap());
+            });
+        }
         if let (Some(files), Some(folders)) = (info.files, info.folders) {
             ui.label(format!("파일 {files}개 · 하위 폴더 {folders}개"));
         }
@@ -1079,7 +1123,7 @@ impl DiskWeaveApp {
         if let Some(action) = action {
             self.start_open(OpenRequest::for_item(&scan, item, action));
         }
-        ui.small("논리 크기 기준 · Hard Link는 경로별 집계");
+        ui.small("크기 필터·Treemap: 논리 크기 기준 · ADS 미수집");
     }
     fn map_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1189,6 +1233,33 @@ impl eframe::App for DiskWeaveApp {
                     let errors: u64 = sources.iter().map(|s| s.scan.error_count).sum();
                     let skipped: u64 = sources.iter().map(|s| s.scan.skipped_reparse_points).sum();
                     ui.small(format!("오류 {errors} · Reparse 제외 {skipped}"));
+                    if !sources.is_empty() {
+                        let detailed = sources.iter().filter(|s| s.scan.detailed).count();
+                        ui.small(if detailed == sources.len() {
+                            "현재 결과: 상세 수집"
+                        } else if detailed == 0 {
+                            "현재 결과: 빠른 스캔"
+                        } else {
+                            "현재 결과: 수집 방식 혼합"
+                        });
+                    }
+                    let extra_errors: u64 =
+                        sources.iter().map(|s| s.scan.metadata_error_count).sum();
+                    if extra_errors > 0 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            format!("추가 조회 문제 {extra_errors}개"),
+                        )
+                        .on_hover_ui(|ui| {
+                            for issue in sources
+                                .iter()
+                                .flat_map(|s| s.scan.metadata_issues.iter())
+                                .take(5)
+                            {
+                                ui.label(format!("{}: {}", issue.path.display(), issue.error));
+                            }
+                        });
+                    }
                     if let Some(results) = self
                         .search
                         .job

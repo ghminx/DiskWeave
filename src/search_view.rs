@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub struct SearchView {
+    pub show_allocated: bool,
     pub show_path: bool,
     pub show_modified: bool,
     pub widths: crate::presentation::ColumnWidths,
@@ -193,6 +194,7 @@ impl SearchView {
 
     pub fn column_controls(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("열 표시", |ui| {
+            ui.checkbox(&mut self.show_allocated, "할당 크기");
             ui.checkbox(&mut self.show_path, "전체 경로");
             ui.checkbox(&mut self.show_modified, "수정 시각");
         });
@@ -206,6 +208,7 @@ impl SearchView {
                     for (column, field, label) in [
                         (0, Some(SortField::Name), "이름"),
                         (2, Some(SortField::Size), "논리 크기"),
+                        (7, None, "할당 크기"),
                         (4, None, "부모 대비"),
                         (5, None, "파일"),
                         (6, None, "폴더"),
@@ -214,7 +217,10 @@ impl SearchView {
                     ]
                     .into_iter()
                     {
-                        if column == 1 && !self.show_path || column == 3 && !self.show_modified {
+                        if column == 1 && !self.show_path
+                            || column == 3 && !self.show_modified
+                            || column == 7 && !self.show_allocated
+                        {
                             continue;
                         }
                         let suffix = if Some(self.input.sort) == field {

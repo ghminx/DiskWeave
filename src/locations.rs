@@ -37,6 +37,7 @@ impl Snapshot {
 }
 #[derive(Default)]
 pub struct Locations {
+    settings: crate::metadata::ScanSettings,
     pub entries: Vec<Location>,
     next_id: u64,
     selected: Option<u64>,
@@ -81,6 +82,19 @@ fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
 }
 
 impl Locations {
+    pub fn details_requested(&self) -> bool {
+        self.settings.detailed
+    }
+    pub fn configure(&mut self, detailed: bool) -> io::Result<()> {
+        if self.is_running() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "수집 중에는 방식을 변경할 수 없습니다",
+            ));
+        }
+        self.settings.detailed = detailed;
+        Ok(())
+    }
     pub fn add(&mut self, path: &Path) -> io::Result<u64> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
@@ -209,6 +223,10 @@ impl Locations {
                 .expect("등록된 대기 위치");
             entry
                 .scan
+                .configure(self.settings.detailed)
+                .expect("대기 중인 위치의 수집 설정");
+            entry
+                .scan
                 .start(entry.path.clone())
                 .expect("동시에 하나의 스캔만 실행");
             self.active = Some(id);
@@ -294,6 +312,55 @@ impl Locations {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn queued_locations_keep_one_metadata_mode_until_the_batch_finishes() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-location-options-{}", std::process::id()));
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("data"), [0; 3]).unwrap();
+        }
+        let mut locations = Locations::default();
+        assert!(locations.details_requested());
+        let ids = [
+            locations.add(&root.join("a")).unwrap(),
+            locations.add(&root.join("b")).unwrap(),
+        ];
+        locations.configure(false).unwrap();
+        locations.start_selected(&ids).unwrap();
+        assert!(locations.configure(true).is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() && Instant::now() < deadline {
+            locations.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!locations.is_running());
+        for id in ids {
+            assert!(
+                !locations
+                    .get(id)
+                    .unwrap()
+                    .scan
+                    .completed()
+                    .unwrap()
+                    .result
+                    .detailed
+            );
+        }
+        locations.configure(true).unwrap();
+        locations.start_selected(&ids).unwrap();
+        while locations.is_running() && Instant::now() < deadline {
+            locations.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!locations.is_running());
+        for id in ids {
+            let result = &locations.get(id).unwrap().scan.completed().unwrap().result;
+            assert!(result.detailed);
+            assert_eq!(result.folders[0].allocation.known, 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn registration_rejects_overlap_and_removal_preserves_original_files() {

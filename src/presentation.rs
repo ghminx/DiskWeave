@@ -22,6 +22,65 @@ pub struct SizeDisplay {
     pub text: String,
     pub exact: String,
 }
+pub fn missing_display(missing: crate::metadata::Missing) -> &'static str {
+    match missing {
+        crate::metadata::Missing::NotCollected => "미수집",
+        crate::metadata::Missing::Unsupported => "미지원",
+        crate::metadata::Missing::Failed => "조회 실패",
+    }
+}
+pub fn field_display<T: std::fmt::Display>(value: crate::metadata::Field<T>) -> String {
+    match value {
+        crate::metadata::Field::Value(v) => v.to_string(),
+        crate::metadata::Field::Missing(reason) => missing_display(reason).into(),
+    }
+}
+pub fn allocation_display(total: crate::metadata::Allocation) -> SizeDisplay {
+    let size = SizeDisplay::new(total.bytes);
+    let text = if total.missing() == 0 {
+        size.text
+    } else if total.known > 0 {
+        format!("{} (일부)", size.text)
+    } else if total.not_collected > 0 && total.unsupported == 0 && total.failed == 0 {
+        "미수집".into()
+    } else if total.unsupported > 0 && total.not_collected == 0 && total.failed == 0 {
+        "미지원".into()
+    } else if total.failed > 0 && total.unsupported == 0 && total.not_collected == 0 {
+        "조회 실패".into()
+    } else {
+        "확인 불가".into()
+    };
+    SizeDisplay {
+        text,
+        exact: format!(
+            "{} B 확인분 · 확인 {} · 미수집 {} · 미지원 {} · 조회 실패 {} · 기본 데이터 스트림 기준, ADS 미수집",
+            total.bytes, total.known, total.not_collected, total.unsupported, total.failed
+        ),
+    }
+}
+pub fn attributes_display(attributes: u32) -> String {
+    let labels: Vec<_> = [
+        (1, "읽기 전용"),
+        (2, "숨김"),
+        (4, "시스템"),
+        (0x10, "폴더"),
+        (0x20, "보관"),
+        (0x200, "Sparse"),
+        (0x800, "압축"),
+        (0x4000, "암호화"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, label)| (attributes & bit != 0).then_some(label))
+    .collect();
+    format!(
+        "{} (0x{attributes:08X})",
+        if labels.is_empty() {
+            "일반".into()
+        } else {
+            labels.join(" · ")
+        }
+    )
+}
 impl SizeDisplay {
     pub fn new(bytes: u64) -> Self {
         let units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -55,12 +114,12 @@ pub fn percentage(bytes: u64, parent: u64) -> String {
 
 #[derive(Clone)]
 pub struct ColumnWidths {
-    values: [f32; 7],
+    values: [f32; 8],
 }
 impl Default for ColumnWidths {
     fn default() -> Self {
         Self {
-            values: [180.0, 260.0, 120.0, 145.0, 85.0, 80.0, 80.0],
+            values: [180.0, 260.0, 120.0, 145.0, 85.0, 80.0, 80.0, 130.0],
         }
     }
 }
@@ -72,6 +131,7 @@ impl ColumnWidths {
         item: Item,
         path: bool,
         modified: bool,
+        allocated: bool,
     ) {
         use eframe::egui;
         let info = detail(scan, item);
@@ -80,6 +140,13 @@ impl ColumnWidths {
             egui::Label::new(info.size.text).truncate(),
         )
         .on_hover_text(info.size.exact);
+        if allocated {
+            ui.add_sized(
+                [self.get(7), 26.0],
+                egui::Label::new(info.allocated.text).truncate(),
+            )
+            .on_hover_text(info.allocated.exact);
+        }
         ui.add_sized(
             [self.get(4), 26.0],
             egui::Label::new(info.parent_percentage),
@@ -114,6 +181,11 @@ impl ColumnWidths {
 }
 
 pub struct Detail {
+    pub allocated: SizeDisplay,
+    pub created: String,
+    pub attributes: String,
+    pub identity: String,
+    pub links: String,
     pub path: std::path::PathBuf,
     pub kind: &'static str,
     pub size: SizeDisplay,
@@ -123,6 +195,32 @@ pub struct Detail {
     pub parent_percentage: String,
 }
 pub fn detail(scan: &ScanResult, item: Item) -> Detail {
+    let (allocated, created, attributes, identity, links) = match item {
+        Item::Folder(id) => {
+            let folder = &scan.folders[id];
+            (
+                folder.allocation,
+                folder.created,
+                folder.attributes,
+                "파일에만 제공".into(),
+                "—".into(),
+            )
+        }
+        Item::File(id) => {
+            let file = &scan.files[id];
+            let mut allocated = crate::metadata::Allocation::default();
+            allocated
+                .add(file.extra.allocation)
+                .expect("단일 파일 할당 크기");
+            (
+                allocated,
+                file.created,
+                file.attributes,
+                field_display(file.extra.identity),
+                field_display(file.extra.links),
+            )
+        }
+    };
     let (kind, files, folders, parent) = match item {
         Item::File(id) => ("파일", None, None, Some(scan.files[id].parent)),
         Item::Folder(id) => (
@@ -134,6 +232,11 @@ pub fn detail(scan: &ScanResult, item: Item) -> Detail {
     };
     let bytes = crate::search::item_bytes(scan, item);
     Detail {
+        allocated: allocation_display(allocated),
+        created: crate::local_date::display(created),
+        attributes: attributes_display(attributes),
+        identity,
+        links,
         path: crate::search::item_path(scan, item),
         kind,
         size: SizeDisplay::new(bytes),
@@ -149,6 +252,25 @@ pub fn detail(scan: &ScanResult, item: Item) -> Detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn allocation_display_distinguishes_zero_uncollected_unsupported_and_partial_totals() {
+        use crate::metadata::{Allocation, Field, Missing};
+        assert_eq!(allocation_display(Allocation::default()).text, "0 B");
+        let mut total = Allocation::default();
+        total.add(Field::Missing(Missing::NotCollected)).unwrap();
+        assert_eq!(allocation_display(total).text, "미수집");
+        let mut total = Allocation::default();
+        total.add(Field::Missing(Missing::Unsupported)).unwrap();
+        assert_eq!(allocation_display(total).text, "미지원");
+        total.add(Field::Value(4096)).unwrap();
+        let shown = allocation_display(total);
+        assert_eq!(shown.text, "4.0 KiB (일부)");
+        assert!(shown.exact.contains("4096 B") && shown.exact.contains("미지원 1"));
+        assert_eq!(
+            attributes_display(0xA03),
+            "읽기 전용 · 숨김 · Sparse · 압축 (0x00000A03)"
+        );
+    }
     #[test]
     fn details_distinguish_recursive_folder_counts_and_unknown_file_time() {
         let root = std::env::temp_dir().join(format!("diskweave-details-{}", std::process::id()));

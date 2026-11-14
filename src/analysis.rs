@@ -1,6 +1,7 @@
 use crate::explorer::Item;
 use crate::global_search::Hit;
 use crate::locations::Snapshot;
+use crate::metadata::{Allocation, Field, Identity, Missing};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
@@ -16,6 +17,9 @@ pub struct ExtensionTotal {
     pub files: u64,
 }
 pub struct Statistics {
+    pub allocation: Allocation,
+    pub unique_allocation: Allocation,
+    pub identity_conflicts: usize,
     pub bytes: u64,
     pub files: u64,
     pub extensions: Vec<ExtensionTotal>,
@@ -52,11 +56,36 @@ pub fn compute(
     let mut files = 0u64;
     let mut groups: HashMap<String, (u64, u64)> = HashMap::new();
     let mut heap = BinaryHeap::new();
+    let mut allocation = Allocation::default();
+    let mut unique_allocation = Allocation::default();
+    let mut unique: HashMap<Identity, (Field<u64>, bool)> = HashMap::new();
     let mut add = |source: usize, id: usize| -> io::Result<()> {
         if cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "통계 취소"));
         }
         let file = &sources[source].scan.files[id];
+        allocation.add(file.extra.allocation)?;
+        match file.extra.identity {
+            Field::Value(identity) => {
+                unique
+                    .entry(identity)
+                    .and_modify(|old| {
+                        if !old.1 {
+                            match (old.0, file.extra.allocation) {
+                                (Field::Value(a), Field::Value(b)) if a != b => {
+                                    *old = (Field::Missing(Missing::Failed), true);
+                                }
+                                (Field::Missing(_), Field::Value(value)) => {
+                                    old.0 = Field::Value(value)
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                    .or_insert((file.extra.allocation, false));
+            }
+            Field::Missing(reason) => unique_allocation.add(Field::Missing(reason))?,
+        }
         bytes = bytes.checked_add(file.logical_bytes).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -123,6 +152,16 @@ pub fn compute(
             }
         }
     }
+    let mut identity_conflicts = 0;
+    for (value, conflict) in unique.into_values() {
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "통계 취소"));
+        }
+        if conflict {
+            identity_conflicts += 1;
+        }
+        unique_allocation.add(value)?;
+    }
     let mut extensions: Vec<_> = groups
         .into_iter()
         .map(|(name, (bytes, files))| ExtensionTotal { name, bytes, files })
@@ -144,6 +183,9 @@ pub fn compute(
             })
     });
     Ok(Statistics {
+        allocation,
+        unique_allocation,
+        identity_conflicts,
         bytes,
         files,
         extensions,
@@ -155,6 +197,140 @@ pub fn compute(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn allocation_conflicts_and_missing_ids_do_not_become_complete_unique_totals() {
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-allocation-conflict-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("data"), [0; 3]).unwrap();
+        std::fs::hard_link(root.join("data"), root.join("alias")).unwrap();
+        let scan = crate::scanner::scan_with_probe(
+            &root,
+            true,
+            || false,
+            |_| {},
+            |path| {
+                let mut report = crate::metadata::read(path);
+                if path.file_name().unwrap() == "alias" {
+                    report.values.allocation =
+                        Field::Value(report.values.allocation.value().unwrap() + 4096);
+                }
+                report
+            },
+        )
+        .unwrap();
+        let sources = vec![crate::locations::Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(scan),
+        }];
+        let stats = compute(&sources, &StatsScope::All, || false).unwrap();
+        assert_eq!(
+            (
+                stats.identity_conflicts,
+                stats.unique_allocation.bytes,
+                stats.unique_allocation.failed
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(stats.bytes, 6);
+        let basic = vec![crate::locations::Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+        }];
+        let stats = compute(&basic, &StatsScope::All, || false).unwrap();
+        assert_eq!(
+            (
+                stats.allocation.not_collected,
+                stats.unique_allocation.not_collected
+            ),
+            (2, 2)
+        );
+        let stats = compute(
+            &sources,
+            &StatsScope::Matches(vec![
+                Hit {
+                    source: 0,
+                    item: Item::File(0),
+                },
+                Hit {
+                    source: 0,
+                    item: Item::File(0),
+                },
+            ]),
+            || false,
+        )
+        .unwrap();
+        assert_eq!((stats.files, stats.unique_allocation.known), (1, 1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn allocation_totals_distinguish_paths_unique_objects_and_nonadditive_child_scopes() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-allocation-stats-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/data.bin"), vec![3; 8193]).unwrap();
+        std::fs::hard_link(root.join("a/data.bin"), root.join("b/alias.bin")).unwrap();
+        let scan =
+            Arc::new(crate::scanner::scan_with_options(&root, true, || false, |_| {}).unwrap());
+        let allocation = scan.files[0].extra.allocation.value().unwrap();
+        let source = crate::locations::Snapshot {
+            id: 1,
+            generation: 1,
+            scan,
+        };
+        let all = compute(std::slice::from_ref(&source), &StatsScope::All, || false).unwrap();
+        assert_eq!(all.bytes, 16386);
+        assert_eq!(all.allocation.bytes, allocation * 2);
+        assert_eq!(
+            (
+                all.unique_allocation.bytes,
+                all.unique_allocation.known,
+                all.unique_allocation.missing()
+            ),
+            (allocation, 1, 0)
+        );
+        let a = source.scan.folder_index(std::path::Path::new("a")).unwrap();
+        let b = source.scan.folder_index(std::path::Path::new("b")).unwrap();
+        let first = compute(
+            std::slice::from_ref(&source),
+            &StatsScope::Subtree(a),
+            || false,
+        )
+        .unwrap();
+        let second = compute(
+            std::slice::from_ref(&source),
+            &StatsScope::Subtree(b),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            first.unique_allocation.bytes + second.unique_allocation.bytes,
+            allocation * 2
+        );
+        let sources: Vec<_> = ["a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| crate::locations::Snapshot {
+                id: i as u64 + 10,
+                generation: 1,
+                scan: Arc::new(
+                    crate::scanner::scan_with_options(&root.join(p), true, || false, |_| {})
+                        .unwrap(),
+                ),
+            })
+            .collect();
+        let cross = compute(&sources, &StatsScope::All, || false).unwrap();
+        assert_eq!(
+            (cross.allocation.bytes, cross.unique_allocation.bytes),
+            (allocation * 2, allocation)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn cancelling_folder_only_matches_stops_without_a_file_to_aggregate() {
         let calls = std::cell::Cell::new(0);

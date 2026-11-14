@@ -315,6 +315,7 @@ impl LocationsView {
                                 hit.item,
                                 search.show_path,
                                 search.show_modified,
+                                search.show_allocated,
                             );
                         });
                         if self.selection.contains(row) {

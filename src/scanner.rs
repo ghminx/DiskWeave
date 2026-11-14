@@ -9,6 +9,9 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const MAX_REPORTED_ERRORS: usize = 20;
 
 pub struct Folder {
+    pub allocation: crate::metadata::Allocation,
+    pub created: Option<SystemTime>,
+    pub attributes: u32,
     pub path: PathBuf,
     pub parent: Option<usize>,
     pub logical_bytes: u64,
@@ -23,6 +26,9 @@ pub struct ScanIssue {
 }
 
 pub struct FileEntry {
+    pub extra: crate::metadata::Extra,
+    pub created: Option<SystemTime>,
+    pub attributes: u32,
     pub name: OsString,
     pub parent: usize,
     pub logical_bytes: u64,
@@ -37,6 +43,9 @@ pub struct ScanProgress {
 }
 
 pub struct ScanResult {
+    pub detailed: bool,
+    pub metadata_error_count: u64,
+    pub metadata_issues: Vec<ScanIssue>,
     pub folders: Vec<Folder>,
     pub files: Vec<FileEntry>,
     pub children: Vec<Vec<usize>>,
@@ -116,7 +125,30 @@ pub fn scan(root: &Path, cancelled: impl Fn() -> bool) -> io::Result<ScanResult>
 pub fn scan_with_progress(
     root: &Path,
     cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanResult> {
+    scan_with_options(root, false, cancelled, on_progress)
+}
+pub fn scan_with_options(
+    root: &Path,
+    detailed: bool,
+    cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanResult> {
+    scan_with_probe(
+        root,
+        detailed,
+        cancelled,
+        on_progress,
+        crate::metadata::read,
+    )
+}
+pub fn scan_with_probe(
+    root: &Path,
+    detailed: bool,
+    cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(ScanProgress),
+    mut probe: impl FnMut(&Path) -> crate::metadata::Report,
 ) -> io::Result<ScanResult> {
     let metadata = fs::symlink_metadata(root)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
@@ -127,7 +159,13 @@ pub fn scan_with_progress(
     }
 
     let mut result = ScanResult {
+        detailed,
+        metadata_error_count: 0,
+        metadata_issues: Vec::new(),
         folders: vec![Folder {
+            allocation: Default::default(),
+            created: metadata.created().ok(),
+            attributes: metadata.file_attributes(),
             path: root.to_path_buf(),
             parent: None,
             logical_bytes: 0,
@@ -191,6 +229,9 @@ pub fn scan_with_progress(
             } else if metadata.is_dir() {
                 let child_index = result.folders.len();
                 result.folders.push(Folder {
+                    allocation: Default::default(),
+                    created: metadata.created().ok(),
+                    attributes: metadata.file_attributes(),
                     path: entry_path,
                     parent: Some(folder_index),
                     logical_bytes: 0,
@@ -200,13 +241,32 @@ pub fn scan_with_progress(
                 });
                 pending.push(child_index);
             } else if metadata.is_file() {
+                let extra = if detailed {
+                    let report = probe(&entry_path);
+                    if let Some(error) = report.issue {
+                        result.metadata_error_count += 1;
+                        if result.metadata_issues.len() < MAX_REPORTED_ERRORS {
+                            result.metadata_issues.push(ScanIssue {
+                                path: entry_path.clone(),
+                                error,
+                            });
+                        }
+                    }
+                    report.values
+                } else {
+                    Default::default()
+                };
                 result.files.push(FileEntry {
+                    extra,
+                    created: metadata.created().ok(),
+                    attributes: metadata.file_attributes(),
                     name: entry.file_name(),
                     parent: folder_index,
                     logical_bytes: metadata.len(),
                     modified: metadata.modified().ok(),
                 });
                 let folder = &mut result.folders[folder_index];
+                folder.allocation.add(extra.allocation)?;
                 folder.logical_bytes += metadata.len();
                 folder.file_count += 1;
                 progress.files_scanned += 1;
@@ -221,6 +281,7 @@ pub fn scan_with_progress(
         let (parents, child_and_later) = result.folders.split_at_mut(child_index);
         let child = &child_and_later[0];
         let parent = &mut parents[child.parent.expect("루트 외 폴더의 부모")];
+        parent.allocation.merge(child.allocation)?;
         parent.logical_bytes += child.logical_bytes;
         parent.file_count += child.file_count;
         parent.folder_count += child.folder_count + 1;
@@ -261,6 +322,123 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn extra_lookup_failures_keep_logical_records_and_distinguish_uncollected_or_unsupported() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-extra-errors-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for name in ["normal", "failed", "unsupported"] {
+            fs::write(root.join(name), [0; 3]).unwrap();
+        }
+        let scan = scan_with_probe(
+            &root,
+            true,
+            || false,
+            |_| {},
+            |path| match path.file_name().unwrap().to_str().unwrap() {
+                "failed" => crate::metadata::Report::unavailable(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "시험용 추가 조회 실패",
+                )),
+                "unsupported" => {
+                    crate::metadata::Report::unavailable(io::Error::from_raw_os_error(50))
+                }
+                _ => crate::metadata::read(path),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                scan.folders[0].logical_bytes,
+                scan.folders[0].file_count,
+                scan.error_count,
+                scan.metadata_error_count
+            ),
+            (9, 3, 0, 2)
+        );
+        let allocation = scan.folders[0].allocation;
+        assert_eq!(
+            (
+                allocation.known,
+                allocation.failed,
+                allocation.unsupported,
+                allocation.not_collected
+            ),
+            (1, 1, 1, 0)
+        );
+        let fast = scan_with_probe(
+            &root,
+            false,
+            || false,
+            |_| {},
+            |_| panic!("빠른 스캔에서 추가 조회 금지"),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                fast.folders[0].logical_bytes,
+                fast.folders[0].allocation.not_collected
+            ),
+            (9, 3)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn detailed_scan_retains_basic_totals_and_collects_creation_attributes_and_allocation() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-detailed-scan-{}", std::process::id()));
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("child/data.bin"), [1, 2, 3]).unwrap();
+        fs::hard_link(root.join("child/data.bin"), root.join("alias.bin")).unwrap();
+        fs::write(root.join("empty"), []).unwrap();
+        let basic = scan(&root, || false).unwrap();
+        assert_eq!(basic.folders[0].allocation.not_collected, 3);
+        let detailed = scan_with_options(&root, true, || false, |_| {}).unwrap();
+        assert_eq!(
+            (
+                detailed.folders[0].logical_bytes,
+                detailed.folders[0].file_count,
+                detailed.folders[0].folder_count
+            ),
+            (6, 3, 1)
+        );
+        assert!(detailed.detailed);
+        assert_eq!(detailed.metadata_error_count, 0);
+        let file = detailed
+            .files
+            .iter()
+            .find(|f| f.name == "data.bin")
+            .unwrap();
+        assert_eq!(
+            file.created,
+            fs::metadata(root.join("child/data.bin"))
+                .unwrap()
+                .created()
+                .ok()
+        );
+        assert_eq!(
+            file.attributes,
+            fs::metadata(root.join("child/data.bin"))
+                .unwrap()
+                .file_attributes()
+        );
+        assert_eq!(file.extra.links.value(), Some(2));
+        assert_eq!(detailed.folders[0].allocation.known, 3);
+        assert_eq!(detailed.folders[0].allocation.missing(), 0);
+        assert_eq!(
+            detailed.folders[0].allocation.bytes,
+            detailed
+                .files
+                .iter()
+                .map(|f| f.extra.allocation.value().unwrap())
+                .sum::<u64>()
+        );
+        assert_eq!(
+            detailed.folders[0].created,
+            fs::metadata(&root).unwrap().created().ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn preserves_non_unicode_names_and_counts_hard_links_by_path() {
@@ -279,6 +457,19 @@ mod tests {
         let result = scan(&root, || false).unwrap();
         let original = result.files.iter().find(|file| file.name == name).unwrap();
         assert_eq!(original.name.encode_wide().collect::<Vec<_>>(), units);
+        let detailed = scan_with_options(&root, true, || false, |_| {}).unwrap();
+        let original_detail = detailed.files.iter().find(|f| f.name == name).unwrap();
+        let alias = detailed
+            .files
+            .iter()
+            .find(|f| f.name == "link.bin")
+            .unwrap();
+        assert!(original_detail.extra.identity.value().is_some());
+        assert_eq!(
+            original_detail.extra.identity.value(),
+            alias.extra.identity.value()
+        );
+        assert_eq!(original_detail.extra.links.value(), Some(2));
         assert_eq!(
             (
                 result.files.len(),

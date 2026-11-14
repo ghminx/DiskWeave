@@ -10,6 +10,7 @@ mod local_date;
 mod locations;
 mod locations_ui;
 mod map_job;
+mod metadata;
 mod presentation;
 mod scan_job;
 mod scanner;

@@ -32,12 +32,23 @@ struct ActiveScan {
 
 #[derive(Default)]
 pub struct ScanController {
+    settings: crate::metadata::ScanSettings,
     active: Option<ActiveScan>,
     completed: Option<CompletedScan>,
     status: ScanStatus,
 }
 
 impl ScanController {
+    pub fn details_requested(&self) -> bool {
+        self.settings.detailed
+    }
+    pub fn configure(&mut self, detailed: bool) -> Result<(), &'static str> {
+        if self.is_running() {
+            return Err("스캔 중에는 수집 방식을 변경할 수 없습니다");
+        }
+        self.settings.detailed = detailed;
+        Ok(())
+    }
     pub fn start(&mut self, path: PathBuf) -> Result<(), &'static str> {
         if self.active.is_some() {
             return Err("스캔이 진행 중입니다");
@@ -48,9 +59,11 @@ impl ScanController {
         let worker_cancelled = Arc::clone(&cancelled);
         let progress = Arc::new(Mutex::new(ScanProgress::default()));
         let worker_progress = Arc::clone(&progress);
+        let detailed = self.details_requested();
         std::thread::spawn(move || {
-            let result = scanner::scan_with_progress(
+            let result = scanner::scan_with_options(
                 &worker_path,
+                detailed,
                 || worker_cancelled.load(Ordering::Relaxed),
                 |update| *worker_progress.lock().unwrap() = update,
             );
@@ -138,6 +151,41 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn metadata_setting_applies_to_next_scan_and_cancel_preserves_previous_mode() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-scan-settings-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data"), [0; 3]).unwrap();
+        let mut controller = ScanController::default();
+        assert!(controller.details_requested());
+        controller.configure(false).unwrap();
+        controller.start(root.clone()).unwrap();
+        assert!(controller.configure(true).is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.is_running() && Instant::now() < deadline {
+            controller.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!controller.completed().unwrap().result.detailed);
+        assert_eq!(
+            controller.completed().unwrap().result.folders[0]
+                .allocation
+                .not_collected,
+            1
+        );
+        controller.configure(true).unwrap();
+        controller.start(root.clone()).unwrap();
+        controller.cancel();
+        while controller.is_running() && Instant::now() < deadline {
+            controller.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.details_requested());
+        assert!(matches!(controller.status(), ScanStatus::Cancelled));
+        assert!(!controller.completed().unwrap().result.detailed);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn completed_scan_becomes_available() {
