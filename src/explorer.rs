@@ -43,6 +43,18 @@ impl Explorer {
     pub fn select(&mut self, item: Item) {
         self.selected = item;
     }
+    pub fn reveal(&mut self, result: &ScanResult, item: Item) {
+        let mut parent = match item {
+            Item::Folder(id) => result.folders[id].parent,
+            Item::File(id) => Some(result.files[id].parent),
+        };
+        while let Some(id) = parent {
+            self.expanded.insert(id);
+            parent = result.folders[id].parent;
+        }
+        self.selected = item;
+        self.rebuild_tree(result);
+    }
 
     pub fn visible_tree(&self) -> &[(usize, usize)] {
         &self.visible_tree

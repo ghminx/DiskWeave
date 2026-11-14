@@ -8,6 +8,10 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub struct SearchView {
+    pub show_path: bool,
+    pub show_modified: bool,
+    pub widths: crate::presentation::ColumnWidths,
+    pub horizontal_offset: f32,
     pub input: SearchInput,
     pub whole_scan: bool,
     pub selection: ListSelection,
@@ -19,6 +23,9 @@ pub struct SearchView {
 }
 
 impl SearchView {
+    pub fn focus_item(&mut self, item: Item) {
+        self.focus_after_analysis = Some(item);
+    }
     pub fn analyze(
         &mut self,
         scan: &Arc<ScanResult>,
@@ -49,9 +56,12 @@ impl SearchView {
         true
     }
     pub fn reset(&mut self) {
-        self.job.cancel();
+        self.invalidate();
         self.input = SearchInput::default();
         self.whole_scan = false;
+    }
+    pub fn invalidate(&mut self) {
+        self.job.cancel();
         self.selection.clear();
         self.last_request = None;
         self.focus_after_analysis = None;
@@ -90,101 +100,168 @@ impl SearchView {
         }
     }
 
-    pub fn controls(&mut self, ui: &mut egui::Ui) {
+    pub fn controls(&mut self, ui: &mut egui::Ui, global: bool) {
         self.editing = false;
+        if ui.available_width() < 620.0 {
+            ui.horizontal(|ui| {
+                self.editing |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.input.text)
+                            .id(egui::Id::unique("search_query"))
+                            .hint_text("파일·폴더 검색")
+                            .desired_width((ui.available_width() - 78.0).max(80.0)),
+                    )
+                    .has_focus();
+                ui.menu_button("검색 조건", |ui| {
+                    ui.set_min_width(340.0);
+                    self.options(ui, global);
+                    self.filter_fields(ui);
+                });
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                self.editing |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.input.text)
+                            .id(egui::Id::unique("search_query"))
+                            .hint_text("파일·폴더 검색")
+                            .desired_width(230.0),
+                    )
+                    .has_focus();
+                self.options(ui, global);
+            });
+            ui.collapsing("검색 필터", |ui| self.filter_fields(ui));
+        }
+    }
+    fn options(&mut self, ui: &mut egui::Ui, global: bool) {
         ui.horizontal_wrapped(|ui| {
-            self.editing |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.input.text)
-                        .id(egui::Id::unique("search_query"))
-                        .hint_text("파일·폴더 검색")
-                        .desired_width(240.0),
-                )
-                .has_focus();
             ui.selectable_value(&mut self.input.mode, SearchMode::Name, "이름");
             ui.selectable_value(&mut self.input.mode, SearchMode::Path, "전체 경로");
-            ui.checkbox(&mut self.whole_scan, "이번 스캔 전체");
+            if !global {
+                ui.checkbox(&mut self.whole_scan, "현재 위치 전체");
+            }
             ui.checkbox(&mut self.input.recursive, "하위 포함");
             if ui.button("검색·필터 해제").clicked() {
                 self.input = SearchInput::default();
                 self.whole_scan = false;
             }
         });
-        ui.collapsing("검색 필터", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.input.kind, EntryKind::All, "전체");
-                ui.selectable_value(&mut self.input.kind, EntryKind::Files, "파일");
-                ui.selectable_value(&mut self.input.kind, EntryKind::Folders, "폴더");
-                ui.label("확장자");
-                self.editing |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.input.extensions)
-                            .desired_width(150.0)
-                            .hint_text("npy;nii.gz"),
-                    )
-                    .has_focus();
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("최소 Byte");
-                self.editing |= ui
-                    .add(egui::TextEdit::singleline(&mut self.input.min_size).desired_width(100.0))
-                    .has_focus();
-                ui.label("최대 Byte");
-                self.editing |= ui
-                    .add(egui::TextEdit::singleline(&mut self.input.max_size).desired_width(100.0))
-                    .has_focus();
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("수정일: 로컬 날짜 양끝 포함");
-                self.editing |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.input.from_date)
-                            .desired_width(110.0)
-                            .hint_text("YYYY-MM-DD"),
-                    )
-                    .has_focus();
-                ui.label("~");
-                self.editing |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.input.to_date)
-                            .desired_width(110.0)
-                            .hint_text("YYYY-MM-DD"),
-                    )
-                    .has_focus();
-            });
+    }
+    fn filter_fields(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.input.kind, EntryKind::All, "전체");
+            ui.selectable_value(&mut self.input.kind, EntryKind::Files, "파일");
+            ui.selectable_value(&mut self.input.kind, EntryKind::Folders, "폴더");
+            ui.label("확장자");
+            self.editing |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.input.extensions)
+                        .desired_width(150.0)
+                        .hint_text("npy;nii.gz"),
+                )
+                .has_focus();
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("최소 Byte");
+            self.editing |= ui
+                .add(egui::TextEdit::singleline(&mut self.input.min_size).desired_width(100.0))
+                .has_focus();
+            ui.label("최대 Byte");
+            self.editing |= ui
+                .add(egui::TextEdit::singleline(&mut self.input.max_size).desired_width(100.0))
+                .has_focus();
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("수정일: 로컬 날짜 양끝 포함");
+            self.editing |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.input.from_date)
+                        .desired_width(110.0)
+                        .hint_text("YYYY-MM-DD"),
+                )
+                .has_focus();
+            ui.label("~");
+            self.editing |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.input.to_date)
+                        .desired_width(110.0)
+                        .hint_text("YYYY-MM-DD"),
+                )
+                .has_focus();
         });
     }
 
-    pub fn headers(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for (field, label, width) in [
-                (SortField::Name, "이름", 200.0),
-                (SortField::Path, "경로", 260.0),
-                (SortField::Size, "크기", 110.0),
-                (SortField::Modified, "수정 시각", 145.0),
-            ] {
-                let suffix = if self.input.sort == field {
-                    if self.input.descending {
-                        " ↓"
-                    } else {
-                        " ↑"
-                    }
-                } else {
-                    ""
-                };
-                if ui
-                    .add_sized([width, 22.0], egui::Button::new(format!("{label}{suffix}")))
-                    .clicked()
-                {
-                    if self.input.sort == field {
-                        self.input.descending = !self.input.descending;
-                    } else {
-                        self.input.sort = field;
-                        self.input.descending = false;
-                    }
-                }
-            }
+    pub fn column_controls(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("열 표시", |ui| {
+            ui.checkbox(&mut self.show_path, "전체 경로");
+            ui.checkbox(&mut self.show_modified, "수정 시각");
         });
+    }
+    pub fn headers(&mut self, ui: &mut egui::Ui) {
+        let scroll = egui::ScrollArea::horizontal()
+            .id_salt("list_headers")
+            .horizontal_scroll_offset(self.horizontal_offset)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (column, field, label) in [
+                        (0, Some(SortField::Name), "이름"),
+                        (2, Some(SortField::Size), "논리 크기"),
+                        (4, None, "부모 대비"),
+                        (5, None, "파일"),
+                        (6, None, "폴더"),
+                        (1, Some(SortField::Path), "경로"),
+                        (3, Some(SortField::Modified), "수정 시각"),
+                    ]
+                    .into_iter()
+                    {
+                        if column == 1 && !self.show_path || column == 3 && !self.show_modified {
+                            continue;
+                        }
+                        let suffix = if Some(self.input.sort) == field {
+                            if self.input.descending {
+                                " ↓"
+                            } else {
+                                " ↑"
+                            }
+                        } else {
+                            ""
+                        };
+                        let response = ui.add_sized(
+                            [self.widths.get(column), 22.0],
+                            egui::Button::new(format!("{label}{suffix}")),
+                        );
+                        let edge = egui::Rect::from_min_max(
+                            egui::pos2(response.rect.right() - 6.0, response.rect.top()),
+                            response.rect.right_bottom(),
+                        );
+                        let resize = ui
+                            .interact(
+                                edge,
+                                ui.scope_id().with(("column_resize", column)),
+                                egui::Sense::drag(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                        if resize.dragged() {
+                            self.widths.set(
+                                column,
+                                self.widths.get(column) + ui.input(|i| i.pointer.delta().x),
+                            );
+                        }
+                        if response.clicked() && !resize.dragged() && !resize.hovered() {
+                            let Some(field) = field else {
+                                continue;
+                            };
+                            if self.input.sort == field {
+                                self.input.descending = !self.input.descending;
+                            } else {
+                                self.input.sort = field;
+                                self.input.descending = false;
+                            }
+                        }
+                    }
+                });
+            });
+        self.horizontal_offset = scroll.state.clamped_offset().x;
     }
 
     pub fn status(&mut self, ui: &mut egui::Ui) {
@@ -225,6 +302,18 @@ impl SearchView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn result_invalidation_preserves_query_during_background_location_refresh() {
+        let mut view = SearchView::default();
+        view.input.text = "model".into();
+        view.input.extensions = "npy".into();
+        view.selection.click(0, false, false);
+        let expected = view.input.clone();
+        view.invalidate();
+        assert_eq!(view.input, expected);
+        assert_eq!(view.selection.count(), 0);
+        assert!(matches!(view.job.status(), SearchStatus::Cancelled));
+    }
     use crate::explorer::{Explorer, Item};
     use std::time::{Duration, Instant};
 

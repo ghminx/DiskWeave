@@ -1,14 +1,25 @@
+mod analysis;
+mod analysis_panel;
+mod drives;
 mod explorer;
 mod file_open;
+mod global_search;
 mod gui;
 mod list_selection;
 mod local_date;
+mod locations;
+mod locations_ui;
+mod map_job;
+mod presentation;
 mod scan_job;
 mod scanner;
 mod search;
 mod search_job;
 mod search_view;
 mod target_selection;
+mod treemap;
+mod treemap_view;
+mod workspace;
 
 use std::io;
 use std::path::PathBuf;

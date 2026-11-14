@@ -86,6 +86,9 @@ pub struct OpenRequest {
 }
 
 impl OpenRequest {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub fn new(path: PathBuf, kind: TargetKind, action: OpenAction) -> Self {
         Self { path, kind, action }
     }
@@ -196,7 +199,7 @@ fn windows_shell(request: &OpenRequest) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
     let path: Vec<u16> = request
-        .path
+        .path()
         .as_os_str()
         .encode_wide()
         .chain(Some(0))

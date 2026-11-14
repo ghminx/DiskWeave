@@ -1,10 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Default)]
 pub struct TargetSelection {
     path: Option<PathBuf>,
     text: String,
+}
+impl Default for TargetSelection {
+    fn default() -> Self {
+        Self {
+            path: Some(PathBuf::from(r"C:\")),
+            text: r"C:\".into(),
+        }
+    }
 }
 
 impl TargetSelection {
@@ -49,6 +56,14 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn startup_target_is_c_drive_and_explicit_clear_still_clears_it() {
+        let mut selection = TargetSelection::default();
+        assert_eq!(selection.text(), r"C:\");
+        assert_eq!(selection.path(), Some(Path::new(r"C:\")));
+        selection.set_text(String::new());
+        assert_eq!(selection.path(), None);
+    }
 
     #[test]
     fn dropping_one_folder_selects_it() {
