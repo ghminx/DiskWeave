@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 pub struct CompletedScan {
     pub path: PathBuf,
-    pub result: ScanResult,
+    pub result: Arc<ScanResult>,
     pub elapsed: Duration,
 }
 
@@ -98,7 +98,7 @@ impl ScanController {
                 self.status = ScanStatus::Completed;
                 self.completed = Some(CompletedScan {
                     path: active.path,
-                    result,
+                    result: Arc::new(result),
                     elapsed: active.started.elapsed(),
                 });
                 true

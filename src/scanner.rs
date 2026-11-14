@@ -14,6 +14,7 @@ pub struct Folder {
     pub logical_bytes: u64,
     pub file_count: u64,
     pub folder_count: u64,
+    pub modified: Option<SystemTime>,
 }
 
 pub struct ScanIssue {
@@ -132,6 +133,7 @@ pub fn scan_with_progress(
             logical_bytes: 0,
             file_count: 0,
             folder_count: 0,
+            modified: metadata.modified().ok(),
         }],
         children: Vec::new(),
         files: Vec::new(),
@@ -194,6 +196,7 @@ pub fn scan_with_progress(
                     logical_bytes: 0,
                     file_count: 0,
                     folder_count: 0,
+                    modified: metadata.modified().ok(),
                 });
                 pending.push(child_index);
             } else if metadata.is_file() {
@@ -324,6 +327,13 @@ mod tests {
 
         let result = scan(&root, || false).unwrap();
         let nested = result.folder_index(Path::new("nested")).unwrap();
+        assert_eq!(
+            result.folders[nested].modified.unwrap(),
+            fs::metadata(root.join("nested"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
         let file = result
             .files
             .iter()

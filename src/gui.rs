@@ -1,9 +1,13 @@
 use crate::explorer::{Explorer, Item};
+use crate::file_open::{OpenAction, OpenController, OpenRequest, OpenStatus};
 use crate::scan_job::{ScanController, ScanStatus};
 use crate::scanner::ScanResult;
+use crate::search::{item_bytes, item_modified, item_path, SearchInput};
+use crate::search_view::SearchView;
 use crate::target_selection::TargetSelection;
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -12,6 +16,8 @@ struct DiskWeaveApp {
     target: TargetSelection,
     input_error: Option<String>,
     explorer: Option<Explorer>,
+    file_open: OpenController,
+    search: SearchView,
 }
 
 pub fn run() -> eframe::Result {
@@ -109,7 +115,35 @@ fn folder_name(result: &ScanResult, folder: usize) -> String {
         .into_owned()
 }
 
-fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer) {
+fn open_menu(ui: &mut egui::Ui, folder: bool) -> Option<OpenAction> {
+    let mut action = None;
+    if folder {
+        if ui.button("탐색기에서 열기").clicked() {
+            action = Some(OpenAction::OpenFolder);
+        }
+    } else {
+        if ui.button("기본 앱으로 열기").clicked() {
+            action = Some(OpenAction::OpenFile);
+        }
+        if ui.button("파일 위치 열기").clicked() {
+            action = Some(OpenAction::RevealFile);
+        }
+    }
+    if action.is_some() {
+        ui.close();
+    }
+    action
+}
+
+fn show_explorer(
+    ui: &mut egui::Ui,
+    result: &Arc<ScanResult>,
+    explorer: &mut Explorer,
+    view: &mut SearchView,
+) -> Option<OpenRequest> {
+    view.poll();
+    view.controls(ui);
+    let mut open_request = None;
     let mut destination = None;
     egui::ScrollArea::horizontal()
         .id_salt("breadcrumbs")
@@ -120,6 +154,7 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
                     .clicked()
                 {
                     explorer.up(result);
+                    view.whole_scan = false;
                 }
                 for folder in explorer.breadcrumbs(result) {
                     if ui
@@ -134,16 +169,22 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
         });
     if let Some(folder) = destination.take() {
         explorer.open_folder(result, folder);
+        view.whole_scan = false;
     }
     let scope = explorer.folder();
     let scope_folder = &result.folders[scope];
     ui.label(format!(
-        "현재 폴더: {} Byte · 파일 {}개 · 하위 폴더 {}개",
-        scope_folder.logical_bytes, scope_folder.file_count, scope_folder.folder_count
+        "현재 폴더: {} Byte · 파일 {}개 · 하위 폴더 {}개 · 직계 항목 {}개",
+        scope_folder.logical_bytes,
+        scope_folder.file_count,
+        scope_folder.folder_count,
+        explorer.entries().len()
     ));
 
     let mut toggle = None;
     let mut selection = None;
+    let mut result_navigation = false;
+    let mut analyze = false;
     let height = (ui.available_height() - 100.0).max(80.0);
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(
@@ -173,7 +214,7 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
                                 {
                                     toggle = Some(folder);
                                 }
-                                if ui
+                                let response = ui
                                     .selectable_label(
                                         explorer.folder() == folder,
                                         folder_name(result, folder),
@@ -182,9 +223,26 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
                                         "{}\n{} Byte",
                                         result.folders[folder].path.display(),
                                         result.folders[folder].logical_bytes
-                                    ))
-                                    .clicked()
-                                {
+                                    ));
+                                response.context_menu(|ui| {
+                                    if ui.button("이 폴더에서 검색").clicked() {
+                                        destination = Some(folder);
+                                        view.whole_scan = false;
+                                        ui.memory_mut(|memory| {
+                                            memory.request_focus(egui::Id::unique("search_query"))
+                                        });
+                                        ui.close();
+                                    }
+                                    if let Some(action) = open_menu(ui, true) {
+                                        selection = Some(Item::Folder(folder));
+                                        open_request = Some(OpenRequest::for_item(
+                                            result,
+                                            Item::Folder(folder),
+                                            action,
+                                        ));
+                                    }
+                                });
+                                if response.clicked() {
                                     destination = Some(folder);
                                 }
                             });
@@ -197,68 +255,167 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
             egui::vec2(ui.available_width(), height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                ui.strong("직계 목록 · 폴더 우선 / 크기 내림차순");
-                if explorer.entries().is_empty() {
-                    ui.label("표시할 항목이 없습니다");
-                }
-                egui::ScrollArea::both()
-                    .id_salt(("entry_list", scope))
-                    .max_height(height - 28.0)
-                    .show_rows(ui, 26.0, explorer.entries().len(), |ui, rows| {
+                view.headers(ui);
+                view.refresh(result, explorer.folder());
+                view.status(ui);
+                let scope = if view.whole_scan && view.input.is_active() {
+                    0
+                } else {
+                    explorer.folder()
+                };
+                ui.label(format!(
+                    "검색 범위: {}",
+                    result.folders[scope].path.display()
+                ));
+                if let Some(results) = view.job.results() {
+                    let items = &results.items;
+                    if items.is_empty() {
+                        ui.label("조건에 맞는 항목이 없습니다");
+                    }
+                    if !view.editing
+                        && ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::CTRL, egui::Key::A)
+                        })
+                    {
+                        view.selection.all(items.len());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                view.selection.count() == 1,
+                                egui::Button::new("분석에서 보기"),
+                            )
+                            .clicked()
+                        {
+                            analyze = true;
+                        }
+                    });
+                    let mut scroll = egui::ScrollArea::both()
+                        .id_salt(("entry_list", scope))
+                        .max_height((height - 120.0).max(60.0));
+                    if let Some(row) = view.reveal_row.take() {
+                        scroll = scroll.vertical_scroll_offset(
+                            row as f32 * (26.0 + ui.spacing().item_spacing.y),
+                        );
+                    }
+                    scroll.show_rows(ui, 26.0, items.len(), |ui, rows| {
                         for row in rows {
-                            let item = explorer.entries()[row];
-                            let (name, bytes, kind) = match item {
-                                Item::Folder(id) => (
-                                    folder_name(result, id),
-                                    result.folders[id].logical_bytes,
-                                    "폴더",
-                                ),
-                                Item::File(id) => (
-                                    result.files[id].name.to_string_lossy().into_owned(),
-                                    result.files[id].logical_bytes,
-                                    "파일",
-                                ),
+                            let item = items[row];
+                            let (name, kind) = match item {
+                                Item::Folder(id) => (folder_name(result, id), "폴더"),
+                                Item::File(id) => {
+                                    (result.files[id].name.to_string_lossy().into_owned(), "파일")
+                                }
                             };
                             ui.horizontal(|ui| {
                                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                 ui.set_min_height(26.0);
-                                let response = ui.selectable_label(
-                                    explorer.selected() == item,
-                                    format!("[{kind}] {name}"),
+                                let response = ui.add_sized(
+                                    [200.0, 26.0],
+                                    egui::Button::new(format!("[{kind}] {name}"))
+                                        .selected(view.selection.contains(row)),
                                 );
                                 if response.clicked() {
-                                    selection = Some(item);
-                                }
-                                if response.double_clicked() {
-                                    if let Item::Folder(folder) = item {
-                                        destination = Some(folder);
+                                    let modifiers = ui.input(|input| input.modifiers);
+                                    view.selection.click(row, modifiers.ctrl, modifiers.shift);
+                                    if let Some(item) = view.selection.single(items) {
+                                        selection = Some(item);
                                     }
                                 }
-                                ui.label(format!("{bytes} Byte"));
+                                if response.secondary_clicked() && !view.selection.contains(row) {
+                                    view.selection.click(row, false, false);
+                                    selection = Some(item);
+                                }
+                                if response.double_clicked() && view.selection.count() <= 1 {
+                                    match item {
+                                        Item::Folder(folder) => {
+                                            destination = Some(folder);
+                                            result_navigation = true;
+                                        }
+                                        Item::File(_) => {
+                                            open_request = Some(OpenRequest::for_item(
+                                                result,
+                                                item,
+                                                OpenAction::OpenFile,
+                                            ))
+                                        }
+                                    }
+                                }
+                                response.context_menu(|ui| {
+                                    if let Item::Folder(folder) = item {
+                                        if ui.button("이 폴더에서 검색").clicked() {
+                                            destination = Some(folder);
+                                            view.whole_scan = false;
+                                            ui.memory_mut(|memory| {
+                                                memory
+                                                    .request_focus(egui::Id::unique("search_query"))
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.add_enabled_ui(view.selection.count() <= 1, |ui| {
+                                        if let Some(action) =
+                                            open_menu(ui, matches!(item, Item::Folder(_)))
+                                        {
+                                            selection = Some(item);
+                                            open_request =
+                                                Some(OpenRequest::for_item(result, item, action));
+                                        }
+                                    });
+                                });
+                                let path = item_path(result, item).display().to_string();
+                                ui.add_sized([260.0, 26.0], egui::Label::new(&path).truncate())
+                                    .on_hover_text(&path);
+                                ui.add_sized(
+                                    [110.0, 26.0],
+                                    egui::Label::new(format!("{} B", item_bytes(result, item))),
+                                );
+                                ui.add_sized(
+                                    [145.0, 26.0],
+                                    egui::Label::new(crate::local_date::display(item_modified(
+                                        result, item,
+                                    ))),
+                                );
                             });
                         }
                     });
+                }
             },
         );
     });
     if let Some(folder) = toggle {
         explorer.toggle_folder(result, folder);
     }
+    if analyze {
+        view.analyze(result, explorer);
+    }
     if let Some(item) = selection {
         explorer.select(item);
     }
     if let Some(folder) = destination {
         explorer.open_folder(result, folder);
+        view.whole_scan = false;
+        if result_navigation {
+            view.input = SearchInput::default();
+        }
+    }
+    view.refresh(result, explorer.folder());
+    if matches!(view.job.status(), crate::search_job::SearchStatus::Running) {
+        ui.ctx().request_repaint_after(Duration::from_millis(30));
     }
     ui.separator();
-    match explorer.selected() {
-        Item::Folder(folder) => {
+    let selected = view
+        .job
+        .results()
+        .and_then(|results| view.selection.single(&results.items));
+    match selected {
+        Some(Item::Folder(folder)) => {
             ui.label(format!(
                 "선택 폴더: {}",
                 result.folders[folder].path.display()
             ));
         }
-        Item::File(id) => {
+        Some(Item::File(id)) => {
             let file = &result.files[id];
             let path = result.folders[file.parent].path.join(&file.name);
             ui.label(format!("선택 파일: {}", path.display()));
@@ -267,12 +424,18 @@ fn show_explorer(ui: &mut egui::Ui, result: &ScanResult, explorer: &mut Explorer
                 ui.weak("수정 시간을 조회하지 못했습니다");
             }
         }
+        None => {
+            ui.label(format!("선택 항목 {}개", view.selection.count()));
+        }
     }
+    open_request
 }
 
 impl eframe::App for DiskWeaveApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.file_open.poll();
         if self.scan.poll() {
+            self.search.reset();
             self.explorer = Some(Explorer::new(
                 &self.scan.completed().expect("완료 결과").result,
             ));
@@ -288,7 +451,7 @@ impl eframe::App for DiskWeaveApp {
         if !dropped.is_empty() {
             self.accept_drop(dropped);
         }
-        if self.scan.is_running() {
+        if self.scan.is_running() || matches!(self.file_open.status(), OpenStatus::Running) {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
 
@@ -357,6 +520,12 @@ impl eframe::App for DiskWeaveApp {
                 }
                 ui.add_space(10.0);
                 self.show_status(ui);
+                match self.file_open.status() {
+                    OpenStatus::Idle => {},
+                    OpenStatus::Running => { ui.label("Windows에서 열기 요청 처리 중…"); },
+                    OpenStatus::Submitted => { ui.label("Windows에 열기 요청을 전달했습니다"); },
+                    OpenStatus::Failed(error) => { ui.colored_label(egui::Color32::LIGHT_RED, format!("열기 실패: {error}")); },
+                }
 
                 ui.separator();
                 if let Some(completed) = self.scan.completed() {
@@ -372,7 +541,9 @@ impl eframe::App for DiskWeaveApp {
                         ui.colored_label(egui::Color32::YELLOW, "접근 오류로 결과 일부가 누락됐습니다");
                     }
                     if let Some(explorer) = &mut self.explorer {
-                        show_explorer(ui, &completed.result, explorer);
+                        if let Some(request) = show_explorer(ui, &completed.result, explorer, &mut self.search) {
+                            self.input_error = self.file_open.start(request).err().map(|error| error.to_string());
+                        }
                     }
                 } else {
                     ui.label("분석할 폴더를 선택하고 스캔을 시작하세요");

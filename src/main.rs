@@ -1,7 +1,13 @@
 mod explorer;
+mod file_open;
 mod gui;
+mod list_selection;
+mod local_date;
 mod scan_job;
 mod scanner;
+mod search;
+mod search_job;
+mod search_view;
 mod target_selection;
 
 use std::io;
