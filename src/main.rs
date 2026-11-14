@@ -1,4 +1,7 @@
+mod gui;
+mod scan_job;
 mod scanner;
+mod target_selection;
 
 use std::io;
 use std::path::PathBuf;
@@ -6,6 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+enum View {
+    Tree,
+    Search(String),
+    Children(PathBuf),
+}
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -38,13 +47,25 @@ fn main() {
 fn run() -> io::Result<()> {
     let mut args = std::env::args_os();
     let _program = args.next();
-    let root = match (args.next(), args.next()) {
-        (Some(path), None) => PathBuf::from(path),
+    let arguments: Vec<_> = args.collect();
+    if arguments.is_empty() {
+        return gui::run().map_err(|error| io::Error::other(error.to_string()));
+    }
+    let (root, view) = match arguments.as_slice() {
+        [path] => (PathBuf::from(path), View::Tree),
+        [path, option, query] if option == "--find" && !query.is_empty() => (
+            PathBuf::from(path),
+            View::Search(query.to_string_lossy().into_owned()),
+        ),
+        [path, option, relative_path] if option == "--at" && !relative_path.is_empty() => (
+            PathBuf::from(path),
+            View::Children(PathBuf::from(relative_path)),
+        ),
         _ => {
-            eprintln!("사용법: diskweave <폴더 경로>");
+            eprintln!("사용법: diskweave <폴더 경로> [--find <폴더 이름 일부> | --at <하위 폴더 상대 경로>]");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "폴더 경로 하나가 필요합니다",
+                "분석 경로 또는 검색 인자가 올바르지 않습니다",
             ));
         }
     };
@@ -56,21 +77,22 @@ fn run() -> io::Result<()> {
 
     let started = Instant::now();
     let result = scanner::scan(&root, || CANCELLED.load(Ordering::Relaxed))?;
-    let mut children = vec![Vec::new(); result.folders.len()];
-    for (index, folder) in result.folders.iter().enumerate().skip(1) {
-        children[folder.parent.expect("루트 외 폴더의 부모")].push(index);
-    }
-    for siblings in &mut children {
-        siblings.sort_unstable_by(|&a, &b| {
-            result.folders[b]
-                .logical_bytes
-                .cmp(&result.folders[a].logical_bytes)
-                .then_with(|| result.folders[a].path.cmp(&result.folders[b].path))
-        });
-    }
 
+    let (mut pending, recurse, search_count) = match view {
+        View::Tree => (vec![0], true, None),
+        View::Search(query) => {
+            let matches = result.search_folders(&query);
+            let count = matches.len();
+            (matches.into_iter().rev().collect(), false, Some(count))
+        }
+        View::Children(relative_path) => {
+            let index = result.folder_index(&relative_path)?;
+            let mut pending: Vec<_> = result.children[index].iter().rev().copied().collect();
+            pending.push(index);
+            (pending, false, None)
+        }
+    };
     println!("논리 크기(Byte)\t파일 수\t하위 폴더 수\t경로");
-    let mut pending = vec![0];
     while let Some(index) = pending.pop() {
         let folder = &result.folders[index];
         println!(
@@ -80,7 +102,13 @@ fn run() -> io::Result<()> {
             folder.folder_count,
             folder.path.display()
         );
-        pending.extend(children[index].iter().rev());
+        if recurse {
+            pending.extend(result.children[index].iter().rev());
+        }
+    }
+
+    if let Some(count) = search_count {
+        eprintln!("검색 결과: {count}개 폴더");
     }
 
     eprintln!(
