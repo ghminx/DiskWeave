@@ -103,36 +103,31 @@ impl SearchView {
 
     pub fn controls(&mut self, ui: &mut egui::Ui, global: bool) {
         self.editing = false;
-        if ui.available_width() < 620.0 {
-            ui.horizontal(|ui| {
-                self.editing |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.input.text)
-                            .id(egui::Id::unique("search_query"))
-                            .hint_text("파일·폴더 검색")
-                            .desired_width((ui.available_width() - 78.0).max(80.0)),
-                    )
-                    .has_focus();
-                ui.menu_button("검색 조건", |ui| {
+        ui.horizontal(|ui| {
+            self.editing |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.input.text)
+                        .id(egui::Id::unique("search_query"))
+                        .hint_text("파일·폴더 검색")
+                        .desired_width((ui.available_width() - 68.0).max(70.0))
+                        .margin(egui::vec2(9.0, 7.0)),
+                )
+                .has_focus();
+            ui.menu_button(
+                if self.input.is_active() {
+                    "필터 •"
+                } else {
+                    "필터"
+                },
+                |ui| {
                     ui.set_min_width(340.0);
+                    ui.spacing_mut().item_spacing.y = 7.0;
                     self.options(ui, global);
+                    ui.separator();
                     self.filter_fields(ui);
-                });
-            });
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                self.editing |= ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.input.text)
-                            .id(egui::Id::unique("search_query"))
-                            .hint_text("파일·폴더 검색")
-                            .desired_width(230.0),
-                    )
-                    .has_focus();
-                self.options(ui, global);
-            });
-            ui.collapsing("검색 필터", |ui| self.filter_fields(ui));
-        }
+                },
+            );
+        });
     }
     fn options(&mut self, ui: &mut egui::Ui, global: bool) {
         ui.horizontal_wrapped(|ui| {
@@ -200,11 +195,23 @@ impl SearchView {
         });
     }
     pub fn headers(&mut self, ui: &mut egui::Ui) {
+        self.widths.fit(
+            ui.available_width(),
+            self.show_path,
+            self.show_modified,
+            self.show_allocated,
+        );
+        let height = if ui.available_height() < 160.0 {
+            30.0
+        } else {
+            crate::ui_style::HEADER
+        };
         let scroll = egui::ScrollArea::horizontal()
             .id_salt("list_headers")
             .horizontal_scroll_offset(self.horizontal_offset)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     for (column, field, label) in [
                         (0, Some(SortField::Name), "이름"),
                         (2, Some(SortField::Size), "논리 크기"),
@@ -232,9 +239,23 @@ impl SearchView {
                         } else {
                             ""
                         };
-                        let response = ui.add_sized(
-                            [self.widths.get(column), 22.0],
-                            egui::Button::new(format!("{label}{suffix}")),
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(self.widths.get(column), height),
+                            egui::Sense::click(),
+                        );
+                        ui.painter()
+                            .rect_filled(rect, 0.0, egui::Color32::from_rgb(21, 30, 40));
+                        ui.painter().line_segment(
+                            [rect.left_bottom(), rect.right_bottom()],
+                            egui::Stroke::new(1.0, crate::ui_style::LINE),
+                        );
+                        crate::ui_style::text(
+                            ui,
+                            rect.shrink2(egui::vec2(12.0, 0.0)),
+                            &format!("{label}{suffix}"),
+                            column != 0,
+                            crate::ui_style::MUTED,
+                            12.0,
                         );
                         let edge = egui::Rect::from_min_max(
                             egui::pos2(response.rect.right() - 6.0, response.rect.top()),
@@ -292,8 +313,8 @@ impl SearchView {
             }
             SearchStatus::Completed => {
                 if let Some(results) = self.job.results() {
-                    ui.label(format!(
-                        "{}개 항목 · {}개 선택 · 수정 시각 미수집으로 제외 {}개",
+                    ui.small(format!(
+                        "{}개 항목 · {}개 선택 · 날짜 미수집 제외 {}개",
                         results.items.len(),
                         self.selection.count(),
                         results.unknown_dates

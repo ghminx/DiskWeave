@@ -187,74 +187,114 @@ impl AnalysisPanel {
             if top.is_empty() {
                 ui.label("집계할 파일이 없습니다");
             }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                crate::ui_style::header_cell(
+                    ui,
+                    (ui.available_width() - 140.0).max(440.0),
+                    "파일 경로",
+                    false,
+                );
+                crate::ui_style::header_cell(ui, 140.0, "논리 크기 ↓", true);
+            });
             egui::ScrollArea::both()
                 .id_salt("statistics_top")
                 .max_height(ui.available_height().max(40.0))
-                .show_rows(ui, 24.0, top.len(), |ui, rows| {
+                .show_rows(ui, crate::ui_style::ROW, top.len(), |ui, rows| {
                     for row in rows {
                         let hit = &top[row];
                         let source = &output.sources[hit.source];
-                        ui.horizontal(|ui| {
-                            let path = crate::search::item_path(&source.scan, hit.item);
-                            let response = ui.selectable_label(
-                                self.selected == Some(row),
-                                path.display().to_string(),
-                            );
-                            if response.clicked() || response.secondary_clicked() {
-                                self.selected = Some(row);
-                                picked = Some(row);
-                            }
-                            if response.double_clicked() {
+                        let width = ui.available_width().max(580.0);
+                        let response = crate::ui_style::row(
+                            ui,
+                            row,
+                            width,
+                            self.selected == Some(row),
+                            |ui| {
+                                let path = crate::search::item_path(&source.scan, hit.item);
+                                crate::ui_style::name_cell(
+                                    ui,
+                                    width - 140.0,
+                                    &path.display().to_string(),
+                                    false,
+                                );
+                                let size = crate::presentation::SizeDisplay::new(
+                                    crate::search::item_bytes(&source.scan, hit.item),
+                                );
+                                crate::ui_style::cell(ui, 140.0, &size.text, true)
+                                    .on_hover_text(size.exact);
+                            },
+                        );
+                        if response.clicked() || response.secondary_clicked() {
+                            self.selected = Some(row);
+                            picked = Some(row);
+                        }
+                        if response.double_clicked() {
+                            action = Some((row, OpenAction::OpenFile));
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("기본 앱으로 열기").clicked() {
                                 action = Some((row, OpenAction::OpenFile));
+                                ui.close();
                             }
-                            response.context_menu(|ui| {
-                                if ui.button("기본 앱으로 열기").clicked() {
-                                    action = Some((row, OpenAction::OpenFile));
-                                    ui.close();
-                                }
-                                if ui.button("파일 위치 열기").clicked() {
-                                    action = Some((row, OpenAction::RevealFile));
-                                    ui.close();
-                                }
-                                if ui.button("분석에서 보기").clicked() {
-                                    analyze = Some(row);
-                                    ui.close();
-                                }
-                            });
-                            let size = crate::presentation::SizeDisplay::new(
-                                crate::search::item_bytes(&source.scan, hit.item),
-                            );
-                            ui.label(size.text).on_hover_text(size.exact);
+                            if ui.button("파일 위치 열기").clicked() {
+                                action = Some((row, OpenAction::RevealFile));
+                                ui.close();
+                            }
+                            if ui.button("분석에서 보기").clicked() {
+                                analyze = Some(row);
+                                ui.close();
+                            }
                         });
                     }
                 });
         } else {
-            ui.label("확장자 / 논리 크기 / 파일 수 / 집계 범위 대비");
+            let width = ui.available_width().max(580.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (fraction, label, right) in [
+                    (0.4, "확장자", false),
+                    (0.25, "논리 크기 ↓", true),
+                    (0.15, "파일", true),
+                    (0.2, "집계 범위 대비", true),
+                ] {
+                    crate::ui_style::header_cell(ui, width * fraction, label, right);
+                }
+            });
             egui::ScrollArea::both()
                 .id_salt("statistics_extensions")
                 .max_height(ui.available_height().max(40.0))
-                .show_rows(ui, 24.0, output.stats.extensions.len(), |ui, rows| {
-                    for row in rows {
-                        let extension = &output.stats.extensions[row];
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                [150.0, 24.0],
-                                egui::Label::new(&extension.name).truncate(),
-                            );
-                            let size = crate::presentation::SizeDisplay::new(extension.bytes);
-                            ui.add_sized([125.0, 24.0], egui::Label::new(size.text))
-                                .on_hover_text(size.exact);
-                            ui.add_sized(
-                                [90.0, 24.0],
-                                egui::Label::new(extension.files.to_string()),
-                            );
-                            ui.label(crate::presentation::percentage(
-                                extension.bytes,
-                                output.stats.bytes,
-                            ));
-                        });
-                    }
-                });
+                .show_rows(
+                    ui,
+                    crate::ui_style::ROW,
+                    output.stats.extensions.len(),
+                    |ui, rows| {
+                        for row in rows {
+                            let extension = &output.stats.extensions[row];
+                            crate::ui_style::row(ui, row, width, false, |ui| {
+                                crate::ui_style::cell(ui, width * 0.4, &extension.name, false);
+                                let size = crate::presentation::SizeDisplay::new(extension.bytes);
+                                crate::ui_style::cell(ui, width * 0.25, &size.text, true)
+                                    .on_hover_text(size.exact);
+                                crate::ui_style::cell(
+                                    ui,
+                                    width * 0.15,
+                                    &crate::ui_style::count(extension.files),
+                                    true,
+                                );
+                                crate::ui_style::cell(
+                                    ui,
+                                    width * 0.2,
+                                    &crate::presentation::percentage(
+                                        extension.bytes,
+                                        output.stats.bytes,
+                                    ),
+                                    true,
+                                );
+                            });
+                        }
+                    },
+                );
         }
         self.picked = picked.and_then(|row| self.route(row));
         (

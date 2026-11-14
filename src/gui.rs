@@ -57,110 +57,138 @@ pub fn run() -> eframe::Result {
         "DiskWeave",
         options,
         Box::new(|creation| {
-            creation.egui_ctx.set_theme(egui::Theme::Dark);
-            let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = bg();
-            visuals.override_text_color = Some(egui::Color32::from_rgb(225, 234, 244));
-            visuals.weak_text_color = Some(egui::Color32::from_rgb(156, 176, 197));
-            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(25, 35, 48);
-            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 53, 71);
-            visuals.selection.bg_fill = egui::Color32::from_rgb(31, 59, 80);
-            visuals.selection.stroke.color = accent();
-            creation.egui_ctx.set_visuals(visuals);
-            creation.egui_ctx.global_style_mut(|style| {
-                style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-                style
-                    .text_styles
-                    .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
-                style
-                    .text_styles
-                    .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-            });
+            crate::ui_style::apply(&creation.egui_ctx);
             Ok(Box::new(DiskWeaveApp::default()))
         }),
     )
 }
 fn bg() -> egui::Color32 {
-    egui::Color32::from_rgb(12, 17, 24)
+    crate::ui_style::BG
 }
 fn surface() -> egui::Color32 {
-    egui::Color32::from_rgb(16, 24, 34)
+    crate::ui_style::SIDEBAR
 }
 fn accent() -> egui::Color32 {
-    egui::Color32::from_rgb(119, 196, 255)
+    crate::ui_style::ACCENT
 }
 fn type_chart(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
     let mut groups: Vec<_> = stats
         .extensions
         .iter()
         .take(4)
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             (
                 e.name.as_str(),
                 e.bytes,
-                crate::presentation::category_color(std::ffi::OsStr::new(&e.name)),
+                [
+                    egui::Color32::from_rgb(97, 185, 245),
+                    egui::Color32::from_rgb(140, 145, 239),
+                    egui::Color32::from_rgb(118, 211, 175),
+                    egui::Color32::from_rgb(213, 164, 106),
+                ][i],
             )
         })
         .collect();
-    let other = stats.bytes - groups.iter().map(|(_, bytes, _)| bytes).sum::<u64>();
+    let other = stats.bytes - groups.iter().map(|(_, n, _)| n).sum::<u64>();
     if other > 0 {
-        groups.push(("기타", other, egui::Color32::from_rgb(89, 111, 131)));
+        groups.push(("기타", other, egui::Color32::from_rgb(70, 93, 114)));
     }
-    ui.horizontal_top(|ui| {
-        let diameter = (ui.available_width() * 0.37).clamp(64.0, 92.0);
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-        let center = rect.center();
-        let radius = diameter * 0.40;
-        ui.painter().circle_stroke(
-            center,
-            radius,
-            egui::Stroke::new(diameter * 0.12, egui::Color32::from_rgb(40, 53, 67)),
-        );
-        let mut start = -std::f32::consts::FRAC_PI_2;
-        if stats.bytes > 0 {
-            for &(_, bytes, color) in &groups {
-                let angle = bytes as f64 / stats.bytes as f64 * std::f64::consts::TAU;
-                let steps = (angle * 20.0).ceil().max(1.0) as usize;
-                let points = (0..=steps)
-                    .map(|i| {
-                        let a = start + angle as f32 * i as f32 / steps as f32;
-                        center + egui::vec2(a.cos(), a.sin()) * radius
-                    })
-                    .collect();
-                ui.painter().add(egui::Shape::line(
-                    points,
-                    egui::Stroke::new(diameter * 0.12, color),
-                ));
-                start += angle as f32;
-            }
+    let (area, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 108.0),
+        egui::Sense::hover(),
+    );
+    let diameter = 108.0;
+    let center = area.left_center() + egui::vec2(diameter / 2.0, 0.0);
+    let radius = 43.0;
+    ui.painter().circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(20.0, crate::ui_style::LINE),
+    );
+    let mut start = -std::f32::consts::FRAC_PI_2;
+    if stats.bytes > 0 {
+        for &(_, bytes, color) in &groups {
+            let angle = bytes as f64 / stats.bytes as f64 * std::f64::consts::TAU;
+            let steps = (angle * 20.0).ceil().max(1.0) as usize;
+            let points = (0..=steps)
+                .map(|i| {
+                    let a = start + angle as f32 * i as f32 / steps as f32;
+                    center + egui::vec2(a.cos(), a.sin()) * radius
+                })
+                .collect();
+            ui.painter()
+                .add(egui::Shape::line(points, egui::Stroke::new(20.0, color)));
+            start += angle as f32;
         }
-        ui.painter().text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            SizeDisplay::new(stats.bytes).text,
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
+    }
+    ui.painter().text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        SizeDisplay::new(stats.bytes).text,
+        egui::FontId::proportional(14.0),
+        crate::ui_style::TEXT,
+    );
+    let legend = egui::Rect::from_min_max(area.min + egui::vec2(122.0, 0.0), area.max);
+    for (i, (name, bytes, color)) in groups.into_iter().enumerate() {
+        let row = egui::Rect::from_min_size(
+            legend.min + egui::vec2(0.0, i as f32 * 21.0),
+            egui::vec2(legend.width(), 21.0),
         );
-        ui.vertical(|ui| {
-            for (name, bytes, color) in groups {
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 1.0, color);
-                    ui.add_sized(
-                        [ui.available_width().max(45.0) - 40.0, 15.0],
-                        egui::Label::new(egui::RichText::new(name).size(11.0)).truncate(),
-                    );
-                    ui.small(crate::presentation::percentage(bytes, stats.bytes));
-                });
-            }
-        });
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                row.left_center() - egui::vec2(0.0, 3.5),
+                egui::vec2(7.0, 7.0),
+            ),
+            2.0,
+            color,
+        );
+        crate::ui_style::text(
+            ui,
+            egui::Rect::from_min_max(
+                row.min + egui::vec2(14.0, 0.0),
+                row.max - egui::vec2(43.0, 0.0),
+            ),
+            name,
+            false,
+            crate::ui_style::MUTED,
+            11.0,
+        );
+        crate::ui_style::text(
+            ui,
+            row,
+            &crate::presentation::percentage(bytes, stats.bytes),
+            true,
+            crate::ui_style::TEXT,
+            11.0,
+        );
+    }
+}
+fn allocation_summary(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
+    ui.collapsing("파일 할당 합계·수집 기준", |ui| {
+        for (label, total) in [
+            ("파일 할당 · 경로별", stats.allocation),
+            ("중복 제외 참고 합계", stats.unique_allocation),
+        ] {
+            let shown = crate::presentation::allocation_display(total);
+            ui.horizontal_wrapped(|ui| {
+                ui.small(label);
+                ui.label(shown.text).on_hover_text(shown.exact);
+            });
+        }
+        if stats.identity_conflicts > 0 {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "동일 ID의 할당값 불일치 {}개 제외",
+                    stats.identity_conflicts
+                ),
+            );
+        }
+        ui.small("기본 스트림 · ADS 미수집 · 회수 가능 공간 아님");
     });
 }
-fn frame() -> egui::Frame {
-    egui::Frame::new().fill(surface()).inner_margin(12)
-}
+
 fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     let mut action = None;
     match item {
@@ -183,22 +211,6 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     }
     action
 }
-fn folder_icon(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-    let p = rect.min + egui::vec2(1.0, 3.0);
-    let points = vec![
-        p,
-        p + egui::vec2(5.0, 0.0),
-        p + egui::vec2(7.0, 2.0),
-        p + egui::vec2(13.0, 2.0),
-        p + egui::vec2(13.0, 11.0),
-        p + egui::vec2(0.0, 11.0),
-        p,
-    ];
-    ui.painter()
-        .add(egui::Shape::line(points, egui::Stroke::new(1.2, accent())));
-}
-
 impl DiskWeaveApp {
     fn selection_target(&self) -> Option<Target> {
         self.detail_target.or_else(|| {
@@ -468,7 +480,7 @@ impl DiskWeaveApp {
         }
         ui.horizontal(|ui| {
             let texture = self.logo.as_ref().unwrap();
-            ui.add(egui::Image::new((texture.id(), egui::vec2(29.0, 29.0))).uv(
+            ui.add(egui::Image::new((texture.id(), egui::vec2(32.0, 32.0))).uv(
                 egui::Rect::from_min_max(
                     egui::pos2(39.0 / 960.0, 37.0 / 240.0),
                     egui::pos2(205.0 / 960.0, 203.0 / 240.0),
@@ -483,34 +495,68 @@ impl DiskWeaveApp {
                 ),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("읽기 전용");
-                if ui.button("상세 패널").clicked() {
+                ui.small("읽기 전용");
+                ui.menu_button("수집 옵션", |ui| {
+                    let mut detailed = self.scan.details_requested();
+                    let response = ui.add_enabled(
+                        !self.scan.is_running(),
+                        egui::Checkbox::new(&mut detailed, "할당 크기·파일 ID 추가 수집"),
+                    );
+                    if response.on_hover_text("끄면 추가 핸들 조회를 생략합니다. 다음 스캔부터 적용 · 기본 스트림 기준 · ADS 미수집").changed() {
+                        self.input_error = self.scan.configure(detailed).err().map(|e| e.to_string());
+                    }
+                });
+                if ui.available_width() < 700.0 && ui.button("상세 패널").clicked() {
                     self.details_open = !self.details_open;
                 }
             });
         });
     }
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let (label_rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+        crate::ui_style::text(
+            ui,
+            label_rect,
+            "분석 대상",
+            false,
+            crate::ui_style::TEXT,
+            13.0,
+        );
+        let hint = egui::Rect::from_min_max(label_rect.min + egui::vec2(75.0, 0.0), label_rect.max);
+        crate::ui_style::text(
+            ui,
+            hint,
+            "드라이브 또는 폴더를 선택한 뒤 스캔",
+            false,
+            crate::ui_style::SOFT,
+            12.0,
+        );
+        ui.add_space(9.0);
+        let editable = !self.scan.is_running();
+        let available = ui.available_width();
         ui.horizontal(|ui| {
-            ui.strong("분석 대상");
-            let mut detailed = self.scan.details_requested();
-            let option = ui.add_enabled(
-                !self.scan.is_running(),
-                egui::Checkbox::new(&mut detailed, "할당 크기·파일 ID 추가 수집"),
+            crate::ui_style::slot(
+                ui,
+                egui::vec2(64.0, 38.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if let Some(path) =
+                        self.locations_view
+                            .drive_control(ui, !editable, self.target.text())
+                    {
+                        self.input_error = self.target.choose_folder(path).err();
+                    }
+                },
             );
-            if option.on_hover_text("파일별 추가 조회로 스캔 시간이 늘어날 수 있습니다. 끄면 빠른 논리 스캔을 사용하며, 변경은 다음 스캔부터 적용됩니다. 기본 데이터 스트림 기준·ADS 미수집").changed() {
-                self.input_error = self.scan.configure(detailed).err().map(|e| e.to_string());
-            }
-            ui.weak("폴더 선택 · 폴더 드롭");
-        });
-        ui.horizontal(|ui| {
-            let editable = !self.scan.is_running();
+            let path_width = (available - 438.0).max(80.0);
             let mut path = self.target.text().to_owned();
             if ui
                 .add_enabled(
                     editable,
                     egui::TextEdit::singleline(&mut path)
-                        .desired_width((ui.available_width() - 355.0).max(180.0))
+                        .desired_width((path_width - 24.0).max(40.0))
+                        .margin(egui::vec2(12.0, 10.0))
                         .hint_text("분석할 폴더 경로"),
                 )
                 .changed()
@@ -519,44 +565,68 @@ impl DiskWeaveApp {
                 self.input_error = None;
             }
             if ui
-                .add_enabled(editable, egui::Button::new("폴더 선택"))
+                .add_enabled(
+                    editable,
+                    egui::Button::new("폴더 선택").min_size(egui::vec2(84.0, 38.0)),
+                )
                 .clicked()
             {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.input_error = self.target.choose_folder(path).err();
                 }
             }
-            ui.menu_button("위치 관리", |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        if let Some(path) =
-                            self.locations_view
-                                .controls(ui, &mut self.scan, self.target.path())
-                        {
-                            self.input_error = self.target.choose_folder(path).err();
-                        }
+            crate::ui_style::slot(
+                ui,
+                egui::vec2(80.0, 38.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.menu_button("위치 관리", |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                if let Some(path) = self.locations_view.controls(
+                                    ui,
+                                    &mut self.scan,
+                                    self.target.path(),
+                                ) {
+                                    self.input_error = self.target.choose_folder(path).err();
+                                }
+                            });
                     });
-            });
-            if ui
-                .add_enabled(
-                    editable,
-                    egui::Button::new("스캔 시작").fill(egui::Color32::from_rgb(50, 143, 210)),
-                )
-                .clicked()
-            {
-                self.begin_scan();
-            }
+                },
+            );
             if ui
                 .add_enabled(
                     matches!(self.scan.status(), ScanStatus::Running),
-                    egui::Button::new("취소"),
+                    egui::Button::new("취소").min_size(egui::vec2(56.0, 38.0)),
                 )
                 .clicked()
             {
                 self.scan.cancel();
             }
+            if ui
+                .add_enabled(
+                    editable,
+                    egui::Button::new(
+                        egui::RichText::new("▷  스캔 시작")
+                            .color(egui::Color32::from_rgb(6, 17, 27))
+                            .strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(56, 154, 236))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(75, 166, 237),
+                    ))
+                    .min_size(egui::vec2(114.0, 38.0)),
+                )
+                .clicked()
+            {
+                self.begin_scan();
+            }
         });
+        ui.add_space(7.0);
+        ui.small("또는 탐색기에서 폴더를 이 창으로 끌어놓으세요 · 선택 후 스캔 시작");
     }
     fn summary(&self, ui: &mut egui::Ui) {
         let sources = if self.locations_view.global_mode {
@@ -589,13 +659,16 @@ impl DiskWeaveApp {
                 exact: format!("{bytes} B"),
             }
         };
-        ui.columns(4, |cols| {
-            for (col, (label, value)) in cols.iter_mut().zip([
+        let card_height = ui.available_height().max(50.0);
+        ui.horizontal(|ui| {
+            let unit = (ui.available_width() - 30.0) / 4.4;
+            ui.spacing_mut().item_spacing.x = 10.0;
+            for (index, (label, value)) in [
                 ("논리적 파일 크기", size.text),
                 (
                     "파일",
                     if has_results {
-                        format!("{files}개")
+                        crate::ui_style::count(files)
                     } else {
                         "—".into()
                     },
@@ -603,7 +676,7 @@ impl DiskWeaveApp {
                 (
                     "하위 폴더",
                     if has_results {
-                        format!("{folders}개")
+                        crate::ui_style::count(folders)
                     } else {
                         "—".into()
                     },
@@ -623,84 +696,117 @@ impl DiskWeaveApp {
                         )
                     },
                 ),
-            ]) {
-                egui::Frame::new()
-                    .fill(surface())
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(41, 55, 71)))
-                    .corner_radius(6)
-                    .inner_margin(10)
-                    .show(col, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.small(label);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&value)
-                                    .size(18.0)
-                                    .strong()
-                                    .color(accent()),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(
-                            if label == "논리적 파일 크기" {
-                                size.exact.clone()
-                            } else {
-                                value
-                            },
-                        );
-                    });
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let width = unit * if index == 0 { 1.4 } else { 1.0 };
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(width, card_height - 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rect, 8.0, crate::ui_style::SURFACE);
+                ui.painter().rect_stroke(
+                    rect,
+                    8.0,
+                    egui::Stroke::new(1.0, crate::ui_style::LINE),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = rect.shrink2(egui::vec2(
+                    15.0,
+                    if card_height < 65.0 { 6.0 } else { 10.0 },
+                ));
+                let title = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), 15.0));
+                crate::ui_style::text(ui, title, label, false, crate::ui_style::MUTED, 12.0);
+                let number = egui::Rect::from_min_max(inner.min + egui::vec2(0.0, 20.0), inner.max);
+                let shown = if index == 3 && has_results {
+                    if self.scan.is_running() {
+                        "수집 중"
+                    } else {
+                        "스캔 완료"
+                    }
+                } else {
+                    &value
+                };
+                crate::ui_style::text(
+                    ui,
+                    number,
+                    shown,
+                    false,
+                    if index == 0 {
+                        egui::Color32::from_rgb(155, 212, 255)
+                    } else {
+                        crate::ui_style::TEXT
+                    },
+                    if card_height < 65.0 { 20.0 } else { 23.0 },
+                );
+                response.on_hover_text(if index == 0 {
+                    size.exact.clone()
+                } else {
+                    value
+                });
             }
         });
     }
     fn tree(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("폴더 탐색");
-            ui.weak("크기순");
-        });
-        ui.separator();
-        ui.checkbox(&mut self.locations_view.global_mode, "등록 위치 전체 검색");
+        crate::ui_style::panel_title(ui, "폴더 탐색", "크기순");
         let mut chosen = None;
-        for entry in &self.scan.entries {
-            if ui
-                .selectable_label(
-                    if self.locations_view.global_mode {
-                        self.detail_target.map(|t| t.0).or(self.scan.selected_id())
-                            == Some(entry.id)
-                    } else {
-                        self.scan.selected_id() == Some(entry.id)
-                    },
-                    entry
-                        .path
-                        .file_name()
-                        .unwrap_or(entry.path.as_os_str())
-                        .to_string_lossy(),
-                )
-                .on_hover_text(format!(
-                    "{}{}",
-                    entry.path.display(),
-                    if entry.stale {
-                        " · 오래된 결과"
-                    } else {
-                        ""
+        egui::Frame::new().inner_margin(8).show(ui, |ui| {
+            let current = self.scan.selected_id().and_then(|id| self.scan.get(id));
+            let label = if self.locations_view.global_mode {
+                "등록 위치 전체".into()
+            } else {
+                current
+                    .map(|e| {
+                        e.path
+                            .file_name()
+                            .unwrap_or(e.path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| "분석 위치".into())
+            };
+            ui.menu_button(format!("●  {label}  ▾"), |ui| {
+                if ui
+                    .selectable_label(self.locations_view.global_mode, "등록 위치 전체 검색")
+                    .clicked()
+                {
+                    self.locations_view.global_mode = true;
+                    ui.close();
+                }
+                for entry in &self.scan.entries {
+                    if ui
+                        .selectable_label(
+                            self.scan.selected_id() == Some(entry.id)
+                                && !self.locations_view.global_mode,
+                            entry.path.display().to_string(),
+                        )
+                        .on_hover_text(if entry.stale {
+                            "오래된 결과 · 전체 검색에서 제외"
+                        } else {
+                            "마지막 완료 스캔 기준"
+                        })
+                        .clicked()
+                    {
+                        chosen = Some(entry.id);
+                        ui.close();
                     }
-                ))
-                .clicked()
-            {
-                chosen = Some(entry.id);
-            }
-        }
+                }
+            });
+        });
         if let Some(id) = chosen {
             self.scan.choose(id);
             self.locations_view.global_mode = false;
             self.sync_scan();
         }
-        ui.separator();
         let Some(source) = self.source() else {
-            ui.weak("스캔 후 폴더가 표시됩니다");
+            ui.add_space(15.0);
+            ui.weak("  스캔 후 폴더가 표시됩니다");
             return;
         };
         if self.locations_view.global_mode {
-            ui.weak("정상 수집 위치 전체를 검색합니다");
+            ui.weak("  정상 수집 위치 전체를 검색합니다");
             return;
         }
         let Some(explorer) = &mut self.explorer else {
@@ -709,44 +815,115 @@ impl DiskWeaveApp {
         let mut destination = None;
         let mut toggle = None;
         let mut open = None;
-        egui::ScrollArea::both().id_salt("folder_tree").show_rows(
-            ui,
-            27.0,
-            explorer.visible_tree().len(),
-            |ui, rows| {
+        let height = (ui.available_height() - 26.0).max(30.0);
+        egui::ScrollArea::both()
+            .id_salt("folder_tree")
+            .max_height(height)
+            .show_rows(ui, 33.0, explorer.visible_tree().len(), |ui, rows| {
+                // 보이는 행의 깊이만으로 가로 영역 확보. 큰 트리의 매 프레임 전체 순회 방지.
+                let depth = rows
+                    .clone()
+                    .map(|row| explorer.visible_tree()[row].1)
+                    .max()
+                    .unwrap_or(0);
+                let tree_width = ui.available_width().max(depth as f32 * 14.0 + 180.0);
                 for row in rows {
                     let (folder, depth) = explorer.visible_tree()[row];
-                    ui.horizontal(|ui| {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.add_space(depth as f32 * 14.0);
-                        if source.scan.children[folder].is_empty() {
-                            ui.add_space(17.0);
-                        } else if ui
-                            .add_sized(
-                                [17.0, 24.0],
-                                egui::Button::new(if explorer.is_expanded(folder) {
-                                    "▾"
-                                } else {
-                                    "▸"
-                                })
-                                .frame(false),
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(tree_width, 33.0), egui::Sense::hover());
+                    let rect = rect.shrink2(egui::vec2(8.0, 0.5));
+                    let selected = explorer.folder() == folder
+                        || self.detail_target
+                            == Some((source.id, source.generation, Item::Folder(folder)));
+                    let arrow = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(depth as f32 * 14.0, 0.0),
+                        egui::vec2(21.0, rect.height()),
+                    );
+                    let pick =
+                        egui::Rect::from_min_max(egui::pos2(arrow.right(), rect.top()), rect.max);
+                    let response = ui.interact(
+                        pick,
+                        ui.scope_id().with(("folder_select", folder)),
+                        egui::Sense::click(),
+                    );
+                    if selected || response.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            if selected {
+                                egui::Color32::from_rgb(34, 53, 72)
+                            } else {
+                                crate::ui_style::RAISED
+                            },
+                        );
+                    }
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            6.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(61, 102, 134)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if !source.scan.children[folder].is_empty() {
+                        crate::ui_style::text(
+                            ui,
+                            arrow,
+                            if explorer.is_expanded(folder) {
+                                "▾"
+                            } else {
+                                "▸"
+                            },
+                            false,
+                            crate::ui_style::SOFT,
+                            12.0,
+                        );
+                        if ui
+                            .interact(
+                                arrow,
+                                ui.scope_id().with(("folder_toggle", folder)),
+                                egui::Sense::click(),
                             )
                             .clicked()
                         {
                             toggle = Some(folder);
                         }
-                        folder_icon(ui);
-                        let name = item_name(&source.scan, Item::Folder(folder)).to_string_lossy();
-                        let response = ui.selectable_label(
-                            explorer.folder() == folder
-                                || self.detail_target
-                                    == Some((source.id, source.generation, Item::Folder(folder))),
-                            name,
-                        );
-                        if response.clicked() {
-                            destination = Some(folder);
-                        }
-                        response.context_menu(|ui| {
+                    }
+                    crate::ui_style::icon(ui, pick.shrink2(egui::vec2(3.0, 0.0)), true);
+                    let name = egui::Rect::from_min_max(
+                        pick.min + egui::vec2(25.0, 0.0),
+                        pick.max - egui::vec2(68.0, 0.0),
+                    );
+                    crate::ui_style::text(
+                        ui,
+                        name,
+                        &item_name(&source.scan, Item::Folder(folder)).to_string_lossy(),
+                        false,
+                        if selected {
+                            crate::ui_style::TEXT
+                        } else {
+                            crate::ui_style::MUTED
+                        },
+                        13.0,
+                    );
+                    let size = egui::Rect::from_min_max(
+                        egui::pos2(rect.right() - 68.0, rect.top()),
+                        rect.max - egui::vec2(8.0, 0.0),
+                    );
+                    crate::ui_style::text(
+                        ui,
+                        size,
+                        &SizeDisplay::new(source.scan.folders[folder].logical_bytes).text,
+                        true,
+                        crate::ui_style::SOFT,
+                        11.0,
+                    );
+                    if response.clicked() {
+                        destination = Some(folder);
+                    }
+                    response
+                        .on_hover_text(source.scan.folders[folder].path.display().to_string())
+                        .context_menu(|ui| {
                             if ui.button("이 폴더에서 검색").clicked() {
                                 destination = Some(folder);
                                 ui.close();
@@ -759,11 +936,10 @@ impl DiskWeaveApp {
                                 ));
                             }
                         });
-                        ui.weak(SizeDisplay::new(source.scan.folders[folder].logical_bytes).text);
-                    });
                 }
-            },
-        );
+            });
+        ui.add_space(5.0);
+        ui.small("   화살표로 펼치기 · 이름으로 이동");
         if let Some(folder) = toggle {
             explorer.toggle_folder(&source.scan, folder);
         }
@@ -775,18 +951,143 @@ impl DiskWeaveApp {
         }
     }
     fn center(&mut self, ui: &mut egui::Ui) {
-        self.search.controls(ui, self.locations_view.global_mode);
-        ui.horizontal(|ui| {
-            for (tab, label) in [(0, "폴더·파일"), (1, "큰 파일"), (2, "확장자")] {
-                ui.selectable_value(&mut self.tab, tab, label);
-            }
-            if self.tab != 0 {
-                ui.checkbox(&mut self.statistics.matched, "검색 일치 파일만");
-            } else {
-                self.search.column_controls(ui);
-            }
-        });
-        ui.separator();
+        let mut destination = None;
+        let compact = ui.available_height() < 240.0;
+        let available = ui.available_width();
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(17, 0))
+            .show(ui, |ui| {
+                crate::ui_style::slot(
+                    ui,
+                    egui::vec2(available - 34.0, if compact { 42.0 } else { 58.0 }),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let search_width = ((available - 34.0) * 0.46).clamp(160.0, 280.0);
+                        let crumb_width = (ui.available_width() - search_width - 12.0).max(50.0);
+                        crate::ui_style::slot(
+                            ui,
+                            egui::vec2(crumb_width, 40.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                if let (Some(source), Some(explorer)) = (
+                                    self.source().filter(|_| !self.locations_view.global_mode),
+                                    &self.explorer,
+                                ) {
+                                    if ui
+                                        .add_enabled(
+                                            explorer.folder() != 0,
+                                            egui::Button::new("↑").frame(false),
+                                        )
+                                        .on_hover_text("상위 폴더")
+                                        .clicked()
+                                    {
+                                        destination = source.scan.folders[explorer.folder()].parent;
+                                    }
+                                    let crumbs = explorer.breadcrumbs(&source.scan);
+                                    for folder in crumbs
+                                        .into_iter()
+                                        .rev()
+                                        .take(if crumb_width > 360.0 { 3 } else { 1 })
+                                        .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .rev()
+                                    {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(
+                                                        item_name(
+                                                            &source.scan,
+                                                            Item::Folder(folder),
+                                                        )
+                                                        .to_string_lossy(),
+                                                    )
+                                                    .strong(),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            destination = Some(folder);
+                                        }
+                                        if folder != explorer.folder() {
+                                            ui.weak("/");
+                                        }
+                                    }
+                                } else {
+                                    ui.strong(if self.locations_view.global_mode {
+                                        "등록 위치 전체"
+                                    } else {
+                                        "폴더"
+                                    });
+                                }
+                            },
+                        );
+                        crate::ui_style::slot(
+                            ui,
+                            egui::vec2(search_width, 40.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| self.search.controls(ui, self.locations_view.global_mode),
+                        );
+                    },
+                );
+            });
+        if let Some(folder) = destination.take() {
+            self.navigate(folder, false);
+        }
+        ui.painter().hline(
+            ui.min_rect().x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, crate::ui_style::LINE),
+        );
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(5, if compact { 1 } else { 3 }))
+            .show(ui, |ui| {
+                let narrow = ui.available_width() < 420.0;
+                if narrow {
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+                }
+                ui.horizontal(|ui| {
+                    for (tab, label) in [(0, "폴더·파일"), (1, "큰 파일"), (2, "확장자")]
+                    {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(label).color(
+                                    if self.tab == tab {
+                                        egui::Color32::from_rgb(165, 217, 255)
+                                    } else {
+                                        crate::ui_style::MUTED
+                                    },
+                                ))
+                                .fill(if self.tab == tab {
+                                    egui::Color32::from_rgb(33, 56, 76)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .frame(self.tab == tab)
+                                .min_size(egui::vec2(
+                                    if narrow { 65.0 } else { 75.0 },
+                                    if compact { 26.0 } else { 32.0 },
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.tab = tab;
+                        }
+                    }
+                    if self.tab != 0 {
+                        if narrow {
+                            ui.menu_button("범위", |ui| {
+                                ui.checkbox(&mut self.statistics.matched, "검색 일치 파일만");
+                            });
+                        } else {
+                            ui.checkbox(&mut self.statistics.matched, "검색 일치 파일만");
+                        }
+                    } else {
+                        self.search.column_controls(ui);
+                    }
+                });
+            });
         if self.tab != 0 {
             self.statistics.large_files = self.tab == 1;
             if self.tab == 1 {
@@ -822,69 +1123,13 @@ impl DiskWeaveApp {
             return;
         }
         let Some(source) = self.source() else {
-            ui.label("선택한 경로에서 ‘스캔 시작’을 누르면 파일과 폴더가 표시됩니다");
+            egui::Frame::new().inner_margin(24).show(ui, |ui| {
+                ui.weak("선택한 경로에서 ‘스캔 시작’을 누르면 파일과 폴더가 표시됩니다");
+            });
             return;
         };
-        let mut destination = None;
-        let Some(explorer) = &self.explorer else {
-            return;
-        };
-        if ui.available_height() > 200.0 {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(explorer.folder() != 0, egui::Button::new("↑ 상위"))
-                    .clicked()
-                {
-                    destination = source.scan.folders[explorer.folder()].parent;
-                }
-                for folder in explorer.breadcrumbs(&source.scan) {
-                    if ui
-                        .selectable_label(
-                            folder == explorer.folder(),
-                            item_name(&source.scan, Item::Folder(folder)).to_string_lossy(),
-                        )
-                        .clicked()
-                    {
-                        destination = Some(folder);
-                    }
-                    ui.weak("/");
-                }
-            });
-        } else {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(explorer.folder() != 0, egui::Button::new("↑ 상위"))
-                    .clicked()
-                {
-                    destination = source.scan.folders[explorer.folder()].parent;
-                }
-                ui.add(
-                    egui::Label::new(
-                        item_name(&source.scan, Item::Folder(explorer.folder())).to_string_lossy(),
-                    )
-                    .truncate(),
-                );
-            });
-        }
-        if let Some(folder) = destination {
-            self.navigate(folder, false);
-        }
-        if ui.available_height() > 200.0 {
-            if let Some(explorer) = &self.explorer {
-                ui.small(format!("직계 항목 {}개", explorer.entries().len()))
-                    .on_hover_text(
-                        self.scan
-                            .completed()
-                            .map(|c| c.path.display().to_string())
-                            .unwrap_or_default(),
-                    );
-            }
-        }
         self.search.headers(ui);
         self.search.poll();
-        if ui.available_height() > 150.0 {
-            self.search.status(ui);
-        }
         let mut open = None;
         let mut enter = None;
         let mut analyze = false;
@@ -898,31 +1143,40 @@ impl DiskWeaveApp {
             }
             let mut scroll = egui::ScrollArea::both()
                 .id_salt("entry_list")
-                .horizontal_scroll_offset(self.search.horizontal_offset);
+                .horizontal_scroll_offset(self.search.horizontal_offset)
+                .max_height((ui.available_height() - if compact { 0.0 } else { 28.0 }).max(20.0));
             if let Some(row) = self.search.reveal_row.take() {
-                scroll = scroll
-                    .vertical_scroll_offset(row as f32 * (26.0 + ui.spacing().item_spacing.y));
+                scroll = scroll.vertical_scroll_offset(row as f32 * crate::ui_style::ROW);
             }
-            let output = scroll.show_rows(ui, 26.0, results.items.len(), |ui, rows| {
-                for row in rows {
-                    let item = results.items[row];
-                    let background = ui.painter().add(egui::Shape::Noop);
-                    let row_ui = ui.horizontal(|ui| {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        let name = item_name(&source.scan, item).to_string_lossy();
-                        let response = ui.add_sized(
-                            [self.search.widths.get(0), 26.0],
-                            egui::Button::new(format!(
-                                "{} {name}",
-                                if matches!(item, Item::Folder(_)) {
-                                    "▱"
-                                } else {
-                                    "·"
-                                }
-                            ))
-                            .truncate()
-                            .frame(false)
-                            .selected(self.search.selection.contains(row)),
+            let output =
+                scroll.show_rows(ui, crate::ui_style::ROW, results.items.len(), |ui, rows| {
+                    for row in rows {
+                        let item = results.items[row];
+                        let response = crate::ui_style::row(
+                            ui,
+                            row,
+                            self.search.widths.total(
+                                self.search.show_path,
+                                self.search.show_modified,
+                                self.search.show_allocated,
+                            ),
+                            self.search.selection.contains(row),
+                            |ui| {
+                                crate::ui_style::name_cell(
+                                    ui,
+                                    self.search.widths.get(0),
+                                    &item_name(&source.scan, item).to_string_lossy(),
+                                    matches!(item, Item::Folder(_)),
+                                );
+                                self.search.widths.cells(
+                                    ui,
+                                    &source.scan,
+                                    item,
+                                    self.search.show_path,
+                                    self.search.show_modified,
+                                    self.search.show_allocated,
+                                );
+                            },
                         );
                         if response.clicked() {
                             let m = ui.input(|i| i.modifiers);
@@ -963,28 +1217,28 @@ impl DiskWeaveApp {
                                 }
                             });
                         });
-                        self.search.widths.cells(
-                            ui,
-                            &source.scan,
-                            item,
-                            self.search.show_path,
-                            self.search.show_modified,
-                            self.search.show_allocated,
-                        );
-                    });
-                    if self.search.selection.contains(row) {
-                        ui.painter().set(
-                            background,
-                            egui::Shape::rect_filled(
-                                row_ui.response.rect,
-                                0.0,
-                                egui::Color32::from_rgb(27, 52, 71),
-                            ),
-                        );
                     }
-                }
-            });
+                });
             self.search.horizontal_offset = output.state.clamped_offset().x;
+        }
+        if !compact {
+            egui::Frame::new()
+                .fill(crate::ui_style::SIDEBAR)
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    self.search.status(ui);
+                    if let Some(explorer) = &self.explorer {
+                        ui.response().on_hover_text(format!(
+                            "직계 항목 {}개 · {}",
+                            explorer.entries().len(),
+                            self.scan
+                                .completed()
+                                .map(|c| c.path.display().to_string())
+                                .unwrap_or_default()
+                        ));
+                    }
+                });
         }
         if let Some(item) = pick {
             self.detail_target = Some((source.id, source.generation, item));
@@ -1008,35 +1262,14 @@ impl DiskWeaveApp {
         }
     }
     fn details(&mut self, ui: &mut egui::Ui) {
-        ui.strong("저장 공간 구성");
-        ui.separator();
         ui.small(if self.statistics.matched {
-            "검색 일치 파일 기준"
+            "유형별 비율 · 검색 일치 파일"
         } else {
-            "분석 폴더 전체 기준"
+            "유형별 비율 · 폴더 전체"
         });
+        ui.add_space(8.0);
         if let Some(output) = &self.statistics.output {
             type_chart(ui, &output.stats);
-            for (label, total) in [
-                ("파일 할당 · 경로별", output.stats.allocation),
-                ("중복 제외 참고 합계", output.stats.unique_allocation),
-            ] {
-                let shown = crate::presentation::allocation_display(total);
-                ui.horizontal_wrapped(|ui| {
-                    ui.small(label);
-                    ui.label(shown.text).on_hover_text(shown.exact);
-                });
-            }
-            if output.stats.identity_conflicts > 0 {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    format!(
-                        "동일 ID의 할당값 불일치 {}개 제외",
-                        output.stats.identity_conflicts
-                    ),
-                );
-            }
-            ui.small("기본 스트림 · ADS 미수집 · 회수 가능 공간 아님");
         } else {
             ui.weak(if self.statistics.running {
                 "집계 중…"
@@ -1050,6 +1283,9 @@ impl DiskWeaveApp {
         let target = self.selection_target();
         let Some((id, generation, item)) = target else {
             ui.weak("항목을 선택하세요 · 여러 항목은 개별 열기를 실행하지 않습니다");
+            if let Some(output) = &self.statistics.output {
+                allocation_summary(ui, &output.stats);
+            }
             return;
         };
         let Some(entry) = self.scan.get(id).filter(|e| e.generation == generation) else {
@@ -1060,43 +1296,68 @@ impl DiskWeaveApp {
         };
         let scan = Arc::clone(&completed.result);
         let info = detail(&scan, item);
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(23, 35, 49))
-            .corner_radius(6)
-            .inner_margin(10)
-            .show(ui, |ui| {
-                ui.small(info.kind);
-                ui.label(
-                    egui::RichText::new(item_name(&scan, item).to_string_lossy())
-                        .size(17.0)
-                        .strong()
-                        .color(accent()),
-                );
-                ui.add(egui::Label::new(info.path.display().to_string()).wrap());
-            });
+        let (card, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 82.0), egui::Sense::hover());
+        ui.painter().rect_filled(card, 7.0, crate::ui_style::RAISED);
+        ui.painter().rect_stroke(
+            card,
+            7.0,
+            egui::Stroke::new(1.0, crate::ui_style::LINE),
+            egui::StrokeKind::Inside,
+        );
+        let inner = card.shrink2(egui::vec2(12.0, 9.0));
+        let top = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), 15.0));
+        crate::ui_style::text(ui, top, info.kind, false, crate::ui_style::MUTED, 11.0);
+        crate::ui_style::text(ui, top, &info.parent_percentage, true, accent(), 11.0);
+        let name = egui::Rect::from_min_size(
+            inner.min + egui::vec2(0.0, 20.0),
+            egui::vec2(inner.width(), 20.0),
+        );
+        crate::ui_style::text(
+            ui,
+            name,
+            &item_name(&scan, item).to_string_lossy(),
+            false,
+            crate::ui_style::TEXT,
+            15.0,
+        );
+        let path = egui::Rect::from_min_size(
+            inner.min + egui::vec2(0.0, 47.0),
+            egui::vec2(inner.width(), 15.0),
+        );
+        crate::ui_style::text(
+            ui,
+            path,
+            &info.path.display().to_string(),
+            false,
+            crate::ui_style::SOFT,
+            10.0,
+        );
+        response.on_hover_text(info.path.display().to_string());
         ui.add_space(5.0);
-        ui.label(format!("논리 크기 {}", info.size.text))
-            .on_hover_text(info.size.exact);
-        ui.label(format!("할당 크기 {}", info.allocated.text))
+        crate::ui_style::property(ui, "논리 크기", &info.size.text).on_hover_text(info.size.exact);
+        crate::ui_style::property(ui, "할당 크기", &info.allocated.text)
             .on_hover_text(info.allocated.exact);
-        ui.label(format!("부모 대비 {}", info.parent_percentage));
-        ui.small(format!("수정 {}", info.modified));
-        ui.small(format!("생성 {}", info.created));
-        ui.small(format!("속성 {}", info.attributes));
-        if matches!(item, Item::File(_)) {
-            ui.small(format!("Hard Link {}", info.links));
-            if let Item::File(id) = item {
-                if scan.files[id].extra.links.value().is_some_and(|n| n > 1) {
+        if let (Some(files), Some(folders)) = (info.files, info.folders) {
+            crate::ui_style::property(ui, "파일", &format!("{}개", crate::ui_style::count(files)));
+            crate::ui_style::property(
+                ui,
+                "하위 폴더",
+                &format!("{}개", crate::ui_style::count(folders)),
+            );
+        }
+        crate::ui_style::property(ui, "수정 시각", &info.modified);
+        ui.collapsing("추가 메타데이터", |ui| {
+            crate::ui_style::property(ui, "생성 시각", &info.created);
+            ui.small(format!("속성 {}", info.attributes));
+            if let Item::File(file) = item {
+                crate::ui_style::property(ui, "Hard Link", &info.links);
+                ui.small(format!("OS 파일 ID {}", info.identity));
+                if scan.files[file].extra.links.value().is_some_and(|n| n > 1) {
                     ui.small("같은 파일에 여러 이름이 있습니다. 경로별 합계에 중복될 수 있습니다");
                 }
             }
-            ui.collapsing("OS 파일 ID", |ui| {
-                ui.add(egui::Label::new(&info.identity).wrap());
-            });
-        }
-        if let (Some(files), Some(folders)) = (info.files, info.folders) {
-            ui.label(format!("파일 {files}개 · 하위 폴더 {folders}개"));
-        }
+        });
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -1123,33 +1384,48 @@ impl DiskWeaveApp {
         if let Some(action) = action {
             self.start_open(OpenRequest::for_item(&scan, item, action));
         }
+        if let Some(output) = &self.statistics.output {
+            allocation_summary(ui, &output.stats);
+        }
         ui.small("크기 필터·Treemap: 논리 크기 기준 · ADS 미수집");
     }
     fn map_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("공간 지도");
-            ui.selectable_value(&mut self.map_matched, false, "폴더 전체");
-            ui.selectable_value(&mut self.map_matched, true, "검색 일치 파일");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(if self.map_collapsed {
-                        "펼치기 ↑"
-                    } else {
-                        "접기 ↓"
-                    })
-                    .clicked()
-                {
-                    self.map_collapsed = !self.map_collapsed;
+        let width = ui.available_width();
+        crate::ui_style::slot(
+            ui,
+            egui::vec2(
+                width,
+                if self.map_collapsed || ui.available_height() < 140.0 {
+                    26.0
+                } else {
+                    34.0
+                },
+            ),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.strong(egui::RichText::new("공간 지도").size(12.0));
+                if width > 1050.0 {
+                    ui.small("면적 = 논리 크기");
                 }
-                if !self.map_collapsed {
-                    ui.add(
-                        egui::Slider::new(&mut self.map_height, 96.0..=360.0)
-                            .text("높이")
-                            .show_value(false),
-                    );
-                }
-            });
-        });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(if self.map_collapsed {
+                            "펼치기 ↑"
+                        } else {
+                            "접기 ↓"
+                        })
+                        .clicked()
+                    {
+                        self.map_collapsed = !self.map_collapsed;
+                    }
+                    ui.menu_button("지도 옵션", |ui| {
+                        ui.add(egui::Slider::new(&mut self.map_height, 96.0..=360.0).text("높이"));
+                    });
+                    ui.selectable_value(&mut self.map_matched, true, "검색 일치 파일");
+                    ui.selectable_value(&mut self.map_matched, false, "폴더 전체");
+                });
+            },
+        );
         if self.map_collapsed {
             return;
         }
@@ -1175,7 +1451,7 @@ impl DiskWeaveApp {
 impl eframe::App for DiskWeaveApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.map_height == 0.0 {
-            self.map_height = 200.0;
+            self.map_height = 245.0;
         }
         self.file_open.poll();
         self.sync_scan();
@@ -1199,22 +1475,41 @@ impl eframe::App for DiskWeaveApp {
             self.map_collapsed,
         );
         egui::Panel::top("brand")
-            .exact_size(50.0)
-            .frame(frame())
+            .exact_size(panels.header)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(16, 23, 32))
+                    .inner_margin(egui::Margin::symmetric(24, 14)),
+            )
             .show(ui, |ui| self.header(ui));
         egui::Panel::top("target")
-            .exact_size(84.0)
-            .frame(frame())
+            .exact_size(panels.target)
+            .frame(
+                egui::Frame::new()
+                    .fill(crate::ui_style::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(
+                        24,
+                        if size.y < 650.0 { 6 } else { 12 },
+                    )),
+            )
             .show(ui, |ui| self.toolbar(ui));
         self.sync_scan();
         egui::Panel::top("summary")
-            .exact_size(80.0)
-            .frame(egui::Frame::new().fill(bg()).inner_margin(10))
+            .exact_size(panels.summary)
+            .frame(
+                egui::Frame::new()
+                    .fill(bg())
+                    .inner_margin(egui::Margin::symmetric(
+                        24,
+                        if size.y < 650.0 { 6 } else { 12 },
+                    )),
+            )
             .show(ui, |ui| self.summary(ui));
         egui::Panel::bottom("status")
-            .exact_size(26.0)
+            .exact_size(panels.status)
             .frame(egui::Frame::new().fill(surface()).inner_margin(4))
             .show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = 20.0;
                 ui.horizontal(|ui| {
                     if self.scan.is_running() {
                         ui.spinner();
@@ -1337,24 +1632,32 @@ impl eframe::App for DiskWeaveApp {
         egui::Panel::left("tree")
             .exact_size(panels.left)
             .resizable(false)
-            .frame(frame())
+            .frame(egui::Frame::new().fill(surface()))
             .show(ui, |ui| self.tree(ui));
         if panels.right > 0.0 {
             egui::Panel::right("details")
                 .exact_size(panels.right)
                 .resizable(false)
-                .frame(frame())
+                .frame(egui::Frame::new().fill(surface()))
                 .show(ui, |ui| {
+                    crate::ui_style::panel_title(ui, "저장 공간 구성", "분석·상세");
                     egui::ScrollArea::vertical()
                         .id_salt("detail_scroll")
-                        .show(ui, |ui| self.details(ui));
+                        .show(ui, |ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(16, 14))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 7.0;
+                                    self.details(ui);
+                                });
+                        });
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(bg()).inner_margin(12))
+            .frame(egui::Frame::new().fill(bg()))
             .show(ui, |ui| {
-                ui.set_max_width((panels.center - 24.0).max(0.0));
-                ui.set_max_height((panels.body - 24.0).max(0.0));
+                ui.set_max_width(panels.center.max(0.0));
+                ui.set_max_height(panels.body.max(0.0));
                 self.center(ui);
             });
         self.refresh_derived();

@@ -20,6 +20,7 @@ mod search_view;
 mod target_selection;
 mod treemap;
 mod treemap_view;
+mod ui_style;
 mod workspace;
 
 use std::io;

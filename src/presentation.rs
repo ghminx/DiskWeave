@@ -115,11 +115,13 @@ pub fn percentage(bytes: u64, parent: u64) -> String {
 #[derive(Clone)]
 pub struct ColumnWidths {
     values: [f32; 8],
+    manual: bool,
 }
 impl Default for ColumnWidths {
     fn default() -> Self {
         Self {
-            values: [180.0, 260.0, 120.0, 145.0, 85.0, 80.0, 80.0, 130.0],
+            values: [280.0, 260.0, 150.0, 145.0, 100.0, 90.0, 80.0, 130.0],
+            manual: false,
         }
     }
 }
@@ -133,49 +135,97 @@ impl ColumnWidths {
         modified: bool,
         allocated: bool,
     ) {
-        use eframe::egui;
         let info = detail(scan, item);
-        ui.add_sized(
-            [self.get(2), 26.0],
-            egui::Label::new(info.size.text).truncate(),
-        )
-        .on_hover_text(info.size.exact);
-        if allocated {
-            ui.add_sized(
-                [self.get(7), 26.0],
-                egui::Label::new(info.allocated.text).truncate(),
-            )
-            .on_hover_text(info.allocated.exact);
-        }
-        ui.add_sized(
-            [self.get(4), 26.0],
-            egui::Label::new(info.parent_percentage),
+        let width = self.get(2);
+        let (rect, response) = ui.allocate_exact_size(
+            eframe::egui::vec2(width, crate::ui_style::ROW),
+            eframe::egui::Sense::hover(),
         );
+        let value_width = 88.0;
+        if width > 145.0 {
+            let track = eframe::egui::Rect::from_min_size(
+                rect.left_center() + eframe::egui::vec2(12.0, -2.5),
+                eframe::egui::vec2((width - value_width - 30.0).min(55.0), 5.0),
+            );
+            ui.painter()
+                .rect_filled(track, 3.0, eframe::egui::Color32::from_rgb(39, 52, 65));
+            let parent = match item {
+                Item::Folder(id) => scan.folders[id].parent,
+                Item::File(id) => Some(scan.files[id].parent),
+            };
+            let fraction = parent
+                .map(|p| scan.folders[p].logical_bytes)
+                .filter(|&n| n > 0)
+                .map_or(0.0, |n| {
+                    crate::search::item_bytes(scan, item) as f64 / n as f64
+                });
+            ui.painter().rect_filled(
+                eframe::egui::Rect::from_min_size(
+                    track.min,
+                    eframe::egui::vec2(track.width() * fraction.clamp(0.0, 1.0) as f32, 5.0),
+                ),
+                3.0,
+                crate::ui_style::ACCENT,
+            );
+        }
+        crate::ui_style::text(
+            ui,
+            rect.shrink2(eframe::egui::vec2(12.0, 0.0)),
+            &info.size.text,
+            true,
+            crate::ui_style::TEXT,
+            12.0,
+        );
+        response.on_hover_text(info.size.exact);
+        if allocated {
+            crate::ui_style::cell(ui, self.get(7), &info.allocated.text, true)
+                .on_hover_text(info.allocated.exact);
+        }
+        crate::ui_style::cell(ui, self.get(4), &info.parent_percentage, true);
         for (column, count) in [(5, info.files), (6, info.folders)] {
-            ui.add_sized(
-                [self.get(column), 26.0],
-                egui::Label::new(count.map(|v| v.to_string()).unwrap_or_else(|| "—".into()))
-                    .truncate(),
+            crate::ui_style::cell(
+                ui,
+                self.get(column),
+                &count
+                    .map(crate::ui_style::count)
+                    .unwrap_or_else(|| "—".into()),
+                true,
             );
         }
         if path {
-            ui.add_sized(
-                [self.get(1), 26.0],
-                egui::Label::new(info.path.display().to_string()).truncate(),
-            )
-            .on_hover_text(info.path.display().to_string());
+            crate::ui_style::cell(ui, self.get(1), &info.path.display().to_string(), false)
+                .on_hover_text(info.path.display().to_string());
         }
         if modified {
-            ui.add_sized(
-                [self.get(3), 26.0],
-                egui::Label::new(info.modified).truncate(),
-            );
+            crate::ui_style::cell(ui, self.get(3), &info.modified, false);
         }
+    }
+    pub fn fit(&mut self, available: f32, path: bool, modified: bool, allocated: bool) {
+        if self.manual {
+            return;
+        }
+        let extras = if path { self.get(1) } else { 0.0 }
+            + if modified { self.get(3) } else { 0.0 }
+            + if allocated { self.get(7) } else { 0.0 };
+        let base = (available - extras).max(620.0);
+        for (column, fraction) in [(0, 0.44), (2, 0.20), (4, 0.14), (5, 0.12), (6, 0.10)] {
+            self.values[column] = (base * fraction).max(if column == 0 { 180.0 } else { 64.0 });
+        }
+    }
+    pub fn total(&self, path: bool, modified: bool, allocated: bool) -> f32 {
+        [0, 2, 4, 5, 6]
+            .into_iter()
+            .map(|i| self.get(i))
+            .sum::<f32>()
+            + if path { self.get(1) } else { 0.0 }
+            + if modified { self.get(3) } else { 0.0 }
+            + if allocated { self.get(7) } else { 0.0 }
     }
     pub fn get(&self, column: usize) -> f32 {
         self.values[column]
     }
     pub fn set(&mut self, column: usize, width: f32) {
+        self.manual = true;
         self.values[column] = width.clamp(80.0, 800.0);
     }
 }

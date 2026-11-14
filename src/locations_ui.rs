@@ -21,6 +21,42 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn drive_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        running: bool,
+        current: &str,
+    ) -> Option<PathBuf> {
+        if !self.drives.started {
+            self.drives.refresh();
+        }
+        self.drives.poll();
+        let label = current
+            .get(..2)
+            .filter(|s| s.ends_with(':'))
+            .unwrap_or("위치");
+        let mut path = None;
+        ui.add_enabled_ui(!running, |ui| {
+            ui.menu_button(format!("{label}  ▾"), |ui| {
+                if self.drives.running() {
+                    ui.label("드라이브 조회 중…");
+                }
+                for drive in &self.drives.entries {
+                    if ui.button(drive.path.display().to_string()).clicked() {
+                        path = Some(drive.path.clone());
+                        ui.close();
+                    }
+                }
+                if let Some(error) = &self.drives.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if ui.button("새로고침").clicked() {
+                    self.drives.refresh();
+                }
+            });
+        });
+        path
+    }
     pub fn selected_target(&self) -> Option<crate::map_job::Target> {
         if self.selection.count() != 1 {
             return None;
@@ -186,7 +222,6 @@ impl LocationsView {
     ) -> (Option<OpenRequest>, Option<(u64, u64, Item)>) {
         self.selection_changed = false;
         self.refresh(locations, &search.input);
-        search.headers(ui);
         let excluded = locations
             .entries
             .iter()
@@ -198,7 +233,6 @@ impl LocationsView {
             .iter()
             .map(|source| source.scan.skipped_reparse_points)
             .sum();
-        ui.label(format!("마지막 성공 스캔 기준 · 미수집/오래된 위치 {excluded}개 제외 · 접근 오류 {errors}건 · Reparse 제외 {skipped}개"));
         if self.job.running {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -219,118 +253,106 @@ impl LocationsView {
         let mut open = None;
         let mut analyze = None;
         if let Some(results) = &self.job.results {
-            ui.label(format!(
-                "결과 {}개 · 선택 {}개 · 날짜 미수집 제외 {}개",
-                results.hits.len(),
-                self.selection.count(),
-                results.unknown_dates
-            ));
             if !search.editing
                 && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
             {
                 self.selection.all(results.hits.len());
                 self.selection_changed = true;
             }
+            search.headers(ui);
             let output = egui::ScrollArea::both()
                 .id_salt("global_results")
                 .horizontal_scroll_offset(search.horizontal_offset)
-                .max_height(ui.available_height().max(30.0))
-                .show_rows(ui, 28.0, results.hits.len(), |ui, rows| {
+                .max_height((ui.available_height() - 28.0).max(30.0))
+                .show_rows(ui, crate::ui_style::ROW, results.hits.len(), |ui, rows| {
                     for row in rows {
                         let hit = &results.hits[row];
                         let source = &results.sources[hit.source];
-                        let background = ui.painter().add(egui::Shape::Noop);
-                        let row_ui = ui.horizontal(|ui| {
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                            let response = ui
-                                .add_sized(
-                                    [search.widths.get(0), 26.0],
-                                    egui::Button::new(
-                                        item_name(&source.scan, hit.item).to_string_lossy(),
-                                    )
-                                    .truncate()
-                                    .frame(false)
-                                    .selected(self.selection.contains(row)),
-                                )
-                                .on_hover_text(format!(
-                                    "출처: {}",
-                                    source.scan.folders[0].path.display()
-                                ));
-                            if response.clicked() {
-                                let m = ui.input(|i| i.modifiers);
-                                self.selection.click(row, m.ctrl, m.shift);
-                                self.selection_changed = true;
-                            }
-                            if response.secondary_clicked() && !self.selection.contains(row) {
-                                self.selection.click(row, false, false);
-                                self.selection_changed = true;
-                            }
-                            if response.double_clicked() && self.selection.count() <= 1 {
-                                match hit.item {
-                                    Item::Folder(_) => {
-                                        analyze = Some((source.id, source.generation, hit.item))
-                                    }
-                                    Item::File(_) => {
-                                        open = Some(OpenRequest::for_item(
-                                            &source.scan,
-                                            hit.item,
-                                            OpenAction::OpenFile,
-                                        ))
-                                    }
-                                }
-                            }
-                            response.context_menu(|ui| {
-                                ui.add_enabled_ui(self.selection.count() == 1, |ui| {
-                                    if ui.button("분석에서 보기").clicked() {
-                                        analyze = Some((source.id, source.generation, hit.item));
-                                        ui.close();
-                                    }
-                                    let action = match hit.item {
-                                        Item::Folder(_) => OpenAction::OpenFolder,
-                                        Item::File(_) => OpenAction::OpenFile,
-                                    };
-                                    if ui.button("열기").clicked() {
-                                        open = Some(OpenRequest::for_item(
-                                            &source.scan,
-                                            hit.item,
-                                            action,
-                                        ));
-                                        ui.close();
-                                    }
-                                    if matches!(hit.item, Item::File(_))
-                                        && ui.button("파일 위치 열기").clicked()
-                                    {
-                                        open = Some(OpenRequest::for_item(
-                                            &source.scan,
-                                            hit.item,
-                                            OpenAction::RevealFile,
-                                        ));
-                                        ui.close();
-                                    }
-                                });
-                            });
-                            search.widths.cells(
-                                ui,
-                                &source.scan,
-                                hit.item,
+                        let response = crate::ui_style::row(
+                            ui,
+                            row,
+                            search.widths.total(
                                 search.show_path,
                                 search.show_modified,
                                 search.show_allocated,
-                            );
-                        });
-                        if self.selection.contains(row) {
-                            ui.painter().set(
-                                background,
-                                egui::Shape::rect_filled(
-                                    row_ui.response.rect,
-                                    0.0,
-                                    egui::Color32::from_rgb(27, 52, 71),
-                                ),
-                            );
+                            ),
+                            self.selection.contains(row),
+                            |ui| {
+                                crate::ui_style::name_cell(
+                                    ui,
+                                    search.widths.get(0),
+                                    &item_name(&source.scan, hit.item).to_string_lossy(),
+                                    matches!(hit.item, Item::Folder(_)),
+                                );
+                                search.widths.cells(
+                                    ui,
+                                    &source.scan,
+                                    hit.item,
+                                    search.show_path,
+                                    search.show_modified,
+                                    search.show_allocated,
+                                );
+                            },
+                        )
+                        .on_hover_text(format!("출처: {}", source.scan.folders[0].path.display()));
+                        if response.clicked() {
+                            let m = ui.input(|i| i.modifiers);
+                            self.selection.click(row, m.ctrl, m.shift);
+                            self.selection_changed = true;
                         }
+                        if response.secondary_clicked() && !self.selection.contains(row) {
+                            self.selection.click(row, false, false);
+                            self.selection_changed = true;
+                        }
+                        if response.double_clicked() && self.selection.count() <= 1 {
+                            match hit.item {
+                                Item::Folder(_) => {
+                                    analyze = Some((source.id, source.generation, hit.item))
+                                }
+                                Item::File(_) => {
+                                    open = Some(OpenRequest::for_item(
+                                        &source.scan,
+                                        hit.item,
+                                        OpenAction::OpenFile,
+                                    ))
+                                }
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            ui.add_enabled_ui(self.selection.count() == 1, |ui| {
+                                if ui.button("분석에서 보기").clicked() {
+                                    analyze = Some((source.id, source.generation, hit.item));
+                                    ui.close();
+                                }
+                                let action = match hit.item {
+                                    Item::Folder(_) => OpenAction::OpenFolder,
+                                    Item::File(_) => OpenAction::OpenFile,
+                                };
+                                if ui.button("열기").clicked() {
+                                    open =
+                                        Some(OpenRequest::for_item(&source.scan, hit.item, action));
+                                    ui.close();
+                                }
+                                if matches!(hit.item, Item::File(_))
+                                    && ui.button("파일 위치 열기").clicked()
+                                {
+                                    open = Some(OpenRequest::for_item(
+                                        &source.scan,
+                                        hit.item,
+                                        OpenAction::RevealFile,
+                                    ));
+                                    ui.close();
+                                }
+                            });
+                        });
                     }
                 });
             search.horizontal_offset = output.state.clamped_offset().x;
+            egui::Frame::new().fill(crate::ui_style::SIDEBAR).inner_margin(egui::Margin::symmetric(12,6)).show(ui,|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.small(format!("결과 {}개 · 선택 {}개 · 날짜 미수집 제외 {}개",results.hits.len(),self.selection.count(),results.unknown_dates))
+                    .on_hover_text(format!("마지막 성공 스캔 기준 · 미수집/오래된 위치 {excluded}개 제외 · 접근 오류 {errors}건 · Reparse 제외 {skipped}개"));
+            });
         }
         (open, analyze)
     }

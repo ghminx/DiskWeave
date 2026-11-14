@@ -34,21 +34,30 @@ impl MapView {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
         let Some(output) = &map.output else {
+            if !map.running {
+                ui.painter().text(
+                    ui.available_rect_before_wrap().center(),
+                    egui::Align2::CENTER_CENTER,
+                    "스캔 완료 후 용량별 공간 지도가 표시됩니다",
+                    egui::FontId::proportional(12.0),
+                    crate::ui_style::SOFT,
+                );
+            }
             return None;
         };
         if output.data.tiles.is_empty() {
             ui.label("표시할 용량이 없습니다 · 0 Byte 항목은 목록에서 확인하세요");
             return None;
         }
-        ui.small(format!(
+        let summary = format!(
             "논리 크기 {} · {}개 타일 · 0 Byte {}개 제외",
             SizeDisplay::new(output.data.total).text,
             output.data.tiles.len(),
             output.data.zero_count
-        ));
+        );
         let size = egui::vec2(
             ui.available_width().max(0.0),
-            ui.available_height().max(0.0),
+            (ui.available_height() - 23.0).max(0.0),
         );
         let (area, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         let key = (map.revision, [size.x, size.y]);
@@ -59,13 +68,14 @@ impl MapView {
                 .data
                 .tiles
                 .iter()
-                .map(|tile| {
+                .enumerate()
+                .map(|(row, tile)| {
                     if let Some(hit) = tile.target {
                         let scan = &output.sources[hit.source].scan;
                         match hit.item {
-                            Item::Folder(id) => crate::presentation::category_color(
-                                scan.folders[id].path.as_os_str(),
-                            ),
+                            Item::Folder(_) => {
+                                crate::ui_style::MAP_COLORS[row % crate::ui_style::MAP_COLORS.len()]
+                            }
                             Item::File(id) => {
                                 crate::presentation::category_color(std::ffi::OsStr::new(
                                     &crate::analysis::extension(&scan.files[id].name),
@@ -122,8 +132,12 @@ impl MapView {
                 })
                 .unwrap_or_else(|| format!("묶인 항목 {}개", tile.count));
             if paint.width() > 65.0 && paint.height() > 24.0 {
-                let painter = ui.painter().with_clip_rect(paint.shrink(6.0));
-                let center = paint.left_center() + egui::vec2(10.0, -7.0);
+                let painter = ui.painter().with_clip_rect(paint.shrink2(egui::vec2(
+                    6.0,
+                    if paint.height() > 46.0 { 6.0 } else { 2.0 },
+                )));
+                let center = paint.left_center()
+                    + egui::vec2(10.0, if paint.height() > 46.0 { -7.0 } else { 0.0 });
                 painter.text(
                     center,
                     egui::Align2::LEFT_CENTER,
@@ -199,6 +213,29 @@ impl MapView {
                 });
             }
         }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            for (row, tile) in output.data.tiles.iter().enumerate().take(5) {
+                if let Some(hit) = tile.target {
+                    let name = crate::search::item_name(&output.sources[hit.source].scan, hit.item)
+                        .to_string_lossy();
+                    ui.colored_label(self.colors[row], egui::RichText::new("■").size(8.0));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(name)
+                                .size(10.0)
+                                .color(crate::ui_style::SOFT),
+                        )
+                        .truncate(),
+                    );
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.small(&summary).on_hover_text(
+                    "클릭으로 선택 · 폴더 더블클릭으로 이동 · 0 Byte는 목록에서 확인",
+                );
+            });
+        });
         event
     }
 }
