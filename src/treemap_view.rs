@@ -46,11 +46,11 @@ impl MapView {
             return None;
         };
         if output.data.tiles.is_empty() {
-            ui.label("표시할 용량이 없습니다 · 0 Byte 항목은 목록에서 확인하세요");
+            ui.label("표시할 용량이 없습니다 · 0 B 항목은 목록에서 확인하세요");
             return None;
         }
         let summary = format!(
-            "논리 크기 {} · {}개 타일 · 0 Byte {}개 제외",
+            "전체 크기 {} · {}개 영역 · 0 B {}개 제외",
             SizeDisplay::new(output.data.total).text,
             output.data.tiles.len(),
             output.data.zero_count
@@ -183,7 +183,7 @@ impl MapView {
                     event = Some(MapEvent::Pick(row));
                 }
                 response.context_menu(|ui| {
-                    if ui.button("분석에서 보기").clicked() {
+                    if ui.button("용량 분석으로 이동").clicked() {
                         event = Some(MapEvent::Analyze(row));
                         ui.close();
                     }
@@ -231,9 +231,8 @@ impl MapView {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.small(&summary).on_hover_text(
-                    "클릭으로 선택 · 폴더 더블클릭으로 이동 · 0 Byte는 목록에서 확인",
-                );
+                ui.small(&summary)
+                    .on_hover_text("클릭으로 선택 · 폴더 더블클릭으로 이동 · 0 B는 목록에서 확인");
             });
         });
         event

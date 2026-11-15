@@ -24,8 +24,8 @@ pub struct SizeDisplay {
 }
 pub fn missing_display(missing: crate::metadata::Missing) -> &'static str {
     match missing {
-        crate::metadata::Missing::NotCollected => "미수집",
-        crate::metadata::Missing::Unsupported => "미지원",
+        crate::metadata::Missing::NotCollected => "확인하지 않음",
+        crate::metadata::Missing::Unsupported => "지원하지 않음",
         crate::metadata::Missing::Failed => "조회 실패",
     }
 }
@@ -42,9 +42,9 @@ pub fn allocation_display(total: crate::metadata::Allocation) -> SizeDisplay {
     } else if total.known > 0 {
         format!("{} (일부)", size.text)
     } else if total.not_collected > 0 && total.unsupported == 0 && total.failed == 0 {
-        "미수집".into()
+        "확인하지 않음".into()
     } else if total.unsupported > 0 && total.not_collected == 0 && total.failed == 0 {
-        "미지원".into()
+        "지원하지 않음".into()
     } else if total.failed > 0 && total.unsupported == 0 && total.not_collected == 0 {
         "조회 실패".into()
     } else {
@@ -53,7 +53,7 @@ pub fn allocation_display(total: crate::metadata::Allocation) -> SizeDisplay {
     SizeDisplay {
         text,
         exact: format!(
-            "{} B 확인분 · 확인 {} · 미수집 {} · 미지원 {} · 조회 실패 {} · 기본 데이터 스트림 기준, ADS 미수집",
+            "확인된 합계 {} B · 확인 {}개 · 확인하지 않음 {}개 · 지원하지 않음 {}개 · 조회 실패 {}개 · 기본 데이터 스트림 기준이며 추가 데이터 스트림(ADS)은 포함하지 않음",
             total.bytes, total.known, total.not_collected, total.unsupported, total.failed
         ),
     }
@@ -114,6 +114,7 @@ pub fn percentage(bytes: u64, parent: u64) -> String {
 
 #[derive(Clone)]
 pub struct ColumnWidths {
+    pub result_mode: bool,
     values: [f32; 8],
     manual: bool,
 }
@@ -122,6 +123,7 @@ impl Default for ColumnWidths {
         Self {
             values: [280.0, 260.0, 150.0, 145.0, 100.0, 90.0, 80.0, 130.0],
             manual: false,
+            result_mode: false,
         }
     }
 }
@@ -131,7 +133,7 @@ impl ColumnWidths {
         ui: &mut eframe::egui::Ui,
         scan: &ScanResult,
         item: Item,
-        path: bool,
+        path: Option<bool>,
         modified: bool,
         allocated: bool,
     ) {
@@ -181,20 +183,45 @@ impl ColumnWidths {
             crate::ui_style::cell(ui, self.get(7), &info.allocated.text, true)
                 .on_hover_text(info.allocated.exact);
         }
-        crate::ui_style::cell(ui, self.get(4), &info.parent_percentage, true);
-        for (column, count) in [(5, info.files), (6, info.folders)] {
-            crate::ui_style::cell(
-                ui,
-                self.get(column),
-                &count
-                    .map(crate::ui_style::count)
-                    .unwrap_or_else(|| "—".into()),
-                true,
-            );
+        if !self.result_mode {
+            crate::ui_style::cell(ui, self.get(4), &info.parent_percentage, true);
+            for (column, count) in [(5, info.files), (6, info.folders)] {
+                crate::ui_style::cell(
+                    ui,
+                    self.get(column),
+                    &count
+                        .map(crate::ui_style::count)
+                        .unwrap_or_else(|| "—".into()),
+                    true,
+                );
+            }
         }
-        if path {
-            crate::ui_style::cell(ui, self.get(1), &info.path.display().to_string(), false)
-                .on_hover_text(info.path.display().to_string());
+        if let Some(source) = path {
+            let path = info.path.display().to_string();
+            if source {
+                let (rect, response) = ui.allocate_exact_size(
+                    eframe::egui::vec2(self.get(1), crate::ui_style::ROW),
+                    eframe::egui::Sense::hover(),
+                );
+                let rect = rect.shrink2(eframe::egui::vec2(12.0, 0.0));
+                let line = eframe::egui::Rect::from_min_size(
+                    rect.min + eframe::egui::vec2(0.0, 3.0),
+                    eframe::egui::vec2(rect.width(), 17.0),
+                );
+                crate::ui_style::text(ui, line, &path, false, crate::ui_style::TEXT, 11.0);
+                let origin = format!("분석 위치: {}", scan.folders[0].path.display());
+                crate::ui_style::text(
+                    ui,
+                    line.translate(eframe::egui::vec2(0.0, 17.0)),
+                    &origin,
+                    false,
+                    crate::ui_style::SOFT,
+                    10.0,
+                );
+                response.on_hover_text(format!("{path}\n{origin}"));
+            } else {
+                crate::ui_style::cell(ui, self.get(1), &path, false).on_hover_text(path);
+            }
         }
         if modified {
             crate::ui_style::cell(ui, self.get(3), &info.modified, false);
@@ -202,6 +229,15 @@ impl ColumnWidths {
     }
     pub fn fit(&mut self, available: f32, path: bool, modified: bool, allocated: bool) {
         if self.manual {
+            return;
+        }
+        if self.result_mode && path {
+            let extra = if modified { self.get(3) } else { 0.0 }
+                + if allocated { self.get(7) } else { 0.0 };
+            let base = (available - extra).max(480.0);
+            self.values[0] = (base * 0.30).max(160.0);
+            self.values[2] = 120.0;
+            self.values[1] = (base - self.values[0] - self.values[2]).max(180.0);
             return;
         }
         let extras = if path { self.get(1) } else { 0.0 }
@@ -215,6 +251,7 @@ impl ColumnWidths {
     pub fn total(&self, path: bool, modified: bool, allocated: bool) -> f32 {
         [0, 2, 4, 5, 6]
             .into_iter()
+            .filter(|&i| !self.result_mode || i == 0 || i == 2)
             .map(|i| self.get(i))
             .sum::<f32>()
             + if path { self.get(1) } else { 0.0 }
@@ -308,14 +345,14 @@ mod tests {
         assert_eq!(allocation_display(Allocation::default()).text, "0 B");
         let mut total = Allocation::default();
         total.add(Field::Missing(Missing::NotCollected)).unwrap();
-        assert_eq!(allocation_display(total).text, "미수집");
+        assert_eq!(allocation_display(total).text, "확인하지 않음");
         let mut total = Allocation::default();
         total.add(Field::Missing(Missing::Unsupported)).unwrap();
-        assert_eq!(allocation_display(total).text, "미지원");
+        assert_eq!(allocation_display(total).text, "지원하지 않음");
         total.add(Field::Value(4096)).unwrap();
         let shown = allocation_display(total);
         assert_eq!(shown.text, "4.0 KiB (일부)");
-        assert!(shown.exact.contains("4096 B") && shown.exact.contains("미지원 1"));
+        assert!(shown.exact.contains("4096 B") && shown.exact.contains("지원하지 않음 1개"));
         assert_eq!(
             attributes_display(0xA03),
             "읽기 전용 · 숨김 · Sparse · 압축 (0x00000A03)"
@@ -343,7 +380,7 @@ mod tests {
         assert_eq!(info.path, root.join("child/model.bin"));
         assert_eq!(info.kind, "파일");
         assert_eq!(info.size.exact, "3 B");
-        assert_eq!(info.modified, "미수집");
+        assert_eq!(info.modified, "확인 불가");
         assert_eq!((info.files, info.folders), (None, None));
         std::fs::remove_dir_all(root).unwrap();
     }

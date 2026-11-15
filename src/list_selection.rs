@@ -1,6 +1,27 @@
 use crate::explorer::Item;
 use std::collections::BTreeSet;
 
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SelectionSummary {
+    pub files: usize,
+    pub folders: usize,
+}
+impl SelectionSummary {
+    pub fn from_items(items: impl Iterator<Item = Item>) -> Self {
+        let mut summary = Self::default();
+        for item in items {
+            match item {
+                Item::File(_) => summary.files += 1,
+                Item::Folder(_) => summary.folders += 1,
+            }
+        }
+        summary
+    }
+    pub fn count(&self) -> usize {
+        self.files + self.folders
+    }
+}
+
 #[derive(Default)]
 pub struct ListSelection {
     rows: BTreeSet<usize>,

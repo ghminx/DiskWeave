@@ -94,7 +94,7 @@ impl SearchInput {
             Some(self.min_size.trim().parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "최소 크기는 Byte 단위의 정수여야 합니다",
+                    "최소 크기에 0 이상의 정수를 입력하세요. 단위는 바이트(B)입니다.",
                 )
             })?)
         };
@@ -104,7 +104,7 @@ impl SearchInput {
             Some(self.max_size.trim().parse().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "최대 크기는 Byte 단위의 정수여야 합니다",
+                    "최대 크기에 0 이상의 정수를 입력하세요. 단위는 바이트(B)입니다.",
                 )
             })?)
         };

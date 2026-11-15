@@ -175,7 +175,7 @@ impl AnalysisPanel {
         };
         let size = crate::presentation::SizeDisplay::new(output.stats.bytes);
         ui.label(format!(
-            "논리 크기 {} · 파일 {}개 · Hard Link는 경로별 집계",
+            "파일 크기 {} · 파일 {}개 · Hard Link는 경로별 집계",
             size.text, output.stats.files
         ))
         .on_hover_text(size.exact);
@@ -195,7 +195,7 @@ impl AnalysisPanel {
                     "파일 경로",
                     false,
                 );
-                crate::ui_style::header_cell(ui, 140.0, "논리 크기 ↓", true);
+                crate::ui_style::header_cell(ui, 140.0, "파일 크기 ↓", true);
             });
             egui::ScrollArea::both()
                 .id_salt("statistics_top")
@@ -241,7 +241,7 @@ impl AnalysisPanel {
                                 action = Some((row, OpenAction::RevealFile));
                                 ui.close();
                             }
-                            if ui.button("분석에서 보기").clicked() {
+                            if ui.button("용량 분석으로 이동").clicked() {
                                 analyze = Some(row);
                                 ui.close();
                             }
@@ -254,7 +254,7 @@ impl AnalysisPanel {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (fraction, label, right) in [
                     (0.4, "확장자", false),
-                    (0.25, "논리 크기 ↓", true),
+                    (0.25, "파일 크기 ↓", true),
                     (0.15, "파일", true),
                     (0.2, "집계 범위 대비", true),
                 ] {

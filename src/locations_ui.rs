@@ -21,6 +21,26 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn choose_scope(&mut self, view: &mut SearchView, scope: crate::search_view::SearchScope) {
+        view.invalidate();
+        self.selection.clear();
+        self.selection_changed = true;
+        self.job.cancel();
+        self.key = None;
+        self.global_mode = scope == crate::search_view::SearchScope::Registered;
+        view.whole_scan = scope == crate::search_view::SearchScope::Location;
+    }
+    pub fn select_result(&mut self, row: usize, ctrl: bool, shift: bool) {
+        self.selection.click(row, ctrl, shift);
+        self.selection_changed = true;
+    }
+    pub fn selection_summary(&self) -> crate::list_selection::SelectionSummary {
+        crate::list_selection::SelectionSummary::from_items(
+            self.selection
+                .rows()
+                .filter_map(|row| self.results()?.hits.get(row).map(|hit| hit.item)),
+        )
+    }
     pub fn drive_control(
         &mut self,
         ui: &mut egui::Ui,
@@ -73,7 +93,7 @@ impl LocationsView {
                 let s = &results.sources[hit.source];
                 (s.id, s.generation, hit.item) == target
             }) {
-                self.selection.click(row, false, false);
+                self.select_result(row, false, false);
             }
         }
     }
@@ -101,7 +121,7 @@ impl LocationsView {
         }
         self.drives.poll();
         let mut path = None;
-        ui.collapsing("드라이브·등록 위치", |ui| {
+        ui.collapsing("드라이브·분석 위치", |ui| {
             if ui.button("드라이브 새로고침").clicked() {
                 self.drives.refresh();
             }
@@ -109,7 +129,7 @@ impl LocationsView {
                 let capacity = drive
                     .available
                     .map(|n| format!("여유 {n} B"))
-                    .unwrap_or_else(|| "준비 안 됨 / 조회 불가".into());
+                    .unwrap_or_else(|| "드라이브 정보를 확인할 수 없습니다".into());
                 if ui
                     .add_enabled(
                         !locations.is_running(),
@@ -135,7 +155,7 @@ impl LocationsView {
                 if ui
                     .add_enabled(
                         !locations.is_running() && target.is_some(),
-                        egui::Button::new("입력 경로 등록"),
+                        egui::Button::new("이 폴더 추가"),
                     )
                     .clicked()
                 {
@@ -145,7 +165,10 @@ impl LocationsView {
                         .map(|e| e.to_string());
                 }
                 if ui
-                    .add_enabled(!locations.is_running(), egui::Button::new("선택 위치 스캔"))
+                    .add_enabled(
+                        !locations.is_running(),
+                        egui::Button::new("선택한 위치 스캔"),
+                    )
                     .clicked()
                 {
                     let ids: Vec<_> = locations
@@ -178,17 +201,17 @@ impl LocationsView {
                         self.global_mode = false;
                     }
                     let state = if entry.stale {
-                        "오프라인/실패 · 이전 결과 오래됨"
+                        "스캔 실패 · 이전 결과 표시"
                     } else if entry.scan.is_running() {
                         "스캔 중"
                     } else if entry.scan.completed().is_some() {
-                        "수집 완료"
+                        "스캔 완료"
                     } else {
-                        "미수집"
+                        "스캔 전"
                     };
                     ui.label(state);
                     if ui
-                        .add_enabled(!running, egui::Button::new("등록 제거"))
+                        .add_enabled(!running, egui::Button::new("목록에서 빼기"))
                         .clicked()
                     {
                         remove = Some(entry.id);
@@ -206,7 +229,7 @@ impl LocationsView {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
         });
-        ui.checkbox(&mut self.global_mode, "등록 위치 전체 검색");
+        ui.checkbox(&mut self.global_mode, "모든 분석 위치 검색");
         if self.drives.running() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
@@ -236,7 +259,7 @@ impl LocationsView {
         if self.job.running {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("등록 위치 검색 중…");
+                ui.label("모든 분석 위치에서 찾는 중…");
                 if ui.button("검색 취소").clicked() {
                     self.job.cancel();
                     self.selection.clear();
@@ -260,6 +283,15 @@ impl LocationsView {
                 self.selection_changed = true;
             }
             search.headers(ui);
+            if results.hits.is_empty() {
+                ui.weak(if results.sources.is_empty() {
+                    "스캔된 위치가 없습니다. 분석할 위치를 먼저 스캔하세요."
+                } else if search.input.is_active() {
+                    "검색 결과가 없습니다. 검색어나 필터를 바꿔 보세요."
+                } else {
+                    "분석한 위치에 표시할 파일이나 폴더가 없습니다."
+                });
+            }
             let output = egui::ScrollArea::both()
                 .id_salt("global_results")
                 .horizontal_scroll_offset(search.horizontal_offset)
@@ -288,13 +320,16 @@ impl LocationsView {
                                     ui,
                                     &source.scan,
                                     hit.item,
-                                    search.show_path,
+                                    search.show_path.then_some(search.show_source),
                                     search.show_modified,
                                     search.show_allocated,
                                 );
                             },
                         )
-                        .on_hover_text(format!("출처: {}", source.scan.folders[0].path.display()));
+                        .on_hover_text(format!(
+                            "분석 위치: {}",
+                            source.scan.folders[0].path.display()
+                        ));
                         if response.clicked() {
                             let m = ui.input(|i| i.modifiers);
                             self.selection.click(row, m.ctrl, m.shift);
@@ -320,7 +355,7 @@ impl LocationsView {
                         }
                         response.context_menu(|ui| {
                             ui.add_enabled_ui(self.selection.count() == 1, |ui| {
-                                if ui.button("분석에서 보기").clicked() {
+                                if ui.button("용량 분석으로 이동").clicked() {
                                     analyze = Some((source.id, source.generation, hit.item));
                                     ui.close();
                                 }
@@ -350,10 +385,86 @@ impl LocationsView {
             search.horizontal_offset = output.state.clamped_offset().x;
             egui::Frame::new().fill(crate::ui_style::SIDEBAR).inner_margin(egui::Margin::symmetric(12,6)).show(ui,|ui| {
                 ui.set_min_width(ui.available_width());
-                ui.small(format!("결과 {}개 · 선택 {}개 · 날짜 미수집 제외 {}개",results.hits.len(),self.selection.count(),results.unknown_dates))
-                    .on_hover_text(format!("마지막 성공 스캔 기준 · 미수집/오래된 위치 {excluded}개 제외 · 접근 오류 {errors}건 · Reparse 제외 {skipped}개"));
+                ui.small(format!("{}개 항목 · {}개 선택{}",results.hits.len(),self.selection.count(),if results.unknown_dates>0{format!(" · 수정 날짜 확인 불가 {}개 제외",results.unknown_dates)}else{String::new()}))
+                    .on_hover_text(format!("마지막 성공 스캔 기준 · 스캔 전/갱신이 필요한 위치 {excluded}개 제외 · 접근 오류 {errors}건 · 특수 경로 제외 {skipped}개"));
             });
         }
         (open, analyze)
+    }
+}
+
+#[cfg(test)]
+mod search_ui_tests {
+    use super::*;
+    use crate::search_view::SearchScope;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn scope_switch_keeps_conditions_and_routes_real_results_without_old_selection() {
+        let root = std::env::temp_dir().join(format!("diskweave-ui-scopes-{}", std::process::id()));
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join(name).join("child")).unwrap();
+            std::fs::write(root.join(name).join("child/model.bin"), [0; 3]).unwrap();
+        }
+        let mut locations = Locations::default();
+        let a = locations.add(&root.join("a")).unwrap();
+        let b = locations.add(&root.join("b")).unwrap();
+        locations.start_selected(&[a, b]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() && Instant::now() < deadline {
+            locations.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!locations.is_running());
+        locations.choose(a);
+        let scan = locations
+            .get(a)
+            .unwrap()
+            .scan
+            .completed()
+            .unwrap()
+            .result
+            .clone();
+        let child = scan.folder_index(std::path::Path::new("child")).unwrap();
+        let mut view = SearchView::default();
+        let mut global = LocationsView::default();
+        view.input.text = "model".into();
+        view.input.sort = crate::search::SortField::Name;
+        view.selection.click(0, false, false);
+        let query = view.input.clone();
+        global.choose_scope(&mut view, SearchScope::Location);
+        assert_eq!(view.input, query);
+        assert_eq!(view.selection.count(), 0);
+        view.clear_conditions();
+        view.refresh(&scan, child);
+        while view.job.results().is_none() && Instant::now() < deadline {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(view.job.results().unwrap().items, vec![Item::Folder(child)]);
+        view.selection.all(1);
+        assert_eq!(view.selection_summary().folders, 1);
+        view.input.text = "model".into();
+        global.choose_scope(&mut view, SearchScope::Registered);
+        while global.results().is_none() && Instant::now() < deadline {
+            global.refresh(&locations, &view.input);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let results = global.results().unwrap();
+        assert_eq!(results.hits.len(), 2);
+        for hit in &results.hits {
+            assert!(
+                crate::search::item_path(&results.sources[hit.source].scan, hit.item)
+                    .ends_with("child/model.bin")
+            );
+        }
+        global.select_result(0, false, false);
+        global.select_result(1, true, false);
+        let summary = global.selection_summary();
+        assert_eq!((summary.files, summary.folders), (2, 0));
+        assert!(global.selected_target().is_none());
+        global.choose_scope(&mut view, SearchScope::Folder);
+        assert_eq!(global.selection_summary().count(), 0);
+        assert_eq!(view.input.text, "model");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

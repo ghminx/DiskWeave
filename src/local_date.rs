@@ -180,7 +180,7 @@ pub fn range(from: &str, through: &str) -> io::Result<(Option<SystemTime>, Optio
 
 pub fn display(time: Option<SystemTime>) -> String {
     let Some(time) = time else {
-        return "미수집".into();
+        return "확인 불가".into();
     };
     let formatted = (|| -> io::Result<String> {
         const UNIX_TICKS: u64 = 116_444_736_000_000_000;
