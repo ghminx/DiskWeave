@@ -16,11 +16,15 @@ const FILE_COMPRESSION_INFO: i32 = 8;
 const FILE_ID_INFO: i32 = 18;
 
 pub struct ScanSettings {
+    pub method: crate::engine::Method,
     pub detailed: bool,
 }
 impl Default for ScanSettings {
     fn default() -> Self {
-        Self { detailed: true }
+        Self {
+            detailed: true,
+            method: Default::default(),
+        }
     }
 }
 
@@ -207,6 +211,10 @@ pub fn read(path: &Path) -> Report {
         Ok(file) => file,
         Err(e) => return Report::unavailable(e),
     };
+    read_file(&file)
+}
+/// 동일 핸들에서 기본 스트림의 할당량·ID·링크 수 조회.
+pub fn read_file(file: &File) -> Report {
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(e) => return Report::unavailable(e),
@@ -218,7 +226,7 @@ pub fn read(path: &Path) -> Report {
         ));
     }
     let mut issue = None;
-    let standard = query::<Standard>(&file, FILE_STANDARD_INFO);
+    let standard = query::<Standard>(file, FILE_STANDARD_INFO);
     let (links, ordinary) = match standard {
         Ok(s) => (
             Field::Value(s.links),
@@ -232,14 +240,14 @@ pub fn read(path: &Path) -> Report {
     };
     let allocation = if metadata.file_attributes() & COMPRESSED_OR_SPARSE != 0 {
         field(
-            query::<Compression>(&file, FILE_COMPRESSION_INFO).and_then(|c| nonnegative(c.bytes)),
+            query::<Compression>(file, FILE_COMPRESSION_INFO).and_then(|c| nonnegative(c.bytes)),
             &mut issue,
         )
     } else {
         ordinary
     };
     let identity = field(
-        query::<FileId>(&file, FILE_ID_INFO).map(|id| Identity {
+        query::<FileId>(file, FILE_ID_INFO).map(|id| Identity {
             volume: id.volume,
             file: id.id,
         }),

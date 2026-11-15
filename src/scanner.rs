@@ -110,7 +110,7 @@ impl ScanResult {
         matches
     }
 
-    fn record_error(&mut self, path: PathBuf, error: io::Error) {
+    pub(crate) fn record_error(&mut self, path: PathBuf, error: io::Error) {
         self.error_count += 1;
         if self.issues.len() < MAX_REPORTED_ERRORS {
             self.issues.push(ScanIssue { path, error });
@@ -267,7 +267,15 @@ pub fn scan_with_probe(
                 });
                 let folder = &mut result.folders[folder_index];
                 folder.allocation.add(extra.allocation)?;
-                folder.logical_bytes += metadata.len();
+                folder.logical_bytes = folder
+                    .logical_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "논리 크기 합계가 표현 범위를 넘습니다",
+                        )
+                    })?;
                 folder.file_count += 1;
                 progress.files_scanned += 1;
                 if progress.files_scanned.is_multiple_of(256) {
@@ -277,12 +285,29 @@ pub fn scan_with_probe(
         }
     }
 
+    finish(&mut result)?;
+
+    on_progress(progress);
+
+    Ok(result)
+}
+
+/// 기본·NTFS 수집 결과에 동일한 누적 집계와 정렬 기준 적용.
+pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
     for child_index in (1..result.folders.len()).rev() {
         let (parents, child_and_later) = result.folders.split_at_mut(child_index);
         let child = &child_and_later[0];
         let parent = &mut parents[child.parent.expect("루트 외 폴더의 부모")];
         parent.allocation.merge(child.allocation)?;
-        parent.logical_bytes += child.logical_bytes;
+        parent.logical_bytes = parent
+            .logical_bytes
+            .checked_add(child.logical_bytes)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "논리 크기 합계가 표현 범위를 넘습니다",
+                )
+            })?;
         parent.file_count += child.file_count;
         parent.folder_count += child.folder_count + 1;
     }
@@ -312,9 +337,7 @@ pub fn scan_with_probe(
         });
     }
 
-    on_progress(progress);
-
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]

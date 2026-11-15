@@ -1,4 +1,6 @@
-use crate::scanner::{self, ScanProgress, ScanResult};
+#[cfg(test)]
+use crate::scanner;
+use crate::scanner::{ScanProgress, ScanResult};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -6,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub struct CompletedScan {
+    pub engine: Option<crate::engine::Report>,
     pub path: PathBuf,
     pub result: Arc<ScanResult>,
     pub elapsed: Duration,
@@ -14,12 +17,14 @@ pub struct CompletedScan {
 }
 impl CompletedScan {
     pub fn saved_result(&self) -> crate::snapshot::SavedScan {
-        crate::snapshot::SavedScan::new(
+        let mut record = crate::snapshot::SavedScan::new(
             Arc::clone(&self.result),
             self.started,
             self.finished,
             self.elapsed,
-        )
+        );
+        record.engine = self.engine.clone();
+        record
     }
 }
 
@@ -39,8 +44,8 @@ struct ActiveScan {
     started: Instant,
     clock: SystemTime,
     cancelled: Arc<AtomicBool>,
-    progress: Arc<Mutex<ScanProgress>>,
-    receiver: Receiver<(SystemTime, std::io::Result<ScanResult>)>,
+    progress: Arc<Mutex<crate::engine::Progress>>,
+    receiver: Receiver<(SystemTime, std::io::Result<crate::engine::Outcome>)>,
 }
 
 #[derive(Default)]
@@ -56,8 +61,10 @@ impl ScanController {
         Self {
             settings: crate::metadata::ScanSettings {
                 detailed: record.scan.detailed,
+                method: record.engine.as_ref().map_or_default(|r| r.requested),
             },
             completed: Some(CompletedScan {
+                engine: record.engine.clone(),
                 path: record.scan.folders[0].path.clone(),
                 result: Arc::clone(&record.scan),
                 elapsed: record.elapsed,
@@ -67,6 +74,26 @@ impl ScanController {
             status: ScanStatus::Completed,
             ..Default::default()
         }
+    }
+    pub(crate) fn seed_saved(&mut self, record: &crate::snapshot::SavedScan) {
+        if self.completed.is_none() {
+            self.completed = Self::from_saved(record).completed;
+        }
+    }
+    pub fn method(&self) -> crate::engine::Method {
+        self.settings.method
+    }
+    pub fn configure_method(&mut self, method: crate::engine::Method) -> Result<(), &'static str> {
+        if self.is_running() {
+            return Err("스캔 중에는 방식을 변경할 수 없습니다");
+        }
+        self.settings.method = method;
+        Ok(())
+    }
+    pub fn stage(&self) -> Option<crate::engine::Stage> {
+        self.active
+            .as_ref()
+            .map(|a| a.progress.lock().unwrap().stage)
     }
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
@@ -86,16 +113,19 @@ impl ScanController {
         let worker_path = path.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let progress = Arc::new(Mutex::new(ScanProgress::default()));
+        let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
         let worker_progress = Arc::clone(&progress);
         let detailed = self.details_requested();
+        let method = self.method();
         let clock = SystemTime::now();
         std::thread::spawn(move || {
-            let result = scanner::scan_with_options(
+            let result = crate::engine::scan_with(
                 &worker_path,
+                method,
                 detailed,
                 || worker_cancelled.load(Ordering::Relaxed),
                 |update| *worker_progress.lock().unwrap() = update,
+                crate::ntfs_helper::scan,
             );
             let _ = sender.send((SystemTime::now(), result));
         });
@@ -142,7 +172,8 @@ impl ScanController {
                 self.status = ScanStatus::Completed;
                 self.completed = Some(CompletedScan {
                     path: active.path,
-                    result: Arc::new(result),
+                    result: Arc::new(result.result),
+                    engine: Some(result.report),
                     elapsed: active.started.elapsed(),
                     started: active.clock,
                     finished,
@@ -167,7 +198,7 @@ impl ScanController {
     pub fn progress(&self) -> Option<ScanProgress> {
         self.active
             .as_ref()
-            .map(|active| *active.progress.lock().unwrap())
+            .map(|active| active.progress.lock().unwrap().counts)
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
@@ -183,6 +214,36 @@ impl ScanController {
 mod tests {
     use super::*;
     use std::fs;
+    #[test]
+    fn selected_engine_is_frozen_while_running_and_saved_with_fallback_reason() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-method-job-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut job = ScanController::default();
+        assert_eq!(job.method(), crate::engine::Method::Basic);
+        job.configure_method(crate::engine::Method::Ntfs).unwrap();
+        job.start(root.clone()).unwrap();
+        assert!(job.configure_method(crate::engine::Method::Basic).is_err());
+        while job.is_running() {
+            job.poll();
+            std::thread::yield_now();
+        }
+        let completed = job.completed().unwrap();
+        assert_eq!(
+            completed.engine.as_ref().unwrap().actual,
+            crate::engine::Method::Basic
+        );
+        assert!(completed.saved_result().engine.unwrap().fallback.is_some());
+        job.start(root.clone()).unwrap();
+        job.cancel();
+        while job.is_running() {
+            job.poll();
+            std::thread::yield_now();
+        }
+        assert!(matches!(job.status(), ScanStatus::Cancelled));
+        assert!(job.completed().is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]
     fn completed_scan_records_utc_interval_separately_from_save_time() {

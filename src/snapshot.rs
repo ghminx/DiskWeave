@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SavedScan {
+    pub engine: Option<crate::engine::Report>,
     pub scan: Arc<ScanResult>,
     pub started: SystemTime,
     pub finished: SystemTime,
@@ -24,6 +25,7 @@ impl SavedScan {
         elapsed: Duration,
     ) -> Self {
         Self {
+            engine: None,
             scan,
             started,
             finished,
@@ -109,6 +111,8 @@ impl Issue {
 }
 #[derive(Serialize, Deserialize)]
 struct Archive {
+    #[serde(default)]
+    engine: Option<crate::engine::Report>,
     format: String,
     version: u32,
     basis: String,
@@ -180,6 +184,7 @@ fn encoded(record: &SavedScan, cancelled: &impl Fn() -> bool) -> io::Result<Arch
         })
         .collect::<io::Result<_>>()?;
     Ok(Archive {
+        engine: record.engine.clone(),
         format: "DiskWeave".into(),
         version: 1,
         basis: "paths-default-stream-reparse-excluded-v1".into(),
@@ -232,16 +237,25 @@ impl Write for LimitedWriter<'_> {
         self.writer.flush()
     }
 }
-struct CheckedReader<'a, C> {
-    reader: BufReader<File>,
+struct CheckedReader<'a, C, R> {
+    reader: BufReader<R>,
+    bytes: u64,
     cancelled: &'a C,
 }
-impl<C: Fn() -> bool> Read for CheckedReader<'_, C> {
+impl<C: Fn() -> bool, R: Read> Read for CheckedReader<'_, C, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if (self.cancelled)() {
             return Err(io::Error::other("작업을 취소했습니다"));
         }
-        self.reader.read(buffer)
+        let n = self.reader.read(buffer)?;
+        self.bytes += n as u64;
+        if self.bytes > 1_073_741_824 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "분석 결과는 최대 1 GiB까지 열 수 있습니다",
+            ));
+        }
+        Ok(n)
     }
 }
 pub fn load(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<SavedScan> {
@@ -253,8 +267,23 @@ pub fn load(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<SavedScan> 
             "분석 결과 파일은 최대 1 GiB까지 열 수 있습니다",
         ));
     }
+    read_from(file, cancelled)
+}
+pub fn write_to(
+    record: &SavedScan,
+    writer: &mut dyn Write,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<()> {
+    let data = encoded(record, &cancelled)?;
+    let result = serde_json::to_writer(LimitedWriter { writer, bytes: 0 }, &data)
+        .map_err(crate::output::json_error);
+    crate::output::check(&cancelled)?;
+    result
+}
+pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<SavedScan> {
     let parsed = serde_json::from_reader(CheckedReader {
-        reader: BufReader::new(file),
+        reader: BufReader::new(reader),
+        bytes: 0,
         cancelled: &cancelled,
     });
     crate::output::check(&cancelled)?;
@@ -396,6 +425,7 @@ pub fn load(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<SavedScan> 
         });
     }
     Ok(SavedScan {
+        engine: a.engine,
         scan: Arc::new(scan),
         started: a.started.decode()?,
         finished: a.finished.decode()?,
@@ -410,6 +440,32 @@ mod tests {
     use std::os::windows::ffi::OsStringExt;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn scan_method_survives_stream_transfer_and_old_archives_stay_unknown() {
+        let root = std::env::temp_dir().join(format!("diskweave-method-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let scan = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let mut record = SavedScan::new(scan, SystemTime::now(), SystemTime::now(), Duration::ZERO);
+        record.engine = Some(crate::engine::Report {
+            requested: crate::engine::Method::Ntfs,
+            actual: crate::engine::Method::Basic,
+            fallback: Some("권한 없음".into()),
+        });
+        let mut bytes = Vec::new();
+        write_to(&record, &mut bytes, || false).unwrap();
+        let loaded = read_from(bytes.as_slice(), || false).unwrap();
+        assert_eq!(loaded.engine, record.engine);
+        let mut old: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        old.as_object_mut().unwrap().remove("engine");
+        assert!(
+            read_from(serde_json::to_vec(&old).unwrap().as_slice(), || false)
+                .unwrap()
+                .engine
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn save_never_overwrites_scanned_source_and_cancel_keeps_existing_output() {

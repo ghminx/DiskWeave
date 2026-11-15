@@ -1,4 +1,5 @@
 /target/
+/tools/ntfs-validation/target/
 
 # 사용자 분석 결과의 실수 포함 방지
 *.dwsnap

@@ -200,16 +200,24 @@ impl LocationsView {
                         choose = Some(entry.id);
                         self.global_mode = false;
                     }
-                    let state = if entry.stale {
-                        "스캔 실패 · 이전 결과 표시"
-                    } else if entry.scan.is_running() {
+                    let state = if entry.scan.is_running() {
                         "스캔 중"
+                    } else if entry.stale {
+                        if entry.scan.completed().is_some() {
+                            "스캔 실패 · 이전 결과 표시"
+                        } else {
+                            "스캔 실패 · 결과 없음"
+                        }
+                    } else if entry.restored {
+                        "저장된 목록 · 갱신 필요"
                     } else if entry.scan.completed().is_some() {
                         "스캔 완료"
                     } else {
                         "스캔 전"
                     };
-                    ui.label(state);
+                    ui.label(state).on_hover_text(crate::local_date::display(
+                        entry.scan.completed().map(|c| c.finished),
+                    ));
                     if ui
                         .add_enabled(!running, egui::Button::new("목록에서 빼기"))
                         .clicked()

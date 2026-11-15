@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Location {
+    pub restored: bool,
     pub id: u64,
     pub path: PathBuf,
     identity: PathBuf,
@@ -37,6 +38,7 @@ impl Snapshot {
 }
 #[derive(Default)]
 pub struct Locations {
+    removed: Vec<PathBuf>,
     settings: crate::metadata::ScanSettings,
     pub entries: Vec<Location>,
     next_id: u64,
@@ -85,7 +87,12 @@ impl Locations {
     pub fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
         let path = record.scan.folders[0].path.clone();
         Self {
+            settings: crate::metadata::ScanSettings {
+                detailed: record.scan.detailed,
+                method: record.engine.as_ref().map_or_default(|r| r.requested),
+            },
             entries: vec![Location {
+                restored: false,
                 id: 1,
                 identity: path.clone(),
                 path,
@@ -99,6 +106,125 @@ impl Locations {
             epoch: 1,
             ..Default::default()
         }
+    }
+    pub fn export_catalog(&self) -> crate::index_store::Catalog {
+        crate::index_store::Catalog {
+            selected: self.selected,
+            locations: self
+                .entries
+                .iter()
+                .map(|e| crate::index_store::CachedLocation {
+                    id: e.id,
+                    path: e.path.clone(),
+                    identity: e.identity.clone(),
+                    enabled: e.enabled,
+                    stale: e.stale,
+                    generation: e.generation,
+                    record: e.scan.completed().map(|c| Arc::new(c.saved_result())),
+                })
+                .collect(),
+        }
+    }
+    /// 원본 경로를 조회하지 않고 저장 목록을 병합하되 이번 실행의 완료 결과 유지.
+    pub fn restore_catalog(&mut self, catalog: &crate::index_store::Catalog) -> io::Result<bool> {
+        let before = self
+            .selected
+            .and_then(|id| self.get(id))
+            .and_then(|e| e.scan.completed().map(|_| (e.id, e.generation)));
+        let was_empty = self.entries.is_empty();
+        let mut selection = None;
+        for c in &catalog.locations {
+            let mut removed = false;
+            for identity in &self.removed {
+                if contains_path(identity, &c.identity)? && contains_path(&c.identity, identity)? {
+                    removed = true;
+                    break;
+                }
+            }
+            if removed {
+                continue;
+            }
+            let mut overlap = None;
+            for (i, e) in self.entries.iter().enumerate() {
+                if contains_path(&e.identity, &c.identity)?
+                    || contains_path(&c.identity, &e.identity)?
+                {
+                    overlap = Some(i);
+                    break;
+                }
+            }
+            let id = if let Some(i) = overlap {
+                let e = &mut self.entries[i];
+                let exact = contains_path(&e.path, &c.path)? && contains_path(&c.path, &e.path)?;
+                if exact && (e.scan.completed().is_none() || (e.restored && !e.scan.is_running())) {
+                    if let Some(record) = &c.record {
+                        if e.scan.is_running() {
+                            e.scan.seed_saved(record);
+                        } else {
+                            e.scan = ScanController::from_saved(record);
+                        }
+                        e.restored = true;
+                        e.stale |= c.stale;
+                        e.generation += 1;
+                        self.epoch += 1;
+                    }
+                }
+                if !exact {
+                    continue;
+                }
+                e.id
+            } else {
+                self.next_id = self
+                    .next_id
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
+                let scan = c
+                    .record
+                    .as_ref()
+                    .map_or_else(ScanController::default, |r| ScanController::from_saved(r));
+                self.entries.push(Location {
+                    restored: c.record.is_some(),
+                    id: self.next_id,
+                    path: c.path.clone(),
+                    identity: c.identity.clone(),
+                    scan,
+                    stale: c.stale,
+                    enabled: c.enabled,
+                    generation: u64::from(c.record.is_some()),
+                });
+                self.epoch += 1;
+                self.next_id
+            };
+            if catalog.selected == Some(c.id) {
+                selection = Some(id);
+            }
+        }
+        if was_empty {
+            self.selected = selection.or_else(|| self.entries.first().map(|e| e.id));
+        }
+        let after = self
+            .selected
+            .and_then(|id| self.get(id))
+            .and_then(|e| e.scan.completed().map(|_| (e.id, e.generation)));
+        Ok(before != after)
+    }
+    pub fn method(&self) -> crate::engine::Method {
+        self.settings.method
+    }
+    pub fn configure_method(&mut self, method: crate::engine::Method) -> io::Result<()> {
+        if self.is_running() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "스캔 중에는 방식을 변경할 수 없습니다",
+            ));
+        }
+        self.settings.method = method;
+        Ok(())
+    }
+    pub fn stage(&self) -> Option<crate::engine::Stage> {
+        self.active
+            .and_then(|id| self.get(id))
+            .and_then(|e| e.scan.stage())
     }
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
@@ -132,8 +258,12 @@ impl Locations {
                 ));
             }
         }
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
         self.entries.push(Location {
+            restored: false,
             id: self.next_id,
             path: std::path::absolute(path)?,
             identity,
@@ -161,6 +291,7 @@ impl Locations {
             .iter()
             .position(|entry| entry.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "등록 위치가 없습니다"))?;
+        self.removed.push(self.entries[index].identity.clone());
         self.entries.remove(index);
         self.epoch += 1;
         if self.selected == Some(id) {
@@ -245,6 +376,10 @@ impl Locations {
                 .expect("대기 중인 위치의 수집 설정");
             entry
                 .scan
+                .configure_method(self.settings.method)
+                .expect("대기 중인 위치의 스캔 방식");
+            entry
+                .scan
                 .start(entry.path.clone())
                 .expect("동시에 하나의 스캔만 실행");
             self.active = Some(id);
@@ -260,6 +395,7 @@ impl Locations {
                 .expect("활성 등록 위치");
             if entry.scan.poll() {
                 entry.stale = false;
+                entry.restored = false;
                 entry.generation += 1;
                 self.epoch += 1;
                 changed |= self.selected == Some(id);
@@ -330,6 +466,125 @@ impl Locations {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn delayed_restoration_preserves_live_results_selection_and_explicit_removal() {
+        let p =
+            std::env::temp_dir().join(format!("diskweave-restore-newer-{}", std::process::id()));
+        let a = p.join("a");
+        let b = p.join("b");
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("known"), b"12345").unwrap();
+        }
+        let wait = |l: &mut Locations| {
+            let t = Instant::now();
+            while l.is_running() && t.elapsed() < Duration::from_secs(5) {
+                l.poll();
+                std::thread::yield_now();
+            }
+            assert!(!l.is_running());
+        };
+        let mut before = Locations::default();
+        before.start(a.clone()).unwrap();
+        wait(&mut before);
+        before.start(b.clone()).unwrap();
+        wait(&mut before);
+        let catalog = before.export_catalog();
+        std::fs::write(b.join("known"), b"123456789").unwrap();
+        let mut live = Locations::default();
+        live.start(b).unwrap();
+        wait(&mut live);
+        let selected = live.selected_id();
+        assert!(!live.restore_catalog(&catalog).unwrap());
+        assert_eq!(live.selected_id(), selected);
+        assert_eq!(live.completed().unwrap().result.folders[0].logical_bytes, 9);
+        assert!(!live.entries[0].restored);
+        assert_eq!(live.entries.len(), 2);
+        let cached = live.entries.iter().find(|e| e.path == a).unwrap().id;
+        assert_ne!(Some(cached), selected);
+        live.remove(cached).unwrap();
+        live.restore_catalog(&catalog).unwrap();
+        assert_eq!(live.entries.len(), 1);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn restored_locations_search_offline_and_refresh_without_losing_previous_results_on_failure() {
+        let p =
+            std::env::temp_dir().join(format!("diskweave-restored-model-{}", std::process::id()));
+        let root = p.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("known.bin"), b"12345").unwrap();
+        let mut first = Locations::default();
+        first.start(root.clone()).unwrap();
+        let wait = |locations: &mut Locations| {
+            let t = Instant::now();
+            while locations.is_running() && t.elapsed() < Duration::from_secs(5) {
+                locations.poll();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!locations.is_running());
+        };
+        wait(&mut first);
+        let catalog = first.export_catalog();
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut restored = Locations::default();
+        assert!(restored.restore_catalog(&catalog).unwrap());
+        assert!(restored.entries[0].restored);
+        assert_eq!(restored.snapshots().len(), 1);
+        let hits = crate::global_search::search_all(
+            restored.snapshots(),
+            &crate::search::SearchInput {
+                text: "known".into(),
+                ..Default::default()
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("known.bin"), b"123456789").unwrap();
+        restored.start(root.clone()).unwrap();
+        wait(&mut restored);
+        assert!(!restored.entries[0].restored);
+        assert_eq!(
+            restored.completed().unwrap().result.folders[0].logical_bytes,
+            9
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        restored.start(root).unwrap();
+        wait(&mut restored);
+        assert!(restored.entries[0].stale);
+        assert!(restored.snapshots().is_empty());
+        assert_eq!(
+            restored.completed().unwrap().result.folders[0].logical_bytes,
+            9
+        );
+        let id = restored.selected_id().unwrap();
+        restored.remove(id).unwrap();
+        assert!(restored.export_catalog().locations.is_empty());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn saved_workspace_displays_the_recorded_engine_and_collection_options() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-saved-method-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut record = crate::snapshot::SavedScan::new(
+            Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+            std::time::SystemTime::now(),
+            std::time::SystemTime::now(),
+            Duration::ZERO,
+        );
+        record.engine = Some(crate::engine::Report {
+            requested: crate::engine::Method::Ntfs,
+            actual: crate::engine::Method::Ntfs,
+            fallback: None,
+        });
+        let view = Locations::from_saved(&record);
+        assert_eq!(view.method(), crate::engine::Method::Ntfs);
+        assert!(!view.details_requested());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn queued_locations_keep_one_metadata_mode_until_the_batch_finishes() {
         let root =

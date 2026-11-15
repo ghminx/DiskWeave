@@ -3,17 +3,23 @@ mod analysis_panel;
 mod comparison;
 mod documents;
 mod drives;
+mod engine;
 mod explorer;
 mod export;
 mod file_open;
 mod global_search;
 mod gui;
+mod index_job;
+mod index_store;
 mod list_selection;
 mod local_date;
 mod locations;
 mod locations_ui;
 mod map_job;
 mod metadata;
+mod ntfs;
+mod ntfs_helper;
+mod ntfs_native;
 mod output;
 mod presentation;
 mod results_ui;
@@ -74,6 +80,9 @@ fn run() -> io::Result<()> {
     let mut args = std::env::args_os();
     let _program = args.next();
     let arguments: Vec<_> = args.collect();
+    if arguments.first().is_some_and(|a| a == "--ntfs-worker") {
+        return ntfs_helper::worker(&arguments[1..]);
+    }
     if arguments.is_empty() {
         return gui::run().map_err(|error| io::Error::other(error.to_string()));
     }
