@@ -20,6 +20,10 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct DiskWeaveApp {
+    file_close_requested: bool,
+    file_job: crate::file_job::Controller,
+    file_ui: crate::file_ui::FileUi,
+    file_refresh: crate::file_refresh::Controller,
     tracking: crate::tracking::Controller,
     index: crate::index_job::IndexController,
     closing: crate::index_job::CloseState,
@@ -219,6 +223,139 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     action
 }
 impl DiskWeaveApp {
+    fn file_blocked(&self) -> bool {
+        self.file_ui.blocked(&self.file_job) || self.file_refresh.busy()
+    }
+    fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
+        let mut selected = if self.locations_view.global_mode {
+            self.locations_view.selected_targets()
+        } else {
+            self.source()
+                .map(|s| {
+                    self.search
+                        .job
+                        .results()
+                        .map(|r| {
+                            self.search
+                                .selection
+                                .rows()
+                                .filter_map(|row| r.items.get(row).copied())
+                                .map(|item| (s.id, s.generation, item))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        if selected.is_empty() {
+            if let Some(target) = self.selection_target() {
+                selected.push(target);
+            }
+        }
+        let mut writable = self.archive_record.is_none()
+            && !self.scan.is_running()
+            && !self.file_job.busy()
+            && !self.file_refresh.busy()
+            && self.file_ui.dialog.is_none()
+            && !self.results.busy();
+        let paths = if let Some(paths) = explicit {
+            for path in &paths {
+                for entry in &self.scan.entries {
+                    if crate::file_ops::contains_path(&entry.path, path).unwrap_or(true) {
+                        writable &=
+                            !entry.stale && !entry.restored && entry.scan.completed().is_some();
+                    }
+                }
+            }
+            paths
+        } else {
+            selected
+                .iter()
+                .filter_map(|(id, generation, item)| {
+                    let Some(entry) = self.scan.get(*id) else {
+                        writable = false;
+                        return None;
+                    };
+                    if entry.generation != *generation || entry.stale || entry.restored {
+                        writable = false;
+                        return None;
+                    }
+                    let Some(completed) = entry.scan.completed() else {
+                        writable = false;
+                        return None;
+                    };
+                    Some(crate::search::item_path(&completed.result, *item))
+                })
+                .collect()
+        };
+        let current = if self.locations_view.global_mode {
+            None
+        } else {
+            self.source()
+                .zip(self.explorer.as_ref())
+                .map(|(s, e)| s.scan.folders[e.folder()].path.clone())
+        };
+        if let Some(entry) = self.scan.selected_id().and_then(|id| self.scan.get(id)) {
+            writable &= !entry.stale && !entry.restored && entry.scan.completed().is_some();
+        } else {
+            writable = false;
+        }
+        crate::file_ui::Context {
+            paths,
+            current,
+            protected: self.scan.entries.iter().map(|e| e.path.clone()).collect(),
+            writable,
+        }
+    }
+    fn begin_file_action(&mut self, kind: crate::file_ui::Kind, paths: Option<Vec<PathBuf>>) {
+        let explicit = paths.is_some();
+        let mut context = self.file_context(paths);
+        if kind == crate::file_ui::Kind::Folder && explicit {
+            context.current = context.paths.first().cloned();
+        }
+        self.input_error = self
+            .file_ui
+            .begin(kind, context)
+            .err()
+            .map(|e| e.to_string());
+    }
+    fn file_tick(&mut self) {
+        if self.file_job.poll() {
+            let affected = self
+                .file_job
+                .report
+                .as_ref()
+                .map(|r| r.affected.clone())
+                .unwrap_or_default();
+            let tracked = self.tracking.location.filter(|_| self.tracking.running());
+            if let Err(error) = self.file_refresh.begin(&self.scan, &affected, tracked) {
+                self.input_error = Some(error.to_string());
+            }
+        }
+        if self.file_refresh.busy() {
+            self.locations_view.preserve_live_selection();
+        }
+        let tracking = self
+            .tracking
+            .location
+            .map(|id| (id, self.tracking.checked, self.tracking.running()));
+        for update in self.file_refresh.poll(&mut self.scan, tracking) {
+            if self.scan.selected_id() == Some(update.id) {
+                let explorer = match (&self.explorer, &update.old) {
+                    (Some(e), Some(old)) => e.rebase(old, &update.new),
+                    _ => Explorer::new(&update.new),
+                };
+                if let Some(old) = update.old {
+                    self.search.rebase(&old, &update.new, explorer.folder());
+                } else {
+                    self.search.invalidate();
+                }
+                self.explorer = Some(explorer);
+                self.detail_target = None;
+                self.detail_context = None;
+            }
+        }
+    }
     fn stop_tracking(&mut self) {
         if self.tracking.running() {
             if let Some(id) = self.tracking.location {
@@ -273,6 +410,10 @@ impl DiskWeaveApp {
         }
     }
     fn start_tracking(&mut self, fresh: bool) {
+        if self.file_blocked() {
+            self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 시작하세요".into());
+            return;
+        }
         let action = (|| {
             let path = self
                 .target
@@ -355,7 +496,7 @@ impl DiskWeaveApp {
                 .is_some_and(|c| c.tracking.is_some());
             if ui
                 .add_enabled(
-                    !self.scan.is_running() && self.target.path().is_some(),
+                    !self.scan.is_running() && !self.file_blocked() && self.target.path().is_some(),
                     egui::Button::new(if resumable {
                         "갱신 다시 시작"
                     } else {
@@ -368,7 +509,10 @@ impl DiskWeaveApp {
             }
             if resumable
                 && ui
-                    .add_enabled(!self.scan.is_running(), egui::Button::new("기준 다시 수집"))
+                    .add_enabled(
+                        !self.scan.is_running() && !self.file_blocked(),
+                        egui::Button::new("기준 다시 수집"),
+                    )
                     .clicked()
             {
                 self.start_tracking(true);
@@ -471,10 +615,22 @@ impl DiskWeaveApp {
     }
     fn index_windows(&mut self, ctx: &egui::Context) {
         use crate::index_job::CloseState;
-        if ctx.input(|i| i.viewport().close_requested())
-            && !matches!(self.closing, CloseState::Saved | CloseState::Discarded)
-        {
+        let requested = ctx.input(|i| i.viewport().close_requested()) || self.file_close_requested;
+        if requested && self.file_job.working() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.file_job.cancel();
+            self.file_ui.visible = true;
+            self.file_close_requested = true;
+            return;
+        }
+        if requested && !matches!(self.closing, CloseState::Saved | CloseState::Discarded) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.file_close_requested = false;
+            self.file_job.cancel();
+            self.file_ui.dialog = None;
+            if self.file_refresh.busy() {
+                self.file_refresh.cancel(&mut self.scan);
+            }
             self.closing.request();
             self.stop_tracking();
             self.scan.cancel();
@@ -631,6 +787,10 @@ impl DiskWeaveApp {
         }
     }
     fn begin_scan(&mut self) {
+        if self.file_blocked() {
+            self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 스캔하세요".into());
+            return;
+        }
         self.stop_tracking();
         let Some(path) = self.target.path().map(PathBuf::from) else {
             self.input_error = Some("분석할 폴더를 선택하세요".into());
@@ -823,6 +983,16 @@ impl DiskWeaveApp {
         self.map.poll();
     }
     fn status(&self) -> String {
+        if self.file_job.working() {
+            return format!(
+                "{} · {:.1}초",
+                self.file_job.phase.label(),
+                self.file_job.elapsed()
+            );
+        }
+        if self.file_refresh.busy() {
+            return self.file_refresh.label().into();
+        }
         if !self.scan.is_running()
             && self.tracking.location == self.scan.selected_id()
             && (self.tracking.running()
@@ -916,10 +1086,12 @@ impl DiskWeaveApp {
                 ),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.small("읽기 전용");
+                if self.archive_record.is_some(){ui.small("조회 전용");}
+                let context=self.file_context(None);
+                ui.menu_button("작업",|ui|{self.file_ui.menu(ui,context.writable,None,context.paths.len(),context.current.is_some());if ui.button("파일 작업 보기").clicked(){self.file_ui.visible=true;ui.close();}});
                 let record = self.scan.completed().filter(|_|!self.locations_view.global_mode).map(|c| Arc::new(c.saved_result()));
                 let available = !self.scan.snapshots().is_empty();
-                self.results.menu(ui, self.scan.is_running(), record, available, self.archive_record.is_some());
+                self.results.menu(ui, self.scan.is_running() || self.file_blocked(), record, available, self.archive_record.is_some());
                 ui.menu_button("설정", |ui| {
                     ui.set_max_width(340.0);
                     let mut method=self.scan.method();
@@ -968,7 +1140,7 @@ impl DiskWeaveApp {
             12.0,
         );
         ui.add_space(9.0);
-        let editable = !self.scan.is_running();
+        let editable = !self.scan.is_running() && !self.file_blocked();
         let available = ui.available_width();
         ui.horizontal(|ui| {
             crate::ui_style::slot(
@@ -1015,27 +1187,32 @@ impl DiskWeaveApp {
                 egui::vec2(80.0, 38.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.menu_button("위치 관리", |ui| {
-                        ui.set_width((ui.ctx().content_rect().width() - 48.0).clamp(240.0, 400.0));
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        ui.spacing_mut().item_spacing.y = 6.0;
-                        egui::ScrollArea::vertical()
-                            .max_height(360.0)
-                            .show(ui, |ui| {
-                                if let Some(path) = self.locations_view.controls(
-                                    ui,
-                                    &mut self.scan,
-                                    self.target.path(),
-                                ) {
-                                    if self.scan.entries.iter().any(|e| e.path == path) {
-                                        self.target.choose_registered(path);
-                                        self.input_error = None;
-                                    } else {
-                                        self.input_error = self.target.choose_folder(path).err();
+                    ui.add_enabled_ui(editable, |ui| {
+                        ui.menu_button("위치 관리", |ui| {
+                            ui.set_width(
+                                (ui.ctx().content_rect().width() - 48.0).clamp(240.0, 400.0),
+                            );
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            egui::ScrollArea::vertical()
+                                .max_height(360.0)
+                                .show(ui, |ui| {
+                                    if let Some(path) = self.locations_view.controls(
+                                        ui,
+                                        &mut self.scan,
+                                        self.target.path(),
+                                    ) {
+                                        if self.scan.entries.iter().any(|e| e.path == path) {
+                                            self.target.choose_registered(path);
+                                            self.input_error = None;
+                                        } else {
+                                            self.input_error =
+                                                self.target.choose_folder(path).err();
+                                        }
                                     }
-                                }
-                                self.tracking_controls(ui);
-                            });
+                                    self.tracking_controls(ui);
+                                });
+                        });
                     });
                 },
             );
@@ -1318,8 +1495,24 @@ impl DiskWeaveApp {
                     let response = ui.interact(
                         pick,
                         ui.scope_id().with(("folder_select", folder)),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
+                    if self.archive_record.is_none()
+                        && !self.file_job.busy()
+                        && !self.file_refresh.busy()
+                    {
+                        response.dnd_set_drag_payload(crate::file_ui::DragPayload {
+                            paths: vec![source.scan.folders[folder].path.clone()],
+                        });
+                        if let Some(payload) =
+                            response.dnd_release_payload::<crate::file_ui::DragPayload>()
+                        {
+                            self.file_ui.drop_requested = Some((
+                                payload.paths.clone(),
+                                source.scan.folders[folder].path.clone(),
+                            ));
+                        }
+                    }
                     if selected || response.hovered() {
                         ui.painter().rect_filled(
                             rect,
@@ -1392,6 +1585,7 @@ impl DiskWeaveApp {
                         crate::ui_style::SOFT,
                         11.0,
                     );
+                    crate::file_ui::drop_hint(ui, &response);
                     if response.clicked() {
                         destination = Some(folder);
                     }
@@ -1402,6 +1596,16 @@ impl DiskWeaveApp {
                                 destination = Some(folder);
                                 ui.close();
                             }
+                            ui.separator();
+                            self.file_ui.menu(
+                                ui,
+                                !self.file_job.busy()
+                                    && !self.file_refresh.busy()
+                                    && self.archive_record.is_none(),
+                                Some(vec![source.scan.folders[folder].path.clone()]),
+                                1,
+                                true,
+                            );
                             if let Some(action) = open_menu(ui, Item::Folder(folder)) {
                                 open = Some(OpenRequest::for_item(
                                     &source.scan,
@@ -1722,6 +1926,37 @@ impl DiskWeaveApp {
                                 );
                             },
                         );
+                        let response = response.interact(egui::Sense::click_and_drag());
+                        if self.archive_record.is_none()
+                            && !self.file_job.busy()
+                            && !self.file_refresh.busy()
+                        {
+                            if response.drag_started() {
+                                let paths = if self.search.selection.contains(row) {
+                                    self.search
+                                        .selection
+                                        .rows()
+                                        .filter_map(|r| results.items.get(r))
+                                        .map(|i| crate::search::item_path(&source.scan, *i))
+                                        .collect()
+                                } else {
+                                    vec![crate::search::item_path(&source.scan, item)]
+                                };
+                                response
+                                    .dnd_set_drag_payload(crate::file_ui::DragPayload { paths });
+                            }
+                            if let Item::Folder(id) = item {
+                                crate::file_ui::drop_hint(ui, &response);
+                                if let Some(payload) =
+                                    response.dnd_release_payload::<crate::file_ui::DragPayload>()
+                                {
+                                    self.file_ui.drop_requested = Some((
+                                        payload.paths.clone(),
+                                        source.scan.folders[id].path.clone(),
+                                    ));
+                                }
+                            }
+                        }
                         if response.clicked() {
                             let m = ui.input(|i| i.modifiers);
                             self.search.selection.click(row, m.ctrl, m.shift);
@@ -1745,6 +1980,16 @@ impl DiskWeaveApp {
                             }
                         }
                         response.context_menu(|ui| {
+                            self.file_ui.menu(
+                                ui,
+                                !self.file_job.busy()
+                                    && !self.file_refresh.busy()
+                                    && self.archive_record.is_none(),
+                                None,
+                                self.search.selection.count(),
+                                true,
+                            );
+                            ui.separator();
                             ui.add_enabled_ui(self.search.selection.count() <= 1, |ui| {
                                 if ui.button("용량 분석으로 이동").clicked() {
                                     analyze = true;
@@ -1771,7 +2016,22 @@ impl DiskWeaveApp {
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    self.search.status(ui);
+                    ui.horizontal(|ui| {
+                        self.search.status(ui);
+                        if self.search.selection.count() > 0 {
+                            ui.menu_button("선택 항목 작업", |ui| {
+                                self.file_ui.menu(
+                                    ui,
+                                    !self.file_job.busy()
+                                        && !self.file_refresh.busy()
+                                        && self.archive_record.is_none(),
+                                    None,
+                                    self.search.selection.count(),
+                                    true,
+                                )
+                            });
+                        }
+                    });
                     if let Some(explorer) = &self.explorer {
                         ui.response().on_hover_text(format!(
                             "바로 아래 항목 {}개 · {}",
@@ -2029,9 +2289,15 @@ impl eframe::App for DiskWeaveApp {
             }
             self.sync_scan();
             self.sync_tracking();
+            self.file_tick();
             self.index_tick();
             self.index_windows(ui.ctx());
-            if self.index.busy() || self.scan.is_running() || self.tracking.running() {
+            if self.index.busy()
+                || self.scan.is_running()
+                || self.tracking.running()
+                || self.file_job.working()
+                || self.file_refresh.busy()
+            {
                 ui.ctx().request_repaint_after(Duration::from_millis(30));
             }
         }
@@ -2100,7 +2366,14 @@ impl eframe::App for DiskWeaveApp {
                 .collect()
         });
         if !dropped.is_empty() && self.archive_record.is_none() {
-            self.accept_drop(dropped);
+            let context = self.file_context(None);
+            if self.file_ui.importing || !self.file_blocked() {
+                match self.file_ui.route_drop(dropped, context) {
+                    Ok(Some(paths)) => self.accept_drop(paths),
+                    Ok(None) => {}
+                    Err(error) => self.input_error = Some(error.to_string()),
+                }
+            }
         }
         self.refresh_derived();
         let size = ui.available_size();
@@ -2394,6 +2667,64 @@ impl eframe::App for DiskWeaveApp {
         if self.results.export_open {
             self.results.export_context = Some(export_context);
         }
+        if let Some((kind, paths)) = self.file_ui.requested.take() {
+            self.begin_file_action(kind, paths);
+        }
+        if let Some((paths, destination)) = self
+            .file_ui
+            .drop_requested
+            .take()
+            .or_else(|| self.locations_view.drop_requested.take())
+        {
+            let mut context = self.file_context(Some(paths.clone()));
+            for entry in &self.scan.entries {
+                if crate::file_ops::contains_path(&entry.path, &destination).unwrap_or(true) {
+                    context.writable &=
+                        !entry.stale && !entry.restored && entry.scan.completed().is_some();
+                }
+            }
+            self.input_error = self
+                .file_ui
+                .folder_drop(paths, destination, context)
+                .err()
+                .map(|e| e.to_string());
+        }
+        if let Some(kind) = self.locations_view.file_requested.take() {
+            self.begin_file_action(kind, None);
+        }
+        if !self.file_blocked()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2))
+        {
+            self.begin_file_action(crate::file_ui::Kind::Rename, None);
+        }
+        if !self.file_blocked()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+        {
+            self.begin_file_action(crate::file_ui::Kind::Recycle, None);
+        }
+        self.file_ui.show(ui.ctx(), &mut self.file_job);
+        if self.file_refresh.busy() || !self.file_refresh.errors.is_empty() {
+            egui::Window::new("분석 목록 갱신")
+                .id(egui::Id::unique("file_refresh_status"))
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(self.file_refresh.label());
+                    for error in &self.file_refresh.errors {
+                        ui.add(egui::Label::new(error).wrap());
+                    }
+                    if !self.file_refresh.busy() && ui.button("확인").clicked() {
+                        self.file_refresh.errors.clear();
+                    }
+                    if self.file_refresh.busy() {
+                        ui.spinner();
+                        if ui.button("목록 갱신 취소").clicked() {
+                            self.file_refresh.cancel(&mut self.scan);
+                        }
+                    }
+                });
+        }
         self.refresh_derived();
         if ui.input(|i| !i.events.is_empty()) {
             ui.ctx().request_repaint();
@@ -2408,6 +2739,8 @@ impl eframe::App for DiskWeaveApp {
             || matches!(self.file_open.status(), OpenStatus::Running)
             || self.results.busy()
             || self.index.busy()
+            || self.file_job.working()
+            || self.file_refresh.busy()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }

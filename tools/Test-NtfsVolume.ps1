@@ -1,4 +1,4 @@
-﻿param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=10000,[switch]$Usn)
+﻿param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=10000,[switch]$Usn,[switch]$FileManagement,[switch]$WaitForClient)
 $ErrorActionPreference='Stop'
 $OutputEncoding=[Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -33,6 +33,14 @@ try {
     if($root.Substring(0,2) -eq $env:SystemDrive){throw '시스템 드라이브는 시험 대상에서 제외함'}
     $resolved=Get-DiskImage -ImagePath $image | Get-Disk | Get-Partition | Where-Object DriveLetter -eq $volume.DriveLetter
     if(-not $resolved){throw '시험 드라이브와 이미지 연결 확인 실패'}
+    if($FileManagement){
+        # 검증된 새 시험 볼륨에만 일반 사용자 파일 작업용 권한 설정
+        $fixtureAcl=Get-Acl -LiteralPath $root
+        $fixtureUser=[Security.Principal.WindowsIdentity]::GetCurrent().User
+        $fixtureRule=[Security.AccessControl.FileSystemAccessRule]::new($fixtureUser,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        $fixtureAcl.AddAccessRule($fixtureRule)
+        Set-Acl -LiteralPath $root -AclObject $fixtureAcl
+    }
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'Cases/sub'))
     [IO.File]::WriteAllText((Join-Path $root ('.diskweave-validation-'+$token)),$token,[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllBytes((Join-Path $root 'Cases/regular.bin'),[byte[]](1..13))
@@ -52,7 +60,19 @@ try {
     for($i=0;$i -lt $FileCount;$i++){[IO.File]::WriteAllBytes((Join-Path $root ('Cases/bulk/entry-{0:D5}.bin' -f $i)),[byte[]](1..8))}
     $guid=(Get-Volume -DriveLetter $volume.DriveLetter).Path
     $request=Join-Path $runDir 'request.json'
-    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount;usn=$Usn.IsPresent}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount;usn=$Usn.IsPresent;file_management=$FileManagement.IsPresent}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    if($WaitForClient){
+        if(-not $FileManagement){throw '별도 클라이언트 대기는 파일 관리 시험에 한정함'}
+        [IO.File]::WriteAllText((Join-Path $runDir 'client-ready.txt'),$request,[Text.UTF8Encoding]::new($false))
+        $clientStart=Get-Date
+        while(-not (Test-Path -LiteralPath (Join-Path $runDir 'client-done.txt'))){
+            if((Get-Date)-$clientStart -gt [TimeSpan]::FromMinutes(10)){throw '파일 관리 클라이언트 대기 시간 초과'}
+            Start-Sleep -Milliseconds 100
+        }
+        if([IO.File]::ReadAllText((Join-Path $runDir 'client-done.txt')).Trim() -ne '0'){throw '일반 권한 파일 관리 대조 실패'}
+        Get-Content -LiteralPath (Join-Path $runDir 'file-results.json') -Encoding UTF8
+        return
+    }
     $trialStart=Get-Date
     $trial=Start-Process -FilePath $Runner -ArgumentList @('"'+$request+'"') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runDir 'result.json') -RedirectStandardError (Join-Path $runDir 'trace.log')
     $ownedProcessHandle=$trial.Handle

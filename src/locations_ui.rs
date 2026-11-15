@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub struct LocationsView {
+    pub file_requested: Option<crate::file_ui::Kind>,
+    pub drop_requested: Option<(Vec<PathBuf>, PathBuf)>,
     live_selection: Option<(SearchInput, std::collections::HashSet<(u64, PathBuf)>)>,
     pub global_mode: bool,
     pub selection_changed: bool,
@@ -22,6 +24,19 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn selected_targets(&self) -> Vec<crate::map_job::Target> {
+        let Some(results) = &self.job.results else {
+            return vec![];
+        };
+        self.selection
+            .rows()
+            .filter_map(|row| {
+                let hit = results.hits.get(row)?;
+                let source = &results.sources[hit.source];
+                Some((source.id, source.generation, hit.item))
+            })
+            .collect()
+    }
     pub fn preserve_live_selection(&mut self) {
         if !self.global_mode || self.live_selection.is_some() {
             return;
@@ -387,6 +402,38 @@ impl LocationsView {
                             "분석 위치: {}",
                             source.scan.folders[0].path.display()
                         ));
+                        let response = response.interact(egui::Sense::click_and_drag());
+                        if !locations.is_running() {
+                            if response.drag_started() {
+                                let paths = if self.selection.contains(row) {
+                                    self.selection
+                                        .rows()
+                                        .filter_map(|r| results.hits.get(r))
+                                        .map(|h| {
+                                            crate::search::item_path(
+                                                &results.sources[h.source].scan,
+                                                h.item,
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    vec![crate::search::item_path(&source.scan, hit.item)]
+                                };
+                                response
+                                    .dnd_set_drag_payload(crate::file_ui::DragPayload { paths });
+                            }
+                            if let Item::Folder(id) = hit.item {
+                                crate::file_ui::drop_hint(ui, &response);
+                                if let Some(payload) =
+                                    response.dnd_release_payload::<crate::file_ui::DragPayload>()
+                                {
+                                    self.drop_requested = Some((
+                                        payload.paths.clone(),
+                                        source.scan.folders[id].path.clone(),
+                                    ));
+                                }
+                            }
+                        }
                         if response.clicked() {
                             let m = ui.input(|i| i.modifiers);
                             self.selection.click(row, m.ctrl, m.shift);
@@ -411,6 +458,26 @@ impl LocationsView {
                             }
                         }
                         response.context_menu(|ui| {
+                            for kind in [
+                                crate::file_ui::Kind::Rename,
+                                crate::file_ui::Kind::Copy,
+                                crate::file_ui::Kind::Move,
+                                crate::file_ui::Kind::Recycle,
+                            ] {
+                                if ui
+                                    .add_enabled(
+                                        !locations.is_running()
+                                            && (kind != crate::file_ui::Kind::Rename
+                                                || self.selection.count() == 1),
+                                        egui::Button::new(kind.label()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.file_requested = Some(kind);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
                             ui.add_enabled_ui(self.selection.count() == 1, |ui| {
                                 if ui.button("용량 분석으로 이동").clicked() {
                                     analyze = Some((source.id, source.generation, hit.item));

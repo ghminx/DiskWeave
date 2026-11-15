@@ -1,13 +1,18 @@
 #![allow(dead_code)]
+mod file_cases;
 #[cfg(test)]
 #[path = "../../src/file_open.rs"]
 mod file_open;
+#[path = "../../src/file_ops.rs"]
+mod file_ops;
 #[cfg(test)]
 #[path = "../../src/global_search.rs"]
 mod global_search;
 #[cfg(test)]
 #[path = "../../src/local_date.rs"]
 mod local_date;
+#[path = "../../src/recycle.rs"]
+mod recycle;
 #[cfg(test)]
 #[path = "../../src/search.rs"]
 mod search;
@@ -144,6 +149,20 @@ fn run() -> io::Result<()> {
     }
     if std::fs::read_to_string(root.join(format!(".diskweave-validation-{token}")))? != token {
         return Err(io::Error::other("시험 볼륨 소유 표식 불일치"));
+    }
+    if request["file_management"].as_bool() == Some(true) {
+        let parent = Path::new(&args[0])
+            .parent()
+            .ok_or_else(|| io::Error::other("시험 요청 경로 확인 실패"))?;
+        let parent = std::fs::canonicalize(parent)?;
+        let owned = std::fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ntfs-validation"),
+        )?;
+        if !parent.starts_with(&owned) || parent.file_name().and_then(|n| n.to_str()) != Some(token)
+        {
+            return Err(io::Error::other("별도 시험 작업 폴더 확인 실패"));
+        }
+        return file_cases::run(root, &parent);
     }
     if request["usn"].as_bool() == Some(true) {
         return usn_cases::run(root, &target);

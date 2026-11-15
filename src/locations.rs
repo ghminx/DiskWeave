@@ -86,6 +86,35 @@ pub(crate) fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
 }
 
 impl Locations {
+    /// 파일 작업 이후의 기본 스캔을 요청 당시 위치 세대에만 반영.
+    pub fn accept_file_refresh(
+        &mut self,
+        id: u64,
+        generation: u64,
+        record: &crate::snapshot::SavedScan,
+    ) -> io::Result<bool> {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return Ok(false);
+        };
+        if entry.generation != generation {
+            return Ok(false);
+        }
+        if entry.scan.is_running()
+            || entry.path != record.scan.folders[0].path
+            || record.tracking.is_some()
+        {
+            return Err(io::Error::other(
+                "파일 작업 후 갱신 대상이 일치하지 않습니다",
+            ));
+        }
+        entry.scan = ScanController::from_saved(record);
+        entry.restored = false;
+        entry.stale = false;
+        entry.generation += 1;
+        entry.checkpoint_revision += 1;
+        self.epoch += 1;
+        Ok(true)
+    }
     /// 검증된 추적 완료 결과를 게시하고 화면 세대와 저장 기준점 변경을 분리.
     pub fn accept_tracking(
         &mut self,
