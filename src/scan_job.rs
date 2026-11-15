@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub struct CompletedScan {
+    pub tracking: Option<crate::usn::Checkpoint>,
     pub engine: Option<crate::engine::Report>,
     pub path: PathBuf,
     pub result: Arc<ScanResult>,
@@ -24,6 +25,7 @@ impl CompletedScan {
             self.elapsed,
         );
         record.engine = self.engine.clone();
+        record.tracking = self.tracking.clone();
         record
     }
 }
@@ -64,6 +66,7 @@ impl ScanController {
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
             },
             completed: Some(CompletedScan {
+                tracking: record.tracking.clone(),
                 engine: record.engine.clone(),
                 path: record.scan.folders[0].path.clone(),
                 result: Arc::clone(&record.scan),
@@ -171,6 +174,7 @@ impl ScanController {
             Ok(result) => {
                 self.status = ScanStatus::Completed;
                 self.completed = Some(CompletedScan {
+                    tracking: None,
                     path: active.path,
                     result: Arc::new(result.result),
                     engine: Some(result.report),

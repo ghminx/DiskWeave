@@ -30,8 +30,17 @@ impl SearchScope {
     }
 }
 
+type LiveSelection = (
+    SearchInput,
+    usize,
+    bool,
+    Arc<ScanResult>,
+    std::collections::HashSet<std::path::PathBuf>,
+);
+
 #[derive(Default)]
 pub struct SearchView {
+    live_selection: Option<LiveSelection>,
     pub show_source: bool,
     presentation: Option<(bool, bool, bool)>,
     pub show_allocated: bool,
@@ -50,6 +59,32 @@ pub struct SearchView {
 }
 
 impl SearchView {
+    pub fn rebase(&mut self, old: &ScanResult, new: &Arc<ScanResult>, folder: usize) {
+        let paths = if let Some(pending) = self.live_selection.take() {
+            pending.4
+        } else {
+            self.selection
+                .rows()
+                .filter_map(|row| {
+                    self.job
+                        .results()?
+                        .items
+                        .get(row)
+                        .map(|&item| crate::search::item_path(old, item))
+                })
+                .collect()
+        };
+        self.invalidate();
+        self.refresh(new, folder);
+        let scope = if self.whole_scan { 0 } else { folder };
+        self.live_selection = Some((
+            self.input.clone(),
+            scope,
+            self.whole_scan,
+            Arc::clone(new),
+            paths,
+        ));
+    }
     pub fn selection_summary(&self) -> crate::list_selection::SelectionSummary {
         crate::list_selection::SelectionSummary::from_items(
             self.selection
@@ -195,6 +230,7 @@ impl SearchView {
         self.whole_scan = false;
     }
     pub fn invalidate(&mut self) {
+        self.live_selection = None;
         self.job.cancel();
         self.selection.clear();
         self.last_request = None;
@@ -204,6 +240,17 @@ impl SearchView {
 
     pub fn poll(&mut self) {
         if self.job.poll() {
+            if let Some((input, scope, whole, scan, paths)) = self.live_selection.take() {
+                if self.last_request.as_ref() == Some(&(input, scope, whole)) {
+                    if let Some(results) = self.job.results() {
+                        for (row, &item) in results.items.iter().enumerate() {
+                            if paths.contains(&crate::search::item_path(&scan, item)) {
+                                self.selection.click(row, true, false);
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(item) = self.focus_after_analysis.take() {
                 if let Some(row) = self.job.results().and_then(|results| {
                     results
@@ -222,6 +269,7 @@ impl SearchView {
         let scope = if self.whole_scan { 0 } else { folder };
         let key = (self.input.clone(), scope, self.whole_scan);
         if self.last_request.as_ref() != Some(&key) {
+            self.live_selection = None;
             self.selection.clear();
             self.reveal_row = None;
             self.focus_after_analysis = None;
@@ -542,6 +590,38 @@ impl SearchView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_search_keeps_conditions_and_surviving_selection_after_resorting() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-search-live-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("kept.bin"), b"123").unwrap();
+        let old = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let mut view = SearchView::default();
+        view.input.text = "bin".into();
+        view.refresh(&old, 0);
+        wait(&mut view);
+        view.selection.click(0, false, false);
+        std::fs::write(root.join("new.bin"), b"123456789").unwrap();
+        let new = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        view.rebase(&old, &new, 0);
+        wait(&mut view);
+        assert_eq!(view.input.text, "bin");
+        let selected = view
+            .selection
+            .single(&view.job.results().unwrap().items)
+            .unwrap();
+        assert_eq!(
+            crate::search::item_path(&new, selected),
+            root.join("kept.bin")
+        );
+        std::fs::remove_file(root.join("kept.bin")).unwrap();
+        let next = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        view.rebase(&new, &next, 0);
+        wait(&mut view);
+        assert_eq!(view.selection.count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     #[test]
     fn search_path_is_visible_by_default_without_horizontal_scroll_in_a_wide_list() {

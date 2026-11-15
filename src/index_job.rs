@@ -51,7 +51,7 @@ impl CloseState {
 #[derive(Clone, PartialEq, Eq)]
 struct Key {
     selected: Option<u64>,
-    entries: Vec<(u64, u64, bool, bool)>,
+    entries: Vec<(u64, u64, bool, bool, u64)>,
 }
 impl Key {
     fn of(locations: &Locations) -> Self {
@@ -60,7 +60,15 @@ impl Key {
             entries: locations
                 .entries
                 .iter()
-                .map(|e| (e.id, e.generation, e.enabled, e.stale))
+                .map(|e| {
+                    (
+                        e.id,
+                        e.generation,
+                        e.enabled,
+                        e.stale,
+                        e.checkpoint_revision,
+                    )
+                })
                 .collect(),
         }
     }
@@ -87,6 +95,7 @@ struct Reply {
 }
 #[derive(Default)]
 pub struct IndexController {
+    pub saving_paused: bool,
     pub status: Status,
     pub enabled: bool,
     pub writable: bool,
@@ -291,6 +300,7 @@ impl IndexController {
             self.dispatch();
         }
         if self.ready
+            && !self.saving_paused
             && self.enabled
             && self.writable
             && !self.busy()
@@ -318,6 +328,7 @@ impl IndexController {
             Status::Dormant => String::new(),
             Status::Loading => "분석 목록 불러오는 중…".into(),
             Status::Saving => "분석 목록 저장 중…".into(),
+            Status::Ready if self.saving_paused => "추적 중 저장 대기 · 중지·종료할 때 저장".into(),
             Status::Ready => "분석 목록 자동 저장".into(),
             Status::Disabled => "분석 목록 자동 저장 꺼짐".into(),
             Status::ReadOnly => "다른 창에서 목록 저장 중 · 이 창은 조회만 가능".into(),
@@ -385,6 +396,36 @@ mod tests {
         fs,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+    #[test]
+    fn pausing_automatic_writes_keeps_dirty_results_until_tracking_stops() {
+        let p = root("paused");
+        let source = p.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a"), b"12345").unwrap();
+        let mut locations = Locations::default();
+        locations.start(source).unwrap();
+        let mut job = IndexController::start(p.join("cache"));
+        job.saving_paused = true;
+        settle(&mut job, &mut locations);
+        assert!(!job.close_ready(&locations));
+        job.saving_paused = false;
+        settle(&mut job, &mut locations);
+        assert!(job.close_ready(&locations));
+        job.shutdown();
+        let mut store = Repository::open(&p.join("cache")).unwrap();
+        assert_eq!(
+            store.load(|| false).unwrap().catalog.locations[0]
+                .record
+                .as_ref()
+                .unwrap()
+                .scan
+                .folders[0]
+                .logical_bytes,
+            5
+        );
+        drop(store);
+        fs::remove_dir_all(p).unwrap();
+    }
     fn root(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "diskweave-index-job-{label}-{}-{}",

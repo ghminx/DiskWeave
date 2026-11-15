@@ -16,6 +16,48 @@ pub struct Explorer {
 }
 
 impl Explorer {
+    /// 변경 세대의 인덱스를 경로로 다시 연결하고 사라진 폴더는 남은 상위로 복귀.
+    pub fn rebase(&self, old: &ScanResult, new: &ScanResult) -> Self {
+        let mut next = Self::new(new);
+        let root = &new.folders[0].path;
+        let mut path = old.folders[self.folder].path.as_path();
+        let folder = loop {
+            if let Ok(relative) = path.strip_prefix(root) {
+                if let Ok(id) = new.folder_index(relative) {
+                    break id;
+                }
+            }
+            let Some(parent) = path.parent() else {
+                break 0;
+            };
+            path = parent;
+        };
+        next.open_folder(new, folder);
+        for id in &self.expanded {
+            if let Some(id) = new
+                .folders
+                .iter()
+                .position(|f| f.path == old.folders[*id].path)
+            {
+                next.expanded.insert(id);
+            }
+        }
+        let selected = match self.selected {
+            Item::Folder(id) => old.folders[id].path.clone(),
+            Item::File(id) => old.folders[old.files[id].parent]
+                .path
+                .join(&old.files[id].name),
+        };
+        if let Some(id) = new.folders.iter().position(|f| f.path == selected) {
+            next.selected = Item::Folder(id);
+        } else if let Some(id) = new.files.iter().enumerate().find_map(|(id, f)| {
+            (new.folders[f.parent].path.join(&f.name) == selected).then_some(id)
+        }) {
+            next.selected = Item::File(id);
+        }
+        next.rebuild_tree(new);
+        next
+    }
     pub fn new(result: &ScanResult) -> Self {
         let mut explorer = Self {
             folder: 0,
@@ -121,6 +163,30 @@ impl Explorer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_results_preserve_navigation_and_fall_back_after_a_folder_leaves_the_scope() {
+        use std::fs;
+        let root =
+            std::env::temp_dir().join(format!("diskweave-explorer-live-{}", std::process::id()));
+        fs::create_dir_all(root.join("a/deep")).unwrap();
+        fs::write(root.join("a/deep/known"), b"123").unwrap();
+        let old = crate::scanner::scan(&root, || false).unwrap();
+        let folder = old.folder_index(std::path::Path::new("a/deep")).unwrap();
+        let mut view = super::Explorer::new(&old);
+        view.open_folder(&old, folder);
+        let selected = super::Item::File(old.file_children[folder][0]);
+        view.select(selected);
+        fs::write(root.join("new"), b"12345").unwrap();
+        let new = crate::scanner::scan(&root, || false).unwrap();
+        let live = view.rebase(&old, &new);
+        assert_eq!(new.folders[live.folder()].path, root.join("a/deep"));
+        assert!(matches!(live.selected(), super::Item::File(_)));
+        fs::remove_dir_all(root.join("a/deep")).unwrap();
+        let next = crate::scanner::scan(&root, || false).unwrap();
+        let live = live.rebase(&new, &next);
+        assert_eq!(next.folders[live.folder()].path, root.join("a"));
+        fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use crate::scanner::{self, ScanResult};
     use std::fs;

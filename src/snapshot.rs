@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SavedScan {
+    pub tracking: Option<crate::usn::Checkpoint>,
     pub engine: Option<crate::engine::Report>,
     pub scan: Arc<ScanResult>,
     pub started: SystemTime,
@@ -25,6 +26,7 @@ impl SavedScan {
         elapsed: Duration,
     ) -> Self {
         Self {
+            tracking: None,
             engine: None,
             scan,
             started,
@@ -34,7 +36,7 @@ impl SavedScan {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Time {
     before_epoch: bool,
     seconds: u64,
@@ -54,7 +56,7 @@ impl From<SystemTime> for Time {
     }
 }
 impl Time {
-    fn decode(self) -> io::Result<SystemTime> {
+    pub(crate) fn decode(self) -> io::Result<SystemTime> {
         if self.nanos >= 1_000_000_000 {
             return Err(invalid());
         }
@@ -111,6 +113,8 @@ impl Issue {
 }
 #[derive(Serialize, Deserialize)]
 struct Archive {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tracking: Option<crate::usn::Checkpoint>,
     #[serde(default)]
     engine: Option<crate::engine::Report>,
     format: String,
@@ -184,6 +188,7 @@ fn encoded(record: &SavedScan, cancelled: &impl Fn() -> bool) -> io::Result<Arch
         })
         .collect::<io::Result<_>>()?;
     Ok(Archive {
+        tracking: record.tracking.clone(),
         engine: record.engine.clone(),
         format: "DiskWeave".into(),
         version: 1,
@@ -424,7 +429,11 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
                 .then_with(|| scan.files[a].name.cmp(&scan.files[b].name))
         });
     }
+    if let Some(state) = &a.tracking {
+        state.validate(&scan)?;
+    }
     Ok(SavedScan {
+        tracking: a.tracking,
         engine: a.engine,
         scan: Arc::new(scan),
         started: a.started.decode()?,

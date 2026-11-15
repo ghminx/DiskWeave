@@ -30,9 +30,12 @@ mod search_job;
 mod search_view;
 mod snapshot;
 mod target_selection;
+mod tracking;
 mod treemap;
 mod treemap_view;
 mod ui_style;
+mod usn;
+mod usn_native;
 mod workspace;
 
 use std::io;

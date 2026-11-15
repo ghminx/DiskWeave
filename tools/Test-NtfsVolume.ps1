@@ -1,4 +1,4 @@
-param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=10000)
+﻿param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=10000,[switch]$Usn)
 $ErrorActionPreference='Stop'
 $OutputEncoding=[Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -46,15 +46,16 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $root 'Cases/compressed.bin'),[byte[]]::new(65536))
     & compact.exe /c /i /q (Join-Path $root 'Cases/compressed.bin') | Out-File (Join-Path $runDir 'compression.log')
     if($LASTEXITCODE -ne 0){throw '시험 압축 설정 실패'}
-    [IO.File]::WriteAllText((Join-Path $root 'Cases/regular.bin:extra'),'ADS excluded')
+    Set-Content -LiteralPath (Join-Path $root 'Cases/regular.bin') -Stream extra -Value 'ADS excluded' -Encoding UTF8
     New-Item -ItemType Junction -Path (Join-Path $root 'Cases/loop') -Target (Join-Path $root 'Cases') | Out-Null
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'Cases/bulk'))
     for($i=0;$i -lt $FileCount;$i++){[IO.File]::WriteAllBytes((Join-Path $root ('Cases/bulk/entry-{0:D5}.bin' -f $i)),[byte[]](1..8))}
     $guid=(Get-Volume -DriveLetter $volume.DriveLetter).Path
     $request=Join-Path $runDir 'request.json'
-    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount;usn=$Usn.IsPresent}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     $trialStart=Get-Date
     $trial=Start-Process -FilePath $Runner -ArgumentList @('"'+$request+'"') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $runDir 'result.json') -RedirectStandardError (Join-Path $runDir 'trace.log')
+    $ownedProcessHandle=$trial.Handle
     $peakCombined=0L
     $processPeaks=@{}
     $unavailableSamples=0
@@ -73,8 +74,8 @@ try {
     }
     $trial.WaitForExit()
     [IO.File]::WriteAllText((Join-Path $runDir 'memory.json'),(@{sample_interval_ms=25;unavailable_samples=$unavailableSamples;sampled_peak_combined_working_set=$peakCombined;observed_process_peak_working_sets=$processPeaks;note='검증 실행기와 같은 경로에서 이번에 생성된 도우미의 작업 집합 표본이며 제품 GUI 메모리 측정과 구분함'}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
-    if($trial.ExitCode -ne 0){Get-Content (Join-Path $runDir 'trace.log') -Tail 30;throw '실제 NTFS 대조 실패'}
-    Get-Content (Join-Path $runDir 'result.json')
+    if($trial.ExitCode -ne 0){Get-Content (Join-Path $runDir 'trace.log') -Encoding UTF8 -Tail 30;throw '실제 NTFS 대조 실패'}
+    Get-Content (Join-Path $runDir 'result.json') -Encoding UTF8
 } finally {
     if($mounted){Dismount-DiskImage -ImagePath $image}
     Write-Output ('시험 기록: '+$runDir)

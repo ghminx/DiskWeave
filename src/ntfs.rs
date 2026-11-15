@@ -13,6 +13,7 @@ pub enum Id {
     V2(u64),
 }
 pub struct Info {
+    pub resolved: Option<PathBuf>,
     pub link_count: Option<u32>,
     pub reference: Option<Id>,
     pub bytes: u64,
@@ -31,6 +32,7 @@ pub trait Source {
 pub fn inspect(path: &Path, detailed: bool) -> io::Result<Info> {
     let m = std::fs::symlink_metadata(path)?;
     Ok(Info {
+        resolved: None,
         link_count: None,
         reference: None,
         bytes: m.len(),

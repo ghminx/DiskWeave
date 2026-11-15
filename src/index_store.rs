@@ -51,6 +51,8 @@ struct Manifest {
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<Cursor>,
     id: u64,
     path: Vec<u16>,
     identity: Vec<u16>,
@@ -58,6 +60,12 @@ struct Entry {
     stale: bool,
     generation: u64,
     snapshot: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Cursor {
+    next: i64,
+    pending: Vec<u64>,
+    checked: crate::snapshot::Time,
 }
 #[derive(Serialize, Deserialize)]
 struct Preference {
@@ -182,15 +190,27 @@ impl Repository {
                     if !snapshot_name(name) {
                         return Err(invalid("저장된 결과의 파일명이 올바르지 않습니다"));
                     }
-                    let record = crate::snapshot::load(&self.root.join(name), cancelled).map_err(
-                        |error| {
+                    let mut record = crate::snapshot::load(&self.root.join(name), cancelled)
+                        .map_err(|error| {
                             if error.kind() == io::ErrorKind::Interrupted {
                                 error
                             } else {
                                 invalid(&format!("저장된 위치 결과를 읽을 수 없습니다: {error}"))
                             }
-                        },
-                    )?;
+                        })?;
+                    if let Some(cursor) = &e.cursor {
+                        let state = record
+                            .tracking
+                            .as_mut()
+                            .ok_or_else(|| invalid("기준 결과 없는 추적 위치"))?;
+                        if cursor.next < state.next {
+                            return Err(invalid("저장된 변경 위치가 역행했습니다"));
+                        }
+                        state.next = cursor.next;
+                        state.pending = cursor.pending.clone();
+                        state.validate(&record.scan)?;
+                        record.finished = cursor.checked.clone().decode()?;
+                    }
                     let actual = &record.scan.folders[0].path;
                     if !crate::locations::contains_path(&root, actual)?
                         || !crate::locations::contains_path(actual, &root)?
@@ -498,7 +518,20 @@ impl Repository {
                 if old.is_some_and(|old| {
                     Arc::ptr_eq(&old.scan, &record.scan)
                         && old.started == record.started
-                        && old.finished == record.finished
+                        && (old.finished == record.finished
+                            || old
+                                .tracking
+                                .as_ref()
+                                .zip(record.tracking.as_ref())
+                                .is_some_and(|(a, b)| {
+                                    a.version == b.version
+                                        && a.volume == b.volume
+                                        && a.root == b.root
+                                        && a.journal == b.journal
+                                        && a.folders == b.folders
+                                        && a.files == b.files
+                                        && a.excluded == b.excluded
+                                }))
                 }) && existing.is_some()
                 {
                     existing
@@ -511,6 +544,13 @@ impl Repository {
                 None
             };
             entries.push(Entry {
+                cursor: l.record.as_ref().and_then(|r| {
+                    r.tracking.as_ref().map(|s| Cursor {
+                        next: s.next,
+                        pending: s.pending.clone(),
+                        checked: r.finished.into(),
+                    })
+                }),
                 id: l.id,
                 path: wide(&l.path),
                 identity: wide(&l.identity),
@@ -580,6 +620,80 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+    fn with_checkpoint(mut location: CachedLocation, next: i64) -> CachedLocation {
+        let record = Arc::get_mut(location.record.as_mut().unwrap()).unwrap();
+        record.tracking = Some(crate::usn::Checkpoint {
+            version: 1,
+            volume: "test".into(),
+            root: 1,
+            journal: 7,
+            next,
+            folders: (1..=record.scan.folders.len() as u64).collect(),
+            files: vec![99; record.scan.files.len()],
+            excluded: vec![],
+            pending: vec![],
+        });
+        location
+    }
+    #[test]
+    fn cursor_and_result_recover_as_one_generation_after_a_cancelled_publish() {
+        use std::cell::Cell;
+        let p = fixture("cursor");
+        let root = p.join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("known"), b"12345").unwrap();
+        let cache = p.join("cache");
+        let mut store = Repository::open(&cache).unwrap();
+        store.load(|| false).unwrap();
+        let first = with_checkpoint(location(&root, 1), 100);
+        let mut catalog = Catalog {
+            locations: vec![first],
+            selected: Some(1),
+        };
+        store.save(&catalog, || false, |_| {}).unwrap();
+        let old = catalog.locations[0].record.as_ref().unwrap();
+        let mut next = SavedScan::new(
+            Arc::clone(&old.scan),
+            old.started,
+            old.finished + Duration::from_secs(1),
+            old.elapsed,
+        );
+        next.tracking = old.tracking.clone();
+        next.tracking.as_mut().unwrap().next = 108;
+        catalog.locations[0].record = Some(Arc::new(next));
+        let stop = Cell::new(false);
+        assert!(store
+            .save(
+                &catalog,
+                || stop.get(),
+                |phase| if matches!(phase, Phase::Publishing) {
+                    stop.set(true)
+                }
+            )
+            .is_err());
+        let mut reader = Repository::open(&cache).unwrap();
+        assert_eq!(
+            reader.load(|| false).unwrap().catalog.locations[0]
+                .record
+                .as_ref()
+                .unwrap()
+                .tracking
+                .as_ref()
+                .unwrap()
+                .next,
+            100
+        );
+        drop(reader);
+        store.save(&catalog, || false, |_| {}).unwrap();
+        drop(store);
+        let mut reopened = Repository::open(&cache).unwrap();
+        let loaded = reopened.load(|| false).unwrap();
+        let record = loaded.catalog.locations[0].record.as_ref().unwrap();
+        assert_eq!(record.tracking.as_ref().unwrap().next, 108);
+        assert_eq!(record.scan.folders[0].logical_bytes, 5);
+        drop(reopened);
+        fs::remove_dir_all(p).unwrap();
     }
     fn location(root: &Path, id: u64) -> CachedLocation {
         CachedLocation {
@@ -660,7 +774,7 @@ mod tests {
         store
             .save(
                 &Catalog {
-                    locations: vec![location(&source, 1)],
+                    locations: vec![with_checkpoint(location(&source, 1), 100)],
                     selected: Some(1),
                 },
                 || false,
@@ -704,6 +818,17 @@ mod tests {
                 .record
                 .as_ref()
                 .unwrap()
+                .tracking
+                .as_ref()
+                .unwrap()
+                .next,
+            100
+        );
+        assert_eq!(
+            loaded.catalog.locations[0]
+                .record
+                .as_ref()
+                .unwrap()
                 .scan
                 .folders[0]
                 .logical_bytes,
@@ -733,7 +858,7 @@ mod tests {
         store
             .save(
                 &Catalog {
-                    locations: vec![location(&source, 1)],
+                    locations: vec![with_checkpoint(location(&source, 1), 108)],
                     selected: Some(1),
                 },
                 || false,

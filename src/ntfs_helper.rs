@@ -44,7 +44,7 @@ impl Drop for Local {
         }
     }
 }
-struct Worker(Handle);
+pub(crate) struct Worker(Handle);
 impl Drop for Worker {
     fn drop(&mut self) {
         // 이 호출에서 생성한 읽기 전용 도우미 핸들에만 종료 요청
@@ -75,6 +75,10 @@ struct Request {
     version: u32,
     target: Target,
     detailed: bool,
+    #[serde(default)]
+    watch: Option<Vec<u16>>,
+    #[serde(default)]
+    resume: bool,
 }
 #[derive(Serialize, Deserialize)]
 enum Message {
@@ -84,17 +88,23 @@ enum Message {
         folders: u64,
     },
     Ready,
+    Checking,
+    Cursor,
     Failed(String),
 }
 
-struct Pipe<'a> {
+pub(crate) struct Pipe<'a> {
     handle: Handle,
     cancelled: &'a dyn Fn() -> bool,
 }
 impl Pipe<'_> {
     fn check(&self, start: Instant) -> io::Result<()> {
         if (self.cancelled)() {
-            return Err(io::Error::other("스캔 취소"));
+            // Read/Write의 기본 재시도에서 취소가 영구 반복되지 않도록 연결 종료로 전달.
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "스캔 취소",
+            ));
         }
         if start.elapsed() > Duration::from_secs(300) {
             return Err(io::Error::new(
@@ -197,19 +207,19 @@ impl Pipe<'_> {
             other => other.map(|n| n as usize),
         }
     }
-    fn send(&mut self, value: &impl Serialize) -> io::Result<()> {
+    pub(crate) fn send(&mut self, value: &impl Serialize) -> io::Result<()> {
         let data = serde_json::to_vec(value).map_err(crate::output::json_error)?;
-        if data.len() > 16 * 1024 {
+        if data.len() > 256 * 1024 {
             return Err(invalid("도우미 제어 메시지가 너무 큽니다"));
         }
         self.write_all(&(data.len() as u32).to_le_bytes())?;
         self.write_all(&data)
     }
-    fn receive<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
+    pub(crate) fn receive<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
         let mut size = [0; 4];
         self.read_exact(&mut size)?;
         let size = u32::from_le_bytes(size) as usize;
-        if size > 16 * 1024 {
+        if size > 256 * 1024 {
             return Err(invalid("도우미 메시지 길이 초과"));
         }
         let mut data = vec![0; size];
@@ -236,6 +246,305 @@ impl Write for Pipe<'_> {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+struct Chunks<'a, 'b> {
+    pipe: &'a mut Pipe<'b>,
+    remaining: usize,
+    total: u64,
+    ended: bool,
+}
+impl Read for Chunks<'_, '_> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        if b.is_empty() || self.ended {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut n = [0u8; 4];
+            self.pipe.read_exact(&mut n)?;
+            self.remaining = u32::from_le_bytes(n) as usize;
+            if self.remaining == 0 {
+                self.ended = true;
+                return Ok(0);
+            }
+            if self.remaining > 65536 {
+                return Err(invalid("도우미 데이터 조각 길이 초과"));
+            }
+            self.total += self.remaining as u64;
+            if self.total > 1_073_741_824 {
+                return Err(invalid("도우미 데이터 크기 초과"));
+            }
+        }
+        let len = b.len().min(self.remaining);
+        self.pipe.read_exact(&mut b[..len])?;
+        self.remaining -= len;
+        Ok(len)
+    }
+}
+struct ChunkWriter<'a, 'b> {
+    pipe: &'a mut Pipe<'b>,
+    total: u64,
+}
+impl Write for ChunkWriter<'_, '_> {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if b.is_empty() {
+            return Ok(0);
+        }
+        let n = b.len().min(65536);
+        self.total += n as u64;
+        if self.total > 1_073_741_824 {
+            return Err(invalid("도우미 데이터 크기 초과"));
+        }
+        self.pipe.write_all(&(n as u32).to_le_bytes())?;
+        self.pipe.write_all(&b[..n])?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Pipe<'_> {
+    fn record(&mut self, record: &SavedScan) -> io::Result<()> {
+        let chunks = ChunkWriter {
+            pipe: self,
+            total: 0,
+        };
+        let mut writer = io::BufWriter::with_capacity(65536, chunks);
+        crate::snapshot::write_to(record, &mut writer, || false)?;
+        writer.flush()?;
+        drop(writer);
+        self.write_all(&0u32.to_le_bytes())
+    }
+    fn read_record(&mut self) -> io::Result<SavedScan> {
+        crate::snapshot::read_from(
+            Chunks {
+                pipe: self,
+                remaining: 0,
+                total: 0,
+                ended: false,
+            },
+            || false,
+        )
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct Advance {
+    next: i64,
+    pending: Vec<u64>,
+}
+/// 명시적으로 선택한 NTFS 위치의 변경 추적을 제한된 읽기 전용 도우미에서 실행.
+pub fn watch(
+    root: &Path,
+    detailed: bool,
+    resume: Option<Arc<SavedScan>>,
+    cancelled: &dyn Fn() -> bool,
+    mut publish: impl FnMut(SavedScan),
+    mut progress: impl FnMut(Progress),
+) -> io::Result<()> {
+    let target = crate::usn_native::target(root)?;
+    let (mut pipe, _worker) = launch(cancelled)?;
+    pipe.send(&Request {
+        version: 1,
+        target: target.clone(),
+        detailed,
+        watch: Some(root.as_os_str().encode_wide().collect()),
+        resume: resume.is_some(),
+    })?;
+    if let Some(record) = &resume {
+        pipe.record(record)?;
+    }
+    let mut previous: Option<SavedScan> = None;
+    loop {
+        crate::output::check(&cancelled)?;
+        let record = match pipe.receive()? {
+            Message::Ready => {
+                let record = pipe.read_record()?;
+                if record.scan.folders[0].path != root
+                    || record.scan.detailed != detailed
+                    || record
+                        .tracking
+                        .as_ref()
+                        .is_none_or(|c| c.volume != target.volume)
+                {
+                    return Err(invalid("변경 추적 응답의 대상·옵션 불일치"));
+                }
+                record
+            }
+            Message::Cursor => {
+                let value: Advance = serde_json::from_reader(Chunks {
+                    pipe: &mut pipe,
+                    remaining: 0,
+                    total: 0,
+                    ended: false,
+                })
+                .map_err(crate::output::json_error)?;
+                let old = previous
+                    .as_ref()
+                    .ok_or_else(|| invalid("기준 결과 없는 변경 위치 응답"))?;
+                let mut next = SavedScan::new(
+                    Arc::clone(&old.scan),
+                    old.started,
+                    SystemTime::now(),
+                    old.elapsed,
+                );
+                next.tracking = old.tracking.clone();
+                let state = next.tracking.as_mut().unwrap();
+                if value.next < state.next || value.pending.len() > state.files.len() {
+                    return Err(invalid("올바르지 않은 변경 추적 위치"));
+                }
+                state.next = value.next;
+                state.pending = value.pending;
+                state.validate(&next.scan)?;
+                next
+            }
+            Message::Checking => {
+                progress(Progress {
+                    stage: Stage::Basic,
+                    counts: Default::default(),
+                });
+                continue;
+            }
+            Message::Progress {
+                stage,
+                files,
+                folders,
+            } => {
+                progress(Progress {
+                    stage,
+                    counts: ScanProgress {
+                        files_scanned: files,
+                        folders_scanned: folders,
+                    },
+                });
+                continue;
+            }
+            Message::Failed(error) => return Err(io::Error::other(error)),
+        };
+        if crate::usn_native::target(root)?.volume != target.volume {
+            return Err(invalid("응답 중 추적 드라이브가 바뀌었습니다"));
+        }
+        let mut delivered = SavedScan::new(
+            Arc::clone(&record.scan),
+            record.started,
+            record.finished,
+            record.elapsed,
+        );
+        delivered.tracking = record.tracking.clone();
+        delivered.engine = record.engine.clone();
+        previous = Some(record);
+        publish(delivered);
+    }
+}
+fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
+    use std::os::windows::ffi::OsStringExt;
+    let value = request.watch.as_ref().unwrap();
+    if value.len() > 32767 || value.contains(&0) {
+        return Err(invalid("추적 경로 길이·형식 오류"));
+    }
+    let root = std::path::PathBuf::from(OsString::from_wide(value));
+    if !root.is_absolute() {
+        return Err(invalid("추적 경로는 절대 경로여야 합니다"));
+    }
+    let result: io::Result<()> = (|| {
+        if crate::usn_native::target(&root)?.volume != request.target.volume {
+            return Err(invalid("추적 볼륨 요청 불일치"));
+        }
+        let mut source = crate::usn_native::Native::open(&root)?;
+        let mut index = if request.resume {
+            let record = pipe.read_record()?;
+            if record.scan.folders[0].path != root || record.scan.detailed != request.detailed {
+                return Err(invalid("복원 대상·수집 옵션 불일치"));
+            }
+            let mut index = crate::usn::Index::restore(&record)?;
+            index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
+            index
+        } else {
+            crate::usn::Index::begin(
+                &root,
+                request.detailed,
+                &mut Traced::new(&mut source, pipe),
+                &|| false,
+            )?
+        };
+        let record = index.snapshot(&|| false)?;
+        pipe.send(&Message::Ready)?;
+        pipe.record(&record)?;
+        loop {
+            pipe.send(&Message::Checking)?;
+            std::thread::sleep(Duration::from_secs(1));
+            let before = (index.checkpoint.next, index.checkpoint.pending.clone());
+            let changed = index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
+            if changed {
+                let record = index.snapshot(&|| false)?;
+                pipe.send(&Message::Ready)?;
+                pipe.record(&record)?;
+            } else if index.checkpoint.next != before.0 || index.checkpoint.pending != before.1 {
+                pipe.send(&Message::Cursor)?;
+                let value = Advance {
+                    next: index.checkpoint.next,
+                    pending: index.checkpoint.pending.clone(),
+                };
+                let mut writer =
+                    io::BufWriter::with_capacity(65536, ChunkWriter { pipe, total: 0 });
+                serde_json::to_writer(&mut writer, &value).map_err(crate::output::json_error)?;
+                writer.flush()?;
+                drop(writer);
+                pipe.write_all(&0u32.to_le_bytes())?;
+            }
+        }
+    })();
+    if let Err(error) = result {
+        pipe.send(&Message::Failed(error.to_string()))?;
+    }
+    Ok(())
+}
+struct Traced<'a, 'p, 'c> {
+    source: &'a mut crate::usn_native::Native,
+    pipe: &'p mut Pipe<'c>,
+    last: Instant,
+    counts: ScanProgress,
+}
+impl<'a, 'p, 'c> Traced<'a, 'p, 'c> {
+    fn new(source: &'a mut crate::usn_native::Native, pipe: &'p mut Pipe<'c>) -> Self {
+        Self {
+            source,
+            pipe,
+            last: Instant::now() - Duration::from_secs(1),
+            counts: ScanProgress::default(),
+        }
+    }
+    fn notify(&mut self) -> io::Result<()> {
+        if self.last.elapsed() >= Duration::from_millis(100) {
+            self.pipe.send(&Message::Progress {
+                stage: Stage::Metadata,
+                files: self.counts.files_scanned,
+                folders: self.counts.folders_scanned,
+            })?;
+            self.last = Instant::now();
+        }
+        Ok(())
+    }
+}
+impl crate::usn::Source for Traced<'_, '_, '_> {
+    fn journal(&mut self) -> io::Result<crate::usn::Journal> {
+        self.notify()?;
+        self.source.journal()
+    }
+    fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<crate::usn::Event>> {
+        self.source.read(start, end)
+    }
+    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+        let info = self.source.inspect(path, detailed)?;
+        if info.attributes & 0x10 != 0 {
+            self.counts.folders_scanned += 1;
+        } else {
+            self.counts.files_scanned += 1;
+        }
+        self.notify()?;
+        Ok(info)
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+        self.source.list(path)
     }
 }
 fn descriptor() -> io::Result<Local> {
@@ -342,13 +651,7 @@ fn spawn(nonce: &str) -> io::Result<Worker> {
     }
     Ok(Worker(Handle(info.hProcess)))
 }
-pub fn scan(
-    root: &Path,
-    detailed: bool,
-    cancelled: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(Progress),
-) -> io::Result<ScanResult> {
-    let target = ntfs_native::target(root)?;
+pub(crate) fn launch(cancelled: &dyn Fn() -> bool) -> io::Result<(Pipe<'_>, Worker)> {
     let key = nonce()?;
     let name = pipe_name(&key)?;
     let sd = descriptor()?;
@@ -372,14 +675,10 @@ pub fn scan(
     if h == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    let mut pipe = Pipe {
+    let pipe = Pipe {
         handle: Handle(h),
         cancelled,
     };
-    progress(Progress {
-        stage: Stage::Authorizing,
-        counts: Default::default(),
-    });
     let worker = spawn(&key).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -393,10 +692,26 @@ pub fn scan(
     {
         return Err(invalid("스캔 도우미 프로세스가 일치하지 않습니다"));
     }
+    Ok((pipe, worker))
+}
+pub fn scan(
+    root: &Path,
+    detailed: bool,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(Progress),
+) -> io::Result<ScanResult> {
+    let target = ntfs_native::target(root)?;
+    progress(Progress {
+        stage: Stage::Authorizing,
+        counts: Default::default(),
+    });
+    let (mut pipe, _worker) = launch(cancelled)?;
     pipe.send(&Request {
         version: 1,
         target: target.clone(),
         detailed,
+        watch: None,
+        resume: false,
     })?;
     loop {
         match pipe.receive()? {
@@ -413,6 +728,7 @@ pub fn scan(
             }),
             Message::Failed(e) => return Err(io::Error::other(e)),
             Message::Ready => break,
+            _ => return Err(invalid("일반 스캔에 잘못된 도우미 응답")),
         }
     }
     progress(Progress {
@@ -464,6 +780,9 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     let request: Request = pipe.receive()?;
     if request.version != 1 {
         return Err(invalid("지원하지 않는 도우미 버전"));
+    }
+    if request.watch.is_some() {
+        return watch_worker(&mut pipe, &request);
     }
     let root = Path::new(&request.target.root);
     let begin = SystemTime::now();
@@ -520,6 +839,29 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_transport_returns_without_retrying_the_read() {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = null_mut();
+            let mut writer = null_mut();
+            assert_ne!(
+                unsafe { CreatePipe(&mut reader, &mut writer, null(), 0) },
+                0
+            );
+            let _writer = Handle(writer);
+            let mut pipe = Pipe {
+                handle: Handle(reader),
+                cancelled: &|| true,
+            };
+            let result = pipe.read_exact(&mut [0u8; 4]);
+            done.send(result.map_err(|e| e.kind())).unwrap();
+        });
+        assert_eq!(
+            wait.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(io::ErrorKind::ConnectionAborted))
+        );
+    }
     #[test]
     fn helper_responses_must_match_requested_root_mode_and_details() {
         let root = std::env::temp_dir().join(format!("diskweave-response-{}", std::process::id()));

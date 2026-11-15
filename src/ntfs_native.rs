@@ -241,9 +241,9 @@ pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::R
         .share_mode(7)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    check_volume(&f, expected_volume)?;
+    let resolved = check_volume(&f, expected_volume)?;
     let metadata = f.metadata()?;
-    if metadata.is_dir() {
+    if metadata.is_dir() && metadata.file_attributes() & 0x400 == 0 {
         let _access = File::options()
             .access_mode(FILE_LIST_DIRECTORY)
             .share_mode(7)
@@ -255,6 +255,7 @@ pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::R
         return Err(io::Error::last_os_error());
     }
     Ok(Info {
+        resolved: Some(resolved),
         link_count: Some(id.nNumberOfLinks),
         reference: Some(Id::V2(
             (u64::from(id.nFileIndexHigh) << 32) | u64::from(id.nFileIndexLow),
@@ -273,7 +274,7 @@ pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::R
         },
     })
 }
-fn check_volume(file: &File, expected: &str) -> io::Result<()> {
+pub(crate) fn check_volume(file: &File, expected: &str) -> io::Result<PathBuf> {
     let mut buffer = vec![0u16; 256];
     let query = |buffer: &mut Vec<u16>| unsafe {
         GetFinalPathNameByHandleW(
@@ -308,7 +309,7 @@ fn check_volume(file: &File, expected: &str) -> io::Result<()> {
             "선택한 볼륨 밖으로 경로가 변경됐습니다",
         ));
     }
-    Ok(())
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..size])))
 }
 
 #[cfg(test)]

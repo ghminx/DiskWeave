@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Location {
+    checkpoint_written: Option<std::time::Instant>,
+    pub checkpoint_revision: u64,
     pub restored: bool,
     pub id: u64,
     pub path: PathBuf,
@@ -84,6 +86,81 @@ pub(crate) fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
 }
 
 impl Locations {
+    /// 검증된 추적 완료 결과를 게시하고 화면 세대와 저장 기준점 변경을 분리.
+    pub fn accept_tracking(
+        &mut self,
+        id: u64,
+        record: &crate::snapshot::SavedScan,
+    ) -> io::Result<bool> {
+        self.accept_tracking_at(id, record, std::time::Instant::now())
+    }
+    pub fn accept_tracking_at(
+        &mut self,
+        id: u64,
+        record: &crate::snapshot::SavedScan,
+        now: std::time::Instant,
+    ) -> io::Result<bool> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "추적 위치가 목록에서 제거되었습니다",
+                )
+            })?;
+        if entry.scan.is_running() || record.scan.folders[0].path != entry.path {
+            return Err(io::Error::other(
+                "현재 스캔과 추적 대상이 일치하지 않습니다",
+            ));
+        }
+        record
+            .tracking
+            .as_ref()
+            .ok_or_else(|| io::Error::other("변경 추적 기준점이 없습니다"))?
+            .validate(&record.scan)?;
+        let changed = entry
+            .scan
+            .completed()
+            .is_none_or(|old| !Arc::ptr_eq(&old.result, &record.scan));
+        let state_changed = entry.stale || entry.restored;
+        entry.scan = ScanController::from_saved(record);
+        entry.restored = false;
+        entry.stale = false;
+        if changed
+            || state_changed
+            || entry
+                .checkpoint_written
+                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(60))
+        {
+            entry.checkpoint_revision += 1;
+            entry.checkpoint_written = Some(now);
+        }
+        if changed {
+            entry.generation += 1;
+        }
+        if changed || state_changed {
+            self.epoch += 1;
+        }
+        Ok(changed)
+    }
+    pub fn flush_tracking_checkpoint(&mut self, id: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            if entry.scan.completed().is_some_and(|c| c.tracking.is_some()) {
+                entry.checkpoint_revision += 1;
+                entry.checkpoint_written = Some(std::time::Instant::now());
+            }
+        }
+    }
+    pub fn tracking_failed(&mut self, id: u64) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            if !entry.stale {
+                entry.stale = true;
+                self.epoch += 1;
+            }
+        }
+    }
     pub fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
         let path = record.scan.folders[0].path.clone();
         Self {
@@ -93,6 +170,8 @@ impl Locations {
             },
             entries: vec![Location {
                 restored: false,
+                checkpoint_revision: 0,
+                checkpoint_written: None,
                 id: 1,
                 identity: path.clone(),
                 path,
@@ -184,6 +263,8 @@ impl Locations {
                     .map_or_else(ScanController::default, |r| ScanController::from_saved(r));
                 self.entries.push(Location {
                     restored: c.record.is_some(),
+                    checkpoint_revision: 0,
+                    checkpoint_written: None,
                     id: self.next_id,
                     path: c.path.clone(),
                     identity: c.identity.clone(),
@@ -264,6 +345,8 @@ impl Locations {
             .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
         self.entries.push(Location {
             restored: false,
+            checkpoint_revision: 0,
+            checkpoint_written: None,
             id: self.next_id,
             path: std::path::absolute(path)?,
             identity,
@@ -466,6 +549,61 @@ impl Locations {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn accepted_tracking_checkpoints_are_saved_even_when_the_visible_data_is_unchanged() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-tracked-location-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut locations = Locations::default();
+        let id = locations.add(&root).unwrap();
+        let now = std::time::SystemTime::now();
+        let mut record = crate::snapshot::SavedScan::new(
+            Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+            now,
+            now,
+            Duration::ZERO,
+        );
+        record.tracking = Some(crate::usn::Checkpoint {
+            version: 1,
+            volume: "test".into(),
+            root: 1,
+            journal: 7,
+            next: 100,
+            folders: vec![1],
+            files: vec![],
+            excluded: vec![],
+            pending: vec![],
+        });
+        let now = std::time::Instant::now();
+        assert!(locations.accept_tracking_at(id, &record, now).unwrap());
+        let generation = locations.get(id).unwrap().generation;
+        let revision = locations.get(id).unwrap().checkpoint_revision;
+        record.tracking.as_mut().unwrap().next = 108;
+        assert!(!locations
+            .accept_tracking_at(id, &record, now + Duration::from_secs(1))
+            .unwrap());
+        assert_eq!(locations.get(id).unwrap().generation, generation);
+        assert_eq!(locations.get(id).unwrap().checkpoint_revision, revision);
+        assert!(!locations
+            .accept_tracking_at(id, &record, now + Duration::from_secs(61))
+            .unwrap());
+        assert!(locations.get(id).unwrap().checkpoint_revision > revision);
+        let revision = locations.get(id).unwrap().checkpoint_revision;
+        locations.flush_tracking_checkpoint(id);
+        assert!(locations.get(id).unwrap().checkpoint_revision > revision);
+        assert_eq!(
+            locations.export_catalog().locations[0]
+                .record
+                .as_ref()
+                .unwrap()
+                .tracking
+                .as_ref()
+                .unwrap()
+                .next,
+            108
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn delayed_restoration_preserves_live_results_selection_and_explicit_removal() {
         let p =

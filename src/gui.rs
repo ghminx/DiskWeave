@@ -20,6 +20,7 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct DiskWeaveApp {
+    tracking: crate::tracking::Controller,
     index: crate::index_job::IndexController,
     closing: crate::index_job::CloseState,
     clear_index: bool,
@@ -218,6 +219,179 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     action
 }
 impl DiskWeaveApp {
+    fn stop_tracking(&mut self) {
+        if self.tracking.running() {
+            if let Some(id) = self.tracking.location {
+                self.scan.flush_tracking_checkpoint(id);
+            }
+        }
+        self.tracking.stop();
+    }
+
+    fn sync_tracking(&mut self) {
+        let Some(id) = self.tracking.location else {
+            return;
+        };
+        if self.scan.get(id).is_none() || self.scan.is_running() {
+            self.stop_tracking();
+            return;
+        }
+        let was_running = self.tracking.running();
+        if let Some(record) = self.tracking.poll() {
+            let old = self
+                .scan
+                .get(id)
+                .and_then(|e| e.scan.completed())
+                .map(|c| Arc::clone(&c.result));
+            self.locations_view.preserve_live_selection();
+            match self.scan.accept_tracking(id, &record) {
+                Ok(true) if self.scan.selected_id() == Some(id) => {
+                    let explorer = match (&self.explorer, &old) {
+                        (Some(view), Some(old)) => view.rebase(old, &record.scan),
+                        _ => Explorer::new(&record.scan),
+                    };
+                    if let Some(old) = old {
+                        self.search.rebase(&old, &record.scan, explorer.folder());
+                    } else {
+                        self.search.invalidate();
+                    }
+                    self.explorer = Some(explorer);
+                    self.detail_target = None;
+                    self.detail_context = None;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.stop_tracking();
+                    self.input_error = Some(error.to_string());
+                    self.scan.tracking_failed(id);
+                }
+            }
+        }
+        if was_running && matches!(self.tracking.status, crate::tracking::Status::Failed(_)) {
+            self.locations_view.preserve_live_selection();
+            self.scan.tracking_failed(id);
+        }
+    }
+    fn start_tracking(&mut self, fresh: bool) {
+        let action = (|| {
+            let path = self
+                .target
+                .path()
+                .ok_or_else(|| std::io::Error::other("추적할 폴더를 선택하세요"))?
+                .to_owned();
+            let mut existing = None;
+            for entry in &self.scan.entries {
+                if crate::locations::contains_path(&entry.path, &path)?
+                    && crate::locations::contains_path(&path, &entry.path)?
+                {
+                    existing = Some(entry.id);
+                    break;
+                }
+            }
+            let id = match existing {
+                Some(id) => id,
+                None => self.scan.add(&path)?,
+            };
+            let resume = self
+                .scan
+                .get(id)
+                .and_then(|e| e.scan.completed())
+                .filter(|c| !fresh && c.tracking.is_some())
+                .map(|c| Arc::new(c.saved_result()));
+            let detailed = resume
+                .as_ref()
+                .map_or(self.scan.details_requested(), |r| r.scan.detailed);
+            self.tracking.start(id, path, detailed, resume)
+        })();
+        self.input_error = action.err().map(|e| e.to_string());
+    }
+    fn tracking_controls(&mut self, ui: &mut egui::Ui) {
+        if self.archive_record.is_some() {
+            return;
+        }
+        ui.separator();
+        ui.strong("실시간 갱신");
+        ui.add(
+            egui::Label::new(format!(
+                "추적 대상: {}",
+                (if self.tracking.running() {
+                    self.tracking
+                        .location
+                        .and_then(|id| self.scan.get(id))
+                        .map(|e| e.path.as_path())
+                } else {
+                    self.target.path()
+                })
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+            ))
+            .wrap(),
+        );
+        ui.small("로컬 NTFS 드라이브 또는 폴더 한 곳의 변경을 확인합니다.");
+        if self.tracking.running() {
+            ui.label(self.tracking.label());
+            if matches!(self.tracking.status, crate::tracking::Status::Starting)
+                || self.tracking.applying()
+            {
+                let progress = self.tracking.progress();
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.small(format!(
+                        "조회 파일 {}개 · 폴더 {}개",
+                        progress.files_scanned, progress.folders_scanned
+                    ));
+                });
+            }
+            if ui.button("실시간 갱신 중지").clicked() {
+                self.stop_tracking();
+            }
+        } else {
+            let resumable = self
+                .scan
+                .entries
+                .iter()
+                .find(|e| self.target.path() == Some(e.path.as_path()))
+                .and_then(|e| e.scan.completed())
+                .is_some_and(|c| c.tracking.is_some());
+            if ui
+                .add_enabled(
+                    !self.scan.is_running() && self.target.path().is_some(),
+                    egui::Button::new(if resumable {
+                        "갱신 다시 시작"
+                    } else {
+                        "실시간 갱신 시작"
+                    }),
+                )
+                .clicked()
+            {
+                self.start_tracking(false);
+            }
+            if resumable
+                && ui
+                    .add_enabled(!self.scan.is_running(), egui::Button::new("기준 다시 수집"))
+                    .clicked()
+            {
+                self.start_tracking(true);
+            }
+        }
+        if let crate::tracking::Status::Failed(error) = &self.tracking.status {
+            ui.colored_label(egui::Color32::YELLOW, "갱신 필요");
+            ui.add(egui::Label::new(error).wrap());
+        }
+        if let Some(checked) = self.tracking.checked {
+            ui.small(format!(
+                "마지막 확인 {}",
+                crate::local_date::display(Some(checked))
+            ));
+        }
+        ui.small("처음에는 기준 스캔을 수행하며 Windows 권한 승인이 필요합니다.");
+        ui.small("큰 폴더나 쓰기 중인 파일은 반영이 늦어질 수 있습니다.");
+        if self.index.saving_paused {
+            ui.small("저장 폴더가 추적 범위에 있어 중지·종료할 때 새 결과를 저장합니다.");
+        } else if !self.index.enabled || !self.index.writable {
+            ui.small("이 창의 새 결과와 재시작 기준점은 자동 저장되지 않습니다.");
+        }
+    }
     fn new() -> Self {
         Self {
             index: crate::index_job::IndexController::start_default(),
@@ -225,6 +399,14 @@ impl DiskWeaveApp {
         }
     }
     fn index_tick(&mut self) {
+        self.index.saving_paused = self.tracking.running()
+            && self
+                .tracking
+                .location
+                .and_then(|id| self.scan.get(id))
+                .is_some_and(|entry| {
+                    crate::locations::contains_path(&entry.path, &self.index.root).unwrap_or(true)
+                });
         if self.index.tick(&mut self.scan) {
             self.explorer = self.scan.completed().map(|c| Explorer::new(&c.result));
             self.search.invalidate();
@@ -294,6 +476,7 @@ impl DiskWeaveApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing.request();
+            self.stop_tracking();
             self.scan.cancel();
         }
         if self.closing.poll(&self.index, &self.scan) {
@@ -448,6 +631,7 @@ impl DiskWeaveApp {
         }
     }
     fn begin_scan(&mut self) {
+        self.stop_tracking();
         let Some(path) = self.target.path().map(PathBuf::from) else {
             self.input_error = Some("분석할 폴더를 선택하세요".into());
             return;
@@ -474,6 +658,8 @@ impl DiskWeaveApp {
         }
         if let Some(source) = self.source() {
             let explorer = source.analyze(item);
+            self.locations_view
+                .choose_scope(&mut self.search, SearchScope::Folder);
             self.search.reset();
             self.search.refresh(&source.scan, explorer.folder());
             self.search.focus_item(item);
@@ -637,6 +823,18 @@ impl DiskWeaveApp {
         self.map.poll();
     }
     fn status(&self) -> String {
+        if !self.scan.is_running()
+            && self.tracking.location == self.scan.selected_id()
+            && (self.tracking.running()
+                || self.tracking.checked.is_some()
+                || matches!(self.tracking.status, crate::tracking::Status::Failed(_)))
+        {
+            return format!(
+                "{} · 마지막 확인 {}",
+                self.tracking.label(),
+                crate::local_date::display(self.tracking.checked)
+            );
+        }
         if !self.scan.is_running() {
             if let Some(entry) = self
                 .scan
@@ -818,6 +1016,8 @@ impl DiskWeaveApp {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.menu_button("위치 관리", |ui| {
+                        ui.set_width((ui.ctx().content_rect().width() - 48.0).clamp(240.0, 400.0));
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         ui.spacing_mut().item_spacing.y = 6.0;
                         egui::ScrollArea::vertical()
                             .max_height(360.0)
@@ -834,6 +1034,7 @@ impl DiskWeaveApp {
                                         self.input_error = self.target.choose_folder(path).err();
                                     }
                                 }
+                                self.tracking_controls(ui);
                             });
                     });
                 },
@@ -868,7 +1069,11 @@ impl DiskWeaveApp {
             }
         });
         ui.add_space(7.0);
-        ui.small("폴더를 끌어다 놓은 뒤 ‘스캔 시작’을 누르세요.");
+        ui.small(if self.tracking.running() {
+            "스캔을 시작하면 실시간 갱신을 중지합니다."
+        } else {
+            "폴더를 끌어다 놓은 뒤 ‘스캔 시작’을 누르세요."
+        });
     }
     fn summary(&self, ui: &mut egui::Ui) {
         let sources = if self.locations_view.global_mode {
@@ -888,6 +1093,11 @@ impl DiskWeaveApp {
             .completed()
             .map_or(0.0, |c| c.elapsed.as_secs_f64());
         let has_results = !sources.is_empty();
+        let live =
+            self.tracking.running() && sources.iter().any(|s| Some(s.id) == self.tracking.location);
+        let stale = sources
+            .iter()
+            .any(|s| self.scan.get(s.id).is_some_and(|e| e.stale));
         let restored = sources
             .iter()
             .any(|s| self.scan.get(s.id).is_some_and(|e| e.restored));
@@ -970,6 +1180,10 @@ impl DiskWeaveApp {
                 let shown = if index == 3 && has_results {
                     if self.scan.is_running() {
                         "스캔 중"
+                    } else if live {
+                        "실시간 갱신 중"
+                    } else if stale {
+                        "갱신 필요"
                     } else if restored {
                         "저장된 결과"
                     } else {
@@ -1052,7 +1266,12 @@ impl DiskWeaveApp {
             if let Some(entry) = self.scan.get(id) {
                 self.target.choose_registered(entry.path.clone());
             }
-            self.locations_view.global_mode = false;
+            let scope = if self.search.whole_scan {
+                SearchScope::Location
+            } else {
+                SearchScope::Folder
+            };
+            self.locations_view.choose_scope(&mut self.search, scope);
             self.sync_scan();
         }
         let Some(source) = self.source() else {
@@ -1804,10 +2023,15 @@ impl eframe::App for DiskWeaveApp {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.archive_record.is_none() {
+            if self.scan.is_running() {
+                self.stop_tracking();
+                self.tracking.location = None;
+            }
             self.sync_scan();
+            self.sync_tracking();
             self.index_tick();
             self.index_windows(ui.ctx());
-            if self.index.busy() || self.scan.is_running() {
+            if self.index.busy() || self.scan.is_running() || self.tracking.running() {
                 ui.ctx().request_repaint_after(Duration::from_millis(30));
             }
         }
@@ -1971,6 +2195,7 @@ impl eframe::App for DiskWeaveApp {
                             crate::index_job::Status::Loading => "목록 불러오는 중…",
                             crate::index_job::Status::Saving => "목록 저장 중…",
                             crate::index_job::Status::Disabled => "자동 저장 꺼짐",
+                            _ if self.index.saving_paused => "추적 중 저장 대기",
                             _ => "목록 자동 저장",
                         };
                         let response = ui.small(label);
@@ -2076,7 +2301,8 @@ impl eframe::App for DiskWeaveApp {
                             .and_then(|id| self.scan.get(id))
                             .is_some_and(|e| e.stale)
                     {
-                        ui.colored_label(egui::Color32::YELLOW, "오래된 결과 · 전체 검색 제외");
+                        ui.add(egui::Label::new(egui::RichText::new("갱신 필요").small().color(egui::Color32::YELLOW)).truncate())
+                            .on_hover_text("갱신 실패로 이 위치는 전체 검색에서 제외됩니다. 이전 완료 결과는 유지됩니다.");
                     }
                     if !self.locations_view.global_mode {
                         if let crate::search_job::SearchStatus::Failed(error) =

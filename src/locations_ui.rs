@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub struct LocationsView {
+    live_selection: Option<(SearchInput, std::collections::HashSet<(u64, PathBuf)>)>,
     pub global_mode: bool,
     pub selection_changed: bool,
     drives: DriveList,
@@ -21,7 +22,26 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn preserve_live_selection(&mut self) {
+        if !self.global_mode || self.live_selection.is_some() {
+            return;
+        }
+        if let (Some(results), Some((_, input))) = (&self.job.results, &self.key) {
+            let paths = self
+                .selection
+                .rows()
+                .filter_map(|row| {
+                    results.hits.get(row).map(|hit| {
+                        let source = &results.sources[hit.source];
+                        (source.id, crate::search::item_path(&source.scan, hit.item))
+                    })
+                })
+                .collect();
+            self.live_selection = Some((input.clone(), paths));
+        }
+    }
     pub fn choose_scope(&mut self, view: &mut SearchView, scope: crate::search_view::SearchScope) {
+        self.live_selection = None;
         view.invalidate();
         self.selection.clear();
         self.selection_changed = true;
@@ -101,10 +121,31 @@ impl LocationsView {
         self.job.poll();
         let key = (locations.epoch, input.clone());
         if self.key.as_ref() != Some(&key) {
+            if self
+                .live_selection
+                .as_ref()
+                .is_some_and(|(previous, _)| previous != input)
+            {
+                self.live_selection = None;
+            }
             self.job.submit(locations.snapshots(), input.clone());
             self.key = Some(key);
             self.selection.clear();
             self.selection_changed = true;
+        }
+        if !self.job.running {
+            if let (Some((_, paths)), Some(results)) =
+                (self.live_selection.take(), &self.job.results)
+            {
+                for (row, hit) in results.hits.iter().enumerate() {
+                    let source = &results.sources[hit.source];
+                    if paths
+                        .contains(&(source.id, crate::search::item_path(&source.scan, hit.item)))
+                    {
+                        self.selection.click(row, true, false);
+                    }
+                }
+            }
         }
     }
     pub fn results(&self) -> Option<&crate::global_search::GlobalResults> {
@@ -121,6 +162,7 @@ impl LocationsView {
         }
         self.drives.poll();
         let mut path = None;
+        let previous_global = self.global_mode;
         ui.collapsing("드라이브·분석 위치", |ui| {
             if ui.button("드라이브 새로고침").clicked() {
                 self.drives.refresh();
@@ -204,7 +246,7 @@ impl LocationsView {
                         "스캔 중"
                     } else if entry.stale {
                         if entry.scan.completed().is_some() {
-                            "스캔 실패 · 이전 결과 표시"
+                            "갱신 필요 · 이전 결과 표시"
                         } else {
                             "스캔 실패 · 결과 없음"
                         }
@@ -238,6 +280,13 @@ impl LocationsView {
             }
         });
         ui.checkbox(&mut self.global_mode, "모든 분석 위치 검색");
+        if previous_global != self.global_mode {
+            self.live_selection = None;
+            self.selection.clear();
+            self.selection_changed = true;
+            self.key = None;
+            self.job.cancel();
+        }
         if self.drives.running() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
@@ -403,6 +452,54 @@ impl LocationsView {
 
 #[cfg(test)]
 mod search_ui_tests {
+    #[test]
+    fn live_global_refresh_keeps_the_selected_source_and_path() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-global-live-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("keep"), b"123").unwrap();
+        let mut locations = super::Locations::default();
+        locations.start(root.clone()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while locations.is_running() {
+            locations.poll();
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut view = super::LocationsView {
+            global_mode: true,
+            ..Default::default()
+        };
+        let input = crate::search::SearchInput::default();
+        while view.results().is_none() {
+            view.refresh(&locations, &input);
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        view.select_result(0, false, false);
+        view.preserve_live_selection();
+        std::fs::write(root.join("big"), b"123456789").unwrap();
+        locations.start(root.clone()).unwrap();
+        while locations.is_running() {
+            locations.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        view.refresh(&locations, &input);
+        while view.results().is_none() {
+            view.refresh(&locations, &input);
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (id, _, item) = view.selected_target().unwrap();
+        assert_eq!(
+            crate::search::item_path(
+                &locations.get(id).unwrap().scan.completed().unwrap().result,
+                item
+            ),
+            root.join("keep")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use crate::search_view::SearchScope;
     use std::time::{Duration, Instant};

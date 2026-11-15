@@ -1,10 +1,28 @@
 #![allow(dead_code)]
-#[path = "../../src/index_store.rs"]
-mod index_store;
+#[cfg(test)]
+#[path = "../../src/file_open.rs"]
+mod file_open;
+#[cfg(test)]
+#[path = "../../src/global_search.rs"]
+mod global_search;
+#[cfg(test)]
+#[path = "../../src/local_date.rs"]
+mod local_date;
+#[cfg(test)]
+#[path = "../../src/search.rs"]
+mod search;
+#[path = "../../src/usn.rs"]
+mod usn;
+mod usn_cases;
+#[path = "../../src/usn_native.rs"]
+mod usn_native;
+
 #[path = "../../src/engine.rs"]
 mod engine;
 #[path = "../../src/explorer.rs"]
 mod explorer;
+#[path = "../../src/index_store.rs"]
+mod index_store;
 #[path = "../../src/locations.rs"]
 mod locations;
 #[path = "../../src/metadata.rs"]
@@ -127,6 +145,9 @@ fn run() -> io::Result<()> {
     if std::fs::read_to_string(root.join(format!(".diskweave-validation-{token}")))? != token {
         return Err(io::Error::other("시험 볼륨 소유 표식 불일치"));
     }
+    if request["usn"].as_bool() == Some(true) {
+        return usn_cases::run(root, &target);
+    }
     let mut timings = Vec::new();
     for round in 0..3 {
         let t = Instant::now();
@@ -212,14 +233,36 @@ fn run() -> io::Result<()> {
         }
         timings.push(serde_json::json!({"round":round+1,"basic_ms":basic_ms,"ntfs_with_helper_ms":fast_ms,"direct_ntfs_ms":direct_ms,"enum_api_ms":timed.enumeration,"metadata_api_ms":timed.metadata,"link_api_ms":timed.links,"files":basic.files.len(),"folders":basic.folders.len(),"errors":basic.error_count,"reparse_excluded":basic.skipped_reparse_points}));
     }
-    let mut cancellation=Vec::new();
-    for stage in [engine::Stage::Enumerating,engine::Stage::Transferring] {
-        let cancel=std::cell::Cell::new(false);let fallback=std::cell::Cell::new(false);let started=Instant::now();
-        let result=engine::scan_with(root,engine::Method::Ntfs,true,||cancel.get(),|p|{
-            if p.stage==stage {cancel.set(true);}
-            if p.stage==engine::Stage::Fallback {fallback.set(true);}
-        },ntfs_helper::scan);
-        if !cancel.get() || fallback.get() || result.err().is_none_or(|e|e.kind()!=io::ErrorKind::Interrupted){return Err(io::Error::other("실제 도우미 취소·기본 재스캔 금지 검증 실패"));}
+    let mut cancellation = Vec::new();
+    for stage in [engine::Stage::Enumerating, engine::Stage::Transferring] {
+        let cancel = std::cell::Cell::new(false);
+        let fallback = std::cell::Cell::new(false);
+        let started = Instant::now();
+        let result = engine::scan_with(
+            root,
+            engine::Method::Ntfs,
+            true,
+            || cancel.get(),
+            |p| {
+                if p.stage == stage {
+                    cancel.set(true);
+                }
+                if p.stage == engine::Stage::Fallback {
+                    fallback.set(true);
+                }
+            },
+            ntfs_helper::scan,
+        );
+        if !cancel.get()
+            || fallback.get()
+            || result
+                .err()
+                .is_none_or(|e| e.kind() != io::ErrorKind::Interrupted)
+        {
+            return Err(io::Error::other(
+                "실제 도우미 취소·기본 재스캔 금지 검증 실패",
+            ));
+        }
         cancellation.push(serde_json::json!({"stage":format!("{stage:?}"),"total_ms":started.elapsed().as_secs_f64()*1000.0,"fallback":false}));
     }
     println!(
