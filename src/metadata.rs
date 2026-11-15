@@ -24,13 +24,13 @@ impl Default for ScanSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Missing {
     NotCollected,
     Unsupported,
     Failed,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Field<T> {
     Value(T),
     Missing(Missing),
@@ -48,7 +48,7 @@ impl<T: Copy> Field<T> {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub volume: u64,
     pub file: [u8; 16],
@@ -62,7 +62,7 @@ impl std::fmt::Display for Identity {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Extra {
     pub allocation: Field<u64>,
     pub identity: Field<Identity>,
@@ -72,7 +72,7 @@ pub struct Report {
     pub values: Extra,
     pub issue: Option<io::Error>,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Allocation {
     pub bytes: u64,
     pub known: u64,

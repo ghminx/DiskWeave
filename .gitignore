@@ -1,1 +1,6 @@
 /target/
+
+# 사용자 분석 결과의 실수 포함 방지
+*.dwsnap
+DiskWeave.csv
+DiskWeave.json

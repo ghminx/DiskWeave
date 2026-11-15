@@ -59,7 +59,7 @@ extern "system" {
     ) -> i32;
 }
 
-fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
+pub(crate) fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
     let mut children = child.components();
     for part in parent.components() {
         let Some(other) = children.next() else {
@@ -82,6 +82,24 @@ fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
 }
 
 impl Locations {
+    pub fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
+        let path = record.scan.folders[0].path.clone();
+        Self {
+            entries: vec![Location {
+                id: 1,
+                identity: path.clone(),
+                path,
+                scan: ScanController::from_saved(record),
+                stale: false,
+                enabled: true,
+                generation: 1,
+            }],
+            selected: Some(1),
+            next_id: 1,
+            epoch: 1,
+            ..Default::default()
+        }
+    }
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
     }

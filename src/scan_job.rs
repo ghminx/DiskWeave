@@ -3,12 +3,24 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub struct CompletedScan {
     pub path: PathBuf,
     pub result: Arc<ScanResult>,
     pub elapsed: Duration,
+    pub started: SystemTime,
+    pub finished: SystemTime,
+}
+impl CompletedScan {
+    pub fn saved_result(&self) -> crate::snapshot::SavedScan {
+        crate::snapshot::SavedScan::new(
+            Arc::clone(&self.result),
+            self.started,
+            self.finished,
+            self.elapsed,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -25,9 +37,10 @@ pub enum ScanStatus {
 struct ActiveScan {
     path: PathBuf,
     started: Instant,
+    clock: SystemTime,
     cancelled: Arc<AtomicBool>,
     progress: Arc<Mutex<ScanProgress>>,
-    receiver: Receiver<std::io::Result<ScanResult>>,
+    receiver: Receiver<(SystemTime, std::io::Result<ScanResult>)>,
 }
 
 #[derive(Default)]
@@ -39,6 +52,22 @@ pub struct ScanController {
 }
 
 impl ScanController {
+    pub(crate) fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
+        Self {
+            settings: crate::metadata::ScanSettings {
+                detailed: record.scan.detailed,
+            },
+            completed: Some(CompletedScan {
+                path: record.scan.folders[0].path.clone(),
+                result: Arc::clone(&record.scan),
+                elapsed: record.elapsed,
+                started: record.started,
+                finished: record.finished,
+            }),
+            status: ScanStatus::Completed,
+            ..Default::default()
+        }
+    }
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
     }
@@ -60,6 +89,7 @@ impl ScanController {
         let progress = Arc::new(Mutex::new(ScanProgress::default()));
         let worker_progress = Arc::clone(&progress);
         let detailed = self.details_requested();
+        let clock = SystemTime::now();
         std::thread::spawn(move || {
             let result = scanner::scan_with_options(
                 &worker_path,
@@ -67,12 +97,13 @@ impl ScanController {
                 || worker_cancelled.load(Ordering::Relaxed),
                 |update| *worker_progress.lock().unwrap() = update,
             );
-            let _ = sender.send(result);
+            let _ = sender.send((SystemTime::now(), result));
         });
         self.status = ScanStatus::Running;
         self.active = Some(ActiveScan {
             path,
             started: Instant::now(),
+            clock,
             cancelled,
             progress,
             receiver,
@@ -92,7 +123,7 @@ impl ScanController {
         let Some(active) = self.active.as_ref() else {
             return false;
         };
-        let result = match active.receiver.try_recv() {
+        let (finished, result) = match active.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
@@ -113,6 +144,8 @@ impl ScanController {
                     path: active.path,
                     result: Arc::new(result),
                     elapsed: active.started.elapsed(),
+                    started: active.clock,
+                    finished,
                 });
                 true
             }
@@ -151,6 +184,30 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn completed_scan_records_utc_interval_separately_from_save_time() {
+        let root = std::env::temp_dir().join(format!("diskweave-scan-time-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), [0; 3]).unwrap();
+        let before = SystemTime::now();
+        let mut job = ScanController::default();
+        job.start(root.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while job.is_running() && std::time::Instant::now() < deadline {
+            job.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let complete = job.completed().unwrap();
+        assert!(
+            complete.started >= before
+                && complete.finished >= complete.started
+                && complete.finished <= SystemTime::now()
+        );
+        let saved = complete.saved_result();
+        assert_eq!(saved.started, complete.started);
+        assert_eq!(saved.finished, complete.finished);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn metadata_setting_applies_to_next_scan_and_cancel_preserves_previous_mode() {
         let root =
