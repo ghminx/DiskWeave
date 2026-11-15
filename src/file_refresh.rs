@@ -82,6 +82,7 @@ impl Controller {
         }
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&self.cancel);
+        let parallelism = locations.parallelism();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             for (id, generation, path, detailed) in targets {
@@ -93,9 +94,10 @@ impl Controller {
                 let clock = Instant::now();
                 let result = (|| {
                     let root = crate::file_ops::Target::capture(&path)?;
-                    let scan = crate::scanner::scan_with_options(
+                    let scan = crate::scanner::scan_configured(
                         Path::new(&path),
                         detailed,
+                        parallelism,
                         stop,
                         |_| {},
                     )?;

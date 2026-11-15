@@ -98,6 +98,25 @@ pub fn scan_with(
     method: Method,
     detailed: bool,
     cancelled: impl Fn() -> bool,
+    progress: impl FnMut(Progress),
+    fast: impl FnMut(&Path, bool, &dyn Fn() -> bool, &mut dyn FnMut(Progress)) -> io::Result<ScanResult>,
+) -> io::Result<Outcome> {
+    scan_with_parallelism(
+        root,
+        method,
+        detailed,
+        Default::default(),
+        cancelled,
+        progress,
+        fast,
+    )
+}
+pub fn scan_with_parallelism(
+    root: &Path,
+    method: Method,
+    detailed: bool,
+    parallelism: crate::scanner::Parallelism,
+    cancelled: impl Fn() -> bool,
     mut progress: impl FnMut(Progress),
     mut fast: impl FnMut(
         &Path,
@@ -135,9 +154,10 @@ pub fn scan_with(
         stage,
         counts: Default::default(),
     });
-    let result = crate::scanner::scan_with_options(root, detailed, cancelled, |counts| {
-        progress(Progress { stage, counts })
-    })?;
+    let result =
+        crate::scanner::scan_configured(root, detailed, parallelism, cancelled, |counts| {
+            progress(Progress { stage, counts })
+        })?;
     Ok(Outcome {
         result,
         report: Report {

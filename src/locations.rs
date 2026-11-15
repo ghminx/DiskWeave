@@ -194,6 +194,7 @@ impl Locations {
         let path = record.scan.folders[0].path.clone();
         Self {
             settings: crate::metadata::ScanSettings {
+                parallelism: Default::default(),
                 detailed: record.scan.detailed,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
             },
@@ -317,6 +318,18 @@ impl Locations {
             .and_then(|id| self.get(id))
             .and_then(|e| e.scan.completed().map(|_| (e.id, e.generation)));
         Ok(before != after)
+    }
+    pub fn parallelism(&self) -> crate::scanner::Parallelism {
+        self.settings.parallelism
+    }
+    pub fn configure_parallelism(&mut self, value: crate::scanner::Parallelism) -> io::Result<()> {
+        if self.is_running() {
+            return Err(io::Error::other(
+                "스캔 중에는 동시 작업 수를 변경할 수 없습니다",
+            ));
+        }
+        self.settings.parallelism = value;
+        Ok(())
     }
     pub fn method(&self) -> crate::engine::Method {
         self.settings.method
@@ -482,6 +495,10 @@ impl Locations {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .expect("등록된 대기 위치");
+            entry
+                .scan
+                .configure_parallelism(self.settings.parallelism)
+                .expect("대기 위치의 동시 작업 설정");
             entry
                 .scan
                 .configure(self.settings.detailed)

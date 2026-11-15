@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#[global_allocator]
+static PROFILE_ALLOCATOR: scanner::profile::Allocator = scanner::profile::Allocator;
 mod file_cases;
 #[cfg(test)]
 #[path = "../../src/file_open.rs"]
@@ -13,6 +15,7 @@ mod global_search;
 mod local_date;
 #[path = "../../src/recycle.rs"]
 mod recycle;
+mod scan_profile;
 #[cfg(test)]
 #[path = "../../src/search.rs"]
 mod search;
@@ -123,6 +126,9 @@ fn main() {
 }
 fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--profile-scan") {
+        return scan_profile::run(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--ntfs-worker") {
         return ntfs_helper::worker(&args[1..]);
     }
@@ -289,4 +295,120 @@ fn run() -> io::Result<()> {
         serde_json::json!({"root":target.root,"volume":target.volume,"timings":timings,"cancellation":cancellation,"verified":"실제 새 NTFS VHD에서 전체 경로·논리/할당 합계 및 독립 manifest 대조"})
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod allocation_profile_tests {
+    #[test]
+    fn public_profile_counts_real_rust_allocations_without_treating_bytes_as_live_memory() {
+        use crate::scanner::profile::{self, Stage, Trace};
+        profile::enable_allocations();
+        let trace = Trace::default();
+        {
+            let _phase = profile::scope(Some(&trace), Stage::PathPrepare);
+            std::hint::black_box(Vec::<u8>::with_capacity(8192));
+        }
+        let report = trace.snapshot();
+        let row = &report.stages[Stage::PathPrepare as usize];
+        assert!(row.allocations.unwrap() >= 1);
+        assert!(row.allocated_bytes.unwrap() >= 8192);
+    }
+}
+#[cfg(test)]
+mod prepared_path_profile_tests {
+    #[test]
+    fn repeated_metadata_reads_reuse_path_storage_and_keep_dotted_names_correct() {
+        use crate::{
+            metadata::{self, StatSource},
+            scanner::profile::{self, Stage, Trace},
+        };
+        profile::enable_allocations();
+        let root = std::env::temp_dir().join(format!("diskweave-prepared-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let long = root.join("a".repeat(180));
+        let short = root.join("x");
+        std::fs::write(&long, b"12345").unwrap();
+        std::fs::write(&short, b"12").unwrap();
+        let dotted = root.join("nested/../x");
+        let source = metadata::Named::for_root(&root).unwrap();
+        if source.stat(&long).unwrap().is_some() {
+            let trace = Trace::default();
+            let expected = metadata::read(&short).values;
+            for _ in 0..16 {
+                let mut metrics = metadata::ReadMetrics {
+                    trace: Some(&trace),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    metadata::read_combined(&short, &source, Some(&mut metrics)).values,
+                    expected
+                );
+            }
+            let report = trace.snapshot();
+            assert!(
+                report.stages[Stage::PathPrepare as usize]
+                    .allocations
+                    .unwrap()
+                    <= 2,
+                "반복 경로 준비가 파일 수만큼 임시 버퍼를 할당하지 않음"
+            );
+            assert_eq!(
+                metadata::read_combined(&dotted, &source, None).values,
+                expected
+            );
+            let relative_source = metadata::Named::for_root(std::path::Path::new(".")).unwrap();
+            assert_eq!(
+                metadata::read_combined(&short, &relative_source, None).values,
+                expected
+            );
+            let other = metadata::Named::for_root(&root.join("nested")).unwrap();
+            assert_eq!(
+                metadata::read_combined(&short, &other, None).values,
+                expected
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+#[cfg(test)]
+mod result_transfer_profile_tests {
+    #[test]
+    fn scan_result_transfer_keeps_names_without_a_fresh_allocation_per_file() {
+        use crate::scanner::{
+            self,
+            directory::Strategy,
+            profile::{self, Stage},
+            Parallelism, ScanMetrics,
+        };
+        profile::enable_allocations();
+        let root = std::env::temp_dir().join(format!("diskweave-transfer-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..512 {
+            std::fs::write(root.join(format!("file-{index}")), b"12").unwrap();
+        }
+        let metrics = ScanMetrics::default();
+        let scan = scanner::scan_with_strategy(
+            &root,
+            false,
+            Parallelism::Four,
+            Strategy::Combined,
+            || false,
+            |_| {},
+            Some(&metrics),
+        )
+        .unwrap();
+        assert_eq!(
+            (scan.files.len(), scan.folders[0].logical_bytes),
+            (512, 1024)
+        );
+        assert!(scan.files.iter().any(|f| f.name == "file-511"));
+        assert!(
+            metrics.trace.snapshot().stages[Stage::Coordinator as usize]
+                .allocations
+                .unwrap()
+                <= 64,
+            "결과 보관 시 파일명마다 새 버퍼를 만들지 않음"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

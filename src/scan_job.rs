@@ -62,6 +62,7 @@ impl ScanController {
     pub(crate) fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
         Self {
             settings: crate::metadata::ScanSettings {
+                parallelism: Default::default(),
                 detailed: record.scan.detailed,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
             },
@@ -82,6 +83,19 @@ impl ScanController {
         if self.completed.is_none() {
             self.completed = Self::from_saved(record).completed;
         }
+    }
+    pub fn parallelism(&self) -> crate::scanner::Parallelism {
+        self.settings.parallelism
+    }
+    pub fn configure_parallelism(
+        &mut self,
+        value: crate::scanner::Parallelism,
+    ) -> Result<(), &'static str> {
+        if self.is_running() {
+            return Err("스캔 중에는 동시 작업 수를 변경할 수 없습니다");
+        }
+        self.settings.parallelism = value;
+        Ok(())
     }
     pub fn method(&self) -> crate::engine::Method {
         self.settings.method
@@ -120,16 +134,29 @@ impl ScanController {
         let worker_progress = Arc::clone(&progress);
         let detailed = self.details_requested();
         let method = self.method();
+        let parallelism = self.parallelism();
         let clock = SystemTime::now();
         std::thread::spawn(move || {
-            let result = crate::engine::scan_with(
-                &worker_path,
-                method,
-                detailed,
-                || worker_cancelled.load(Ordering::Relaxed),
-                |update| *worker_progress.lock().unwrap() = update,
-                crate::ntfs_helper::scan,
-            );
+            let result = if parallelism == crate::scanner::Parallelism::Auto {
+                crate::engine::scan_with(
+                    &worker_path,
+                    method,
+                    detailed,
+                    || worker_cancelled.load(Ordering::Relaxed),
+                    |update| *worker_progress.lock().unwrap() = update,
+                    crate::ntfs_helper::scan,
+                )
+            } else {
+                crate::engine::scan_with_parallelism(
+                    &worker_path,
+                    method,
+                    detailed,
+                    parallelism,
+                    || worker_cancelled.load(Ordering::Relaxed),
+                    |update| *worker_progress.lock().unwrap() = update,
+                    crate::ntfs_helper::scan,
+                )
+            };
             let _ = sender.send((SystemTime::now(), result));
         });
         self.status = ScanStatus::Running;
@@ -281,9 +308,16 @@ mod tests {
         fs::write(root.join("data"), [0; 3]).unwrap();
         let mut controller = ScanController::default();
         assert!(controller.details_requested());
+        controller
+            .configure_parallelism(crate::scanner::Parallelism::Two)
+            .unwrap();
         controller.configure(false).unwrap();
         controller.start(root.clone()).unwrap();
         assert!(controller.configure(true).is_err());
+        assert!(controller
+            .configure_parallelism(crate::scanner::Parallelism::Eight)
+            .is_err());
+        assert_eq!(controller.parallelism(), crate::scanner::Parallelism::Two);
         let deadline = Instant::now() + Duration::from_secs(5);
         while controller.is_running() && Instant::now() < deadline {
             controller.poll();

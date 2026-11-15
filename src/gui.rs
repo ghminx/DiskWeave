@@ -1029,7 +1029,16 @@ impl DiskWeaveApp {
                         self.scan.elapsed().unwrap_or_default().as_secs_f64()
                     )
                 } else {
-                    progress.label(self.scan.elapsed().unwrap_or_default().as_secs_f64())
+                    let text =
+                        progress.label(self.scan.elapsed().unwrap_or_default().as_secs_f64());
+                    if matches!(
+                        progress.stage,
+                        crate::engine::Stage::Basic | crate::engine::Stage::Fallback
+                    ) {
+                        format!("{text} · 동시 작업 {}개", self.scan.parallelism().workers())
+                    } else {
+                        text
+                    }
                 }
             }
             ScanStatus::Completed => self
@@ -1111,6 +1120,16 @@ impl DiskWeaveApp {
                     if response.on_hover_text("파일별 디스크 할당 크기와 파일 ID를 확인합니다. 끄면 추가 조회를 생략합니다. 변경 사항은 다음 스캔부터 적용됩니다.").changed() {
                         self.input_error = self.scan.configure(detailed).err().map(|e| e.to_string());
                     }
+                    ui.separator();
+                    let mut parallelism=self.scan.parallelism();
+                    ui.add_enabled_ui(!self.scan.is_running() && !self.file_blocked() && self.archive_record.is_none(),|ui|{
+                        egui::ComboBox::from_id_salt("scan_parallelism").selected_text(format!("동시 작업: {}",parallelism.label())).show_ui(ui,|ui|{
+                            for choice in [crate::scanner::Parallelism::Auto,crate::scanner::Parallelism::Sequential,crate::scanner::Parallelism::Two,crate::scanner::Parallelism::Four,crate::scanner::Parallelism::Eight] {ui.selectable_value(&mut parallelism,choice,choice.label());}
+                        });
+                    });
+                    if parallelism!=self.scan.parallelism(){self.input_error=self.scan.configure_parallelism(parallelism).err().map(|e|e.to_string());}
+                    ui.small("기본 스캔에 적용 · 자동 모드는 최대 8개");
+                    ui.small("작업 수가 많을수록 디스크 부하가 커질 수 있습니다.");
                     self.index_settings(ui);
                 });
                 if ui.available_width() < 700.0 && ui.button("상세 정보").clicked() {

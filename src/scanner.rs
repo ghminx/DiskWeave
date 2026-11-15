@@ -1,3 +1,9 @@
+#[path = "scanner/directory.rs"]
+pub mod directory;
+#[path = "scanner/parallel.rs"]
+mod parallel;
+#[path = "scanner/profile.rs"]
+pub mod profile;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -118,6 +124,149 @@ impl ScanResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Parallelism {
+    #[default]
+    Auto,
+    Sequential,
+    Two,
+    Four,
+    Eight,
+    #[allow(dead_code, reason = "제품 기본 상한 8개를 유지하는 개발용 비교")]
+    Twelve,
+    #[allow(dead_code, reason = "제품 기본 상한 8개를 유지하는 개발용 비교")]
+    Sixteen,
+}
+#[derive(Default)]
+pub struct ScanMetrics {
+    pub trace: profile::Trace,
+    pub enumeration_ns: std::sync::atomic::AtomicU64,
+    pub finish_ns: std::sync::atomic::AtomicU64,
+    pub read_ns: [std::sync::atomic::AtomicU64; 6],
+    pub read_calls: [std::sync::atomic::AtomicU64; 6],
+}
+/// 비교용 수집 경로를 고정한 스캔. 제품 설정과 원본 파일 변경 없이 실험 경로 대조.
+pub fn scan_with_strategy(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    strategy: directory::Strategy,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    metrics: Option<&ScanMetrics>,
+) -> io::Result<ScanResult> {
+    let trace = metrics.map(|m| &m.trace);
+    let _overall = profile::scope(trace, profile::Stage::Overall);
+    let _cpu = profile::cpu_scope(trace, false, profile::thread_cpu);
+    if strategy == directory::Strategy::Reference && metrics.is_none() {
+        return scan_parallel_with_probe(
+            root,
+            detailed,
+            parallelism,
+            cancelled,
+            progress,
+            crate::metadata::read,
+        );
+    }
+    let setup = profile::scope(trace, profile::Stage::RootSetup);
+    let named = if detailed
+        && matches!(
+            strategy,
+            directory::Strategy::Bulk | directory::Strategy::Combined
+        ) {
+        Some(crate::metadata::Named::for_root(root)?)
+    } else {
+        None
+    };
+    drop(setup);
+    let read = |path: &Path| {
+        let mut values = crate::metadata::ReadMetrics {
+            trace,
+            ..Default::default()
+        };
+        let measure = metrics.map(|_| &mut values);
+        let report = if let Some(named) = &named {
+            crate::metadata::read_combined(path, named, measure)
+        } else if metrics.is_none() {
+            crate::metadata::read(path)
+        } else {
+            crate::metadata::read_with_metrics(path, measure)
+        };
+        if let Some(metrics) = metrics {
+            use std::sync::atomic::Ordering;
+            for (a, b) in metrics.read_ns.iter().zip(values.nanoseconds) {
+                a.fetch_add(b, Ordering::Relaxed);
+            }
+            for (a, b) in metrics.read_calls.iter().zip(values.calls) {
+                a.fetch_add(b, Ordering::Relaxed);
+            }
+        }
+        report
+    };
+    parallel::scan_collected(
+        root,
+        detailed,
+        parallelism.workers(),
+        parallel::Collection { strategy, metrics },
+        cancelled,
+        progress,
+        &read,
+    )
+}
+impl Parallelism {
+    pub fn workers(self) -> usize {
+        match self {
+            Self::Sequential => 1,
+            Self::Two => 2,
+            Self::Four => 4,
+            Self::Eight => 8,
+            Self::Twelve => 12,
+            Self::Sixteen => 16,
+            Self::Auto => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "자동",
+            Self::Sequential => "순차",
+            Self::Two => "2개",
+            Self::Four => "4개",
+            Self::Eight => "8개",
+            Self::Twelve => "12개",
+            Self::Sixteen => "16개",
+        }
+    }
+}
+/// 제한된 작업 풀에서 폴더 열거와 상세 조회를 처리하고 완성된 결과만 반환.
+///
+/// Args:
+///     parallelism: 제품 최대 8개, 개발용 비교 최대 16개의 동시 작업 설정.
+///     cancelled: 조정 스레드에서 확인하는 취소 조건.
+///     on_progress: 묶음 단위로 전달하는 완료 파일/폴더 수.
+///     probe: 여러 작업 스레드에서 동시에 호출 가능한 OS 메타데이터 조회 경계.
+///
+/// Returns:
+///     모든 작업 스레드 정리 후 완료 결과 또는 취소/수집 오류.
+pub fn scan_parallel_with_probe(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(ScanProgress),
+    probe: impl Fn(&Path) -> crate::metadata::Report + Sync,
+) -> io::Result<ScanResult> {
+    if parallelism.workers() == 1 {
+        return scan_with_probe(root, detailed, cancelled, on_progress, probe);
+    }
+    parallel::scan(
+        root,
+        detailed,
+        parallelism.workers(),
+        cancelled,
+        on_progress,
+        &probe,
+    )
+}
 pub fn scan(root: &Path, cancelled: impl Fn() -> bool) -> io::Result<ScanResult> {
     scan_with_progress(root, cancelled, |_| {})
 }
@@ -135,12 +284,24 @@ pub fn scan_with_options(
     cancelled: impl Fn() -> bool,
     on_progress: impl FnMut(ScanProgress),
 ) -> io::Result<ScanResult> {
-    scan_with_probe(
+    scan_configured(root, detailed, Parallelism::Auto, cancelled, on_progress)
+}
+/// 제품 공통 기본 수집. 병렬도와 완료/취소 계약을 유지한 검증된 수집 경로 선택.
+pub fn scan_configured(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanResult> {
+    scan_with_strategy(
         root,
         detailed,
+        parallelism,
+        Default::default(),
         cancelled,
-        on_progress,
-        crate::metadata::read,
+        progress,
+        None,
     )
 }
 pub fn scan_with_probe(
@@ -150,36 +311,7 @@ pub fn scan_with_probe(
     mut on_progress: impl FnMut(ScanProgress),
     mut probe: impl FnMut(&Path) -> crate::metadata::Report,
 ) -> io::Result<ScanResult> {
-    let metadata = fs::symlink_metadata(root)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "분석 대상은 재분석 지점이 아닌 폴더여야 합니다",
-        ));
-    }
-
-    let mut result = ScanResult {
-        detailed,
-        metadata_error_count: 0,
-        metadata_issues: Vec::new(),
-        folders: vec![Folder {
-            allocation: Default::default(),
-            created: metadata.created().ok(),
-            attributes: metadata.file_attributes(),
-            path: root.to_path_buf(),
-            parent: None,
-            logical_bytes: 0,
-            file_count: 0,
-            folder_count: 0,
-            modified: metadata.modified().ok(),
-        }],
-        children: Vec::new(),
-        files: Vec::new(),
-        file_children: Vec::new(),
-        error_count: 0,
-        issues: Vec::new(),
-        skipped_reparse_points: 0,
-    };
+    let mut result = empty_result(root, detailed)?;
     let mut pending = vec![0];
     let mut progress = ScanProgress::default();
 
@@ -215,12 +347,27 @@ pub fn scan_with_probe(
                 }
             };
             let entry_path = entry.path();
-            let metadata = match fs::symlink_metadata(&entry_path) {
+            // Windows 열거 결과의 메타데이터 재사용. 링크를 따라가지 않으며 항목별 추가 시스템 호출 방지.
+            let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     result.record_error(entry_path, error);
                     continue;
                 }
+            };
+            // NTFS 디렉터리 엔트리의 시각은 하위 변경보다 늦게 갱신될 수 있어 폴더만 현재 값 재조회.
+            let metadata = if metadata.is_dir()
+                && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            {
+                match fs::symlink_metadata(&entry_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        result.record_error(entry_path, error);
+                        continue;
+                    }
+                }
+            } else {
+                metadata
             };
 
             // Junction과 심볼릭 링크 등의 대상 중복·순환 탐색 방지
@@ -292,6 +439,40 @@ pub fn scan_with_probe(
     Ok(result)
 }
 
+fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "분석 대상은 재분석 지점이 아닌 폴더여야 합니다",
+        ));
+    }
+
+    let result = ScanResult {
+        detailed,
+        metadata_error_count: 0,
+        metadata_issues: Vec::new(),
+        folders: vec![Folder {
+            allocation: Default::default(),
+            created: metadata.created().ok(),
+            attributes: metadata.file_attributes(),
+            path: root.to_path_buf(),
+            parent: None,
+            logical_bytes: 0,
+            file_count: 0,
+            folder_count: 0,
+            modified: metadata.modified().ok(),
+        }],
+        children: Vec::new(),
+        files: Vec::new(),
+        file_children: Vec::new(),
+        error_count: 0,
+        issues: Vec::new(),
+        skipped_reparse_points: 0,
+    };
+    Ok(result)
+}
+
 /// 기본·NTFS 수집 결과에 동일한 누적 집계와 정렬 기준 적용.
 pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
     for child_index in (1..result.folders.len()).rev() {
@@ -343,6 +524,260 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sixteen_workers_preserve_totals_and_finish_all_queries_before_cancellation_returns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = std::env::temp_dir().join(format!("diskweave-sixteen-{}", std::process::id()));
+        for group in 0..16 {
+            let dir = root.join(group.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            for file in 0..128 {
+                fs::write(dir.join(file.to_string()), b"12").unwrap();
+            }
+        }
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let visited = AtomicUsize::new(0);
+        let result = scan_parallel_with_probe(
+            &root,
+            true,
+            Parallelism::Sixteen,
+            || false,
+            |_| {},
+            |p| {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let report = crate::metadata::read(p);
+                active.fetch_sub(1, Ordering::SeqCst);
+                report
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                result.files.len(),
+                result.folders.len(),
+                result.folders[0].logical_bytes
+            ),
+            (2048, 17, 4096)
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!((2..=16).contains(&peak.load(Ordering::SeqCst)));
+        let cancelled = scan_parallel_with_probe(
+            &root,
+            true,
+            Parallelism::Sixteen,
+            || visited.load(Ordering::SeqCst) > 50,
+            |_| {},
+            |p| {
+                active.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let report = crate::metadata::read(p);
+                visited.fetch_add(1, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+                report
+            },
+        );
+        assert!(matches!(cancelled,Err(e) if e.kind()==io::ErrorKind::Interrupted));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn profiling_does_not_change_scan_fields_or_completed_worker_results() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-profile-fields-{}", std::process::id()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("file"), b"12345").unwrap();
+        fs::hard_link(root.join("file"), root.join("nested/alias")).unwrap();
+        let plain = scan_with_strategy(
+            &root,
+            true,
+            Parallelism::Four,
+            directory::Strategy::Combined,
+            || false,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        let metrics = ScanMetrics::default();
+        let profiled = scan_with_strategy(
+            &root,
+            true,
+            Parallelism::Four,
+            directory::Strategy::Combined,
+            || false,
+            |_| {},
+            Some(&metrics),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                profiled.files.len(),
+                profiled.folders[0].logical_bytes,
+                profiled.folders[0].allocation
+            ),
+            (2, 10, plain.folders[0].allocation)
+        );
+        for f in &plain.files {
+            let path = plain.folders[f.parent].path.join(&f.name);
+            let found = profiled
+                .files
+                .iter()
+                .find(|n| profiled.folders[n.parent].path.join(&n.name) == path)
+                .unwrap();
+            assert_eq!(
+                (found.extra, found.modified, found.created),
+                (f.extra, f.modified, f.created)
+            );
+        }
+        let report = metrics.trace.snapshot();
+        assert_eq!(report.stages[profile::Stage::Overall as usize].calls, 1);
+        assert!(report.stages[profile::Stage::MetadataTask as usize].calls > 0);
+        let cpu = report.worker_cpu.unwrap();
+        assert_eq!(cpu.measured_samples + cpu.missing_samples, 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn collected_scan_keeps_reference_totals_fields_and_parent_relations() {
+        let root = std::env::temp_dir().join(format!("diskweave-collected-{}", std::process::id()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("original"), b"12345").unwrap();
+        fs::hard_link(root.join("original"), root.join("nested/alias")).unwrap();
+        let old = scan_with_probe(&root, true, || false, |_| {}, crate::metadata::read).unwrap();
+        for strategy in [
+            directory::Strategy::LargeFetch,
+            directory::Strategy::Bulk,
+            directory::Strategy::Combined,
+        ] {
+            let new = scan_with_strategy(
+                &root,
+                true,
+                Parallelism::Four,
+                strategy,
+                || false,
+                |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    new.folders[0].logical_bytes,
+                    new.folders[0].file_count,
+                    new.folders[0].folder_count
+                ),
+                (10, 2, 1)
+            );
+            for f in &old.files {
+                let path = old.folders[f.parent].path.join(&f.name);
+                let actual = new
+                    .files
+                    .iter()
+                    .find(|n| new.folders[n.parent].path.join(&n.name) == path)
+                    .unwrap();
+                assert_eq!(
+                    (
+                        actual.extra,
+                        actual.created,
+                        actual.modified,
+                        actual.attributes
+                    ),
+                    (f.extra, f.created, f.modified, f.attributes)
+                );
+            }
+            assert_eq!(new.folders[0].allocation, old.folders[0].allocation);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn collected_modes_keep_long_paths_nonunicode_names_and_external_link_counts() {
+        use std::os::windows::ffi::OsStringExt;
+        let owned =
+            std::env::temp_dir().join(format!("diskweave-collected-paths-{}", std::process::id()));
+        let root = owned.join("scope");
+        let mut deep = root.clone();
+        for _ in 0..3 {
+            deep = deep.join("long".repeat(20));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
+        fs::write(root.join("data"), b"12345").unwrap();
+        fs::hard_link(root.join("data"), owned.join("outside-link")).unwrap();
+        let odd = std::ffi::OsString::from_wide(&[0xD800, 0x0061]);
+        fs::write(root.join(&odd), b"").unwrap();
+        fs::write(deep.join("file"), b"123").unwrap();
+        let reference =
+            scan_with_probe(&root, true, || false, |_| {}, crate::metadata::read).unwrap();
+        for workers in [
+            Parallelism::Sequential,
+            Parallelism::Two,
+            Parallelism::Four,
+            Parallelism::Eight,
+            Parallelism::Twelve,
+            Parallelism::Sixteen,
+        ] {
+            for strategy in [
+                directory::Strategy::LargeFetch,
+                directory::Strategy::Bulk,
+                directory::Strategy::Combined,
+            ] {
+                let result =
+                    scan_with_strategy(&root, true, workers, strategy, || false, |_| {}, None)
+                        .unwrap();
+                assert_eq!(
+                    (
+                        result.files.len(),
+                        result.folders.len(),
+                        result.folders[0].logical_bytes,
+                        result.error_count,
+                        result.metadata_error_count
+                    ),
+                    (3, 5, 8, 0, 0)
+                );
+                for f in &reference.files {
+                    let path = reference.folders[f.parent].path.join(&f.name);
+                    let actual = result
+                        .files
+                        .iter()
+                        .find(|f| result.folders[f.parent].path.join(&f.name) == path)
+                        .unwrap();
+                    assert_eq!(
+                        (
+                            actual.extra,
+                            actual.modified,
+                            actual.created,
+                            actual.attributes
+                        ),
+                        (f.extra, f.modified, f.created, f.attributes)
+                    );
+                }
+                assert_eq!(
+                    result
+                        .files
+                        .iter()
+                        .find(|f| f.name == "data")
+                        .unwrap()
+                        .extra
+                        .links
+                        .value(),
+                    Some(2)
+                );
+                for folder in &result.folders {
+                    let current = fs::metadata(&folder.path).unwrap();
+                    assert_eq!(folder.modified, current.modified().ok());
+                    assert_eq!(folder.created, current.created().ok());
+                }
+                assert_eq!(
+                    scan_with_strategy(&root, true, workers, strategy, || true, |_| {}, None)
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::Interrupted
+                );
+            }
+        }
+        fs::remove_dir_all(owned).unwrap();
+    }
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]
@@ -527,6 +962,309 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn worker_modes_preserve_hard_link_paths_and_missing_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-parallel-fields-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("original"), [0; 8193]).unwrap();
+        fs::hard_link(root.join("original"), root.join("alias")).unwrap();
+        fs::write(root.join("unavailable"), [1, 2, 3]).unwrap();
+        let mut progress = Vec::new();
+        for mode in [
+            Parallelism::Sequential,
+            Parallelism::Two,
+            Parallelism::Four,
+            Parallelism::Eight,
+            Parallelism::Twelve,
+            Parallelism::Sixteen,
+        ] {
+            progress.clear();
+            let result = scan_parallel_with_probe(
+                &root,
+                true,
+                mode,
+                || false,
+                |p| progress.push(p),
+                |path| {
+                    if path.file_name().unwrap() == "unavailable" {
+                        crate::metadata::Report::unavailable(io::Error::from_raw_os_error(50))
+                    } else {
+                        crate::metadata::read(path)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    result.files.len(),
+                    result.folders[0].logical_bytes,
+                    result.metadata_error_count
+                ),
+                (3, 16389, 1)
+            );
+            let original = result.files.iter().find(|f| f.name == "original").unwrap();
+            let alias = result.files.iter().find(|f| f.name == "alias").unwrap();
+            assert_eq!(original.extra.identity, alias.extra.identity);
+            assert_eq!(original.extra.links.value(), Some(2));
+            assert_eq!(result.folders[0].allocation.unsupported, 1);
+            assert_eq!(result.folders[0].allocation.known, 2);
+            assert_eq!(progress.last().unwrap().files_scanned, 3);
+            assert!(progress
+                .windows(2)
+                .all(|p| p[0].files_scanned <= p[1].files_scanned));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn parallel_cancel_and_panicked_probe_leave_no_active_work_or_partial_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-parallel-stop-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for file in 0..512 {
+            fs::write(root.join(format!("item-{file}")), b"data").unwrap();
+        }
+        let active = AtomicUsize::new(0);
+        let visited = AtomicUsize::new(0);
+        let cancelled = scan_parallel_with_probe(
+            &root,
+            true,
+            Parallelism::Four,
+            || visited.load(Ordering::SeqCst) > 16,
+            |_| {},
+            |path| {
+                active.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let report = crate::metadata::read(path);
+                visited.fetch_add(1, Ordering::SeqCst);
+                active.fetch_sub(1, Ordering::SeqCst);
+                report
+            },
+        );
+        assert!(matches!(cancelled,Err(e) if e.kind()==io::ErrorKind::Interrupted));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let before = visited.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(visited.load(Ordering::SeqCst), before);
+        let failed = scan_parallel_with_probe(
+            &root,
+            true,
+            Parallelism::Two,
+            || false,
+            |_| {},
+            |_| panic!("독립 시험용 조회 실패"),
+        );
+        assert!(failed.is_err());
+        let recovered = scan_parallel_with_probe(
+            &root,
+            false,
+            Parallelism::Eight,
+            || false,
+            |_| {},
+            crate::metadata::read,
+        )
+        .unwrap();
+        assert_eq!(
+            (recovered.files.len(), recovered.folders[0].logical_bytes),
+            (512, 2048)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn parallel_scan_preserves_results_and_limits_concurrent_metadata_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-parallel-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for group in 0..16 {
+            let folder = root.join(format!("group-{group}"));
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..16 {
+                fs::write(folder.join(format!("file-{file}")), [1, 2, 3]).unwrap();
+            }
+        }
+        let sequential =
+            scan_with_probe(&root, true, || false, |_| {}, crate::metadata::read).unwrap();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let parallel = scan_parallel_with_probe(
+            &root,
+            true,
+            Parallelism::Four,
+            || false,
+            |_| {},
+            |path| {
+                let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let report = crate::metadata::read(path);
+                active.fetch_sub(1, Ordering::SeqCst);
+                report
+            },
+        )
+        .unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!((2..=4).contains(&peak.load(Ordering::SeqCst)));
+        assert_eq!(
+            (
+                parallel.files.len(),
+                parallel.folders.len(),
+                parallel.folders[0].logical_bytes,
+                parallel.error_count,
+                parallel.metadata_error_count
+            ),
+            (256, 17, 768, 0, 0)
+        );
+        let rows = |scan: &ScanResult| {
+            scan.files
+                .iter()
+                .map(|f| {
+                    (
+                        scan.folders[f.parent].path.join(&f.name),
+                        (
+                            f.logical_bytes,
+                            f.created,
+                            f.modified,
+                            f.attributes,
+                            f.extra,
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let folders = |scan: &ScanResult| {
+            scan.folders
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        (
+                            f.parent.map(|id| scan.folders[id].path.clone()),
+                            f.logical_bytes,
+                            f.file_count,
+                            f.folder_count,
+                            f.created,
+                            f.modified,
+                            f.attributes,
+                            f.allocation,
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(folders(&parallel), folders(&sequential));
+        assert_eq!(rows(&parallel), rows(&sequential));
+        assert_eq!(
+            parallel.folders[0].allocation,
+            sequential.folders[0].allocation
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "독립 임시 1만 파일의 기본/상세 스캔 정확도·Release 시간 측정"]
+    fn benchmark_basic_and_detailed_scan_modes() {
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-scan-benchmark-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for group in 0..100 {
+            let folder = root.join(format!("group-{group}"));
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..100 {
+                fs::write(folder.join(format!("file-{file}.bin")), [1, 2, 3, 4]).unwrap();
+            }
+        }
+        for detailed in [false, true] {
+            let started = std::time::Instant::now();
+            let result = scan_with_options(&root, detailed, || false, |_| {}).unwrap();
+            assert_eq!(
+                (
+                    result.files.len(),
+                    result.folders.len(),
+                    result.folders[0].logical_bytes,
+                    result.error_count,
+                    result.metadata_error_count
+                ),
+                (10000, 101, 40000, 0, 0)
+            );
+            assert_eq!(
+                result.folders[0].allocation.not_collected,
+                if detailed { 0 } else { 10000 }
+            );
+            println!(
+                "detailed={detailed} files=10000 folders=101 bytes=40000 elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn folder_times_are_refreshed_after_directory_enumeration() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-folder-time-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("entry"), b"123").unwrap();
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_123);
+        // 열거 직후 콜백에서 시각을 바꾸는 순차 수집의 회귀 조건 유지.
+        let result = scan_parallel_with_probe(
+            &root,
+            false,
+            Parallelism::Sequential,
+            || false,
+            |progress| {
+                if progress.folders_scanned == 1 {
+                    let handle = fs::File::options()
+                        .access_mode(0x100)
+                        .share_mode(7)
+                        .custom_flags(0x02000000)
+                        .open(root.join("nested"))
+                        .unwrap();
+                    handle.set_modified(expected).unwrap();
+                }
+            },
+            crate::metadata::read,
+        )
+        .unwrap();
+        let folder = result.folder_index(Path::new("nested")).unwrap();
+        assert_eq!(result.folders[folder].modified, Some(expected));
+        assert_eq!(
+            (
+                result.folders[0].logical_bytes,
+                result.folders[0].file_count
+            ),
+            (3, 1)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn retains_file_metadata_without_changing_folder_totals() {
         let stamp = SystemTime::now()
