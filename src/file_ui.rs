@@ -39,6 +39,7 @@ pub struct Dialog {
 }
 #[derive(Default)]
 pub struct FileUi {
+    pub copy_requested: Option<Option<Vec<PathBuf>>>,
     pub importing: bool,
     pub drop_requested: Option<(Vec<PathBuf>, PathBuf)>,
     pub delete_confirmed: bool,
@@ -194,6 +195,21 @@ impl FileUi {
         count: usize,
         has_folder: bool,
     ) {
+        if ui
+            .add_enabled(
+                count > 0,
+                egui::Button::new(if count > 1 {
+                    "선택한 경로 복사"
+                } else {
+                    "경로 복사"
+                }),
+            )
+            .clicked()
+        {
+            self.copy_requested = Some(paths.clone());
+            ui.close();
+        }
+        ui.separator();
         for kind in [
             Kind::Folder,
             Kind::Rename,

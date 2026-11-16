@@ -300,7 +300,25 @@ pub fn scan_selected(
         stage,
         counts: Default::default(),
     });
-    let result = if let Some(preview) = preview.as_mut() {
+    let result = if detailed {
+        if let Some(observer) = preview.as_mut() {
+            crate::scanner::scan_unified(
+                root,
+                parallelism,
+                cancelled,
+                |counts| progress(Progress { stage, counts }),
+                Some(&mut |batch| observer(batch)),
+            )?
+        } else {
+            crate::scanner::scan_unified(
+                root,
+                parallelism,
+                cancelled,
+                |counts| progress(Progress { stage, counts }),
+                None,
+            )?
+        }
+    } else if let Some(preview) = preview.as_mut() {
         crate::scanner::scan_preview(
             root,
             detailed,

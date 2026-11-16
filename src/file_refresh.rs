@@ -94,13 +94,23 @@ impl Controller {
                 let clock = Instant::now();
                 let result = (|| {
                     let root = crate::file_ops::Target::capture(&path)?;
-                    let scan = crate::scanner::scan_configured(
-                        Path::new(&path),
-                        detailed,
-                        parallelism,
-                        stop,
-                        |_| {},
-                    )?;
+                    let scan = if detailed {
+                        crate::scanner::scan_unified(
+                            Path::new(&path),
+                            parallelism,
+                            stop,
+                            |_| {},
+                            None,
+                        )?
+                    } else {
+                        crate::scanner::scan_configured(
+                            Path::new(&path),
+                            false,
+                            parallelism,
+                            stop,
+                            |_| {},
+                        )?
+                    };
                     root.verify()?;
                     let mut record =
                         SavedScan::new(Arc::new(scan), started, SystemTime::now(), clock.elapsed());

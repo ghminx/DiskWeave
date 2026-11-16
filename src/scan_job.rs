@@ -66,7 +66,7 @@ impl ScanController {
         Self {
             settings: crate::metadata::ScanSettings {
                 parallelism: Default::default(),
-                detailed: record.scan.detailed,
+                detailed: true,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
                 fast_mode: record
                     .engine

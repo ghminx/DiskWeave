@@ -779,6 +779,20 @@ mod tests {
                 .value(),
             read(&sparse).values.allocation.value()
         );
+        let unified = crate::scanner::scan_unified(
+            &root,
+            crate::scanner::Parallelism::Two,
+            || false,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(unified.files.len(), 2);
+        for entry in &unified.files {
+            let expected = read(&root.join(&entry.name));
+            assert_eq!(entry.extra.allocation, expected.values.allocation);
+            assert_eq!(entry.extra.identity, expected.values.identity);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

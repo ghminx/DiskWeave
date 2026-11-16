@@ -147,6 +147,7 @@ pub struct ScanMetrics {
 }
 /// 열거 결과의 출처를 유지하는 제한된 상세 조회 요청.
 pub struct MetadataRequest {
+    pub attributes: u32,
     pub index: usize,
     pub path: PathBuf,
     #[allow(dead_code, reason = "개발용 파일 ID 조회 후보에 열거 출처 전달")]
@@ -352,10 +353,12 @@ pub fn scan_parallel_with_probe(
         &probe,
     )
 }
+#[allow(dead_code, reason = "이전 수집 기준·개발 도구·회귀 대조 유지")]
 pub fn scan(root: &Path, cancelled: impl Fn() -> bool) -> io::Result<ScanResult> {
     scan_with_progress(root, cancelled, |_| {})
 }
 
+#[allow(dead_code, reason = "이전 수집 기준·개발 도구·회귀 대조 유지")]
 pub fn scan_with_progress(
     root: &Path,
     cancelled: impl Fn() -> bool,
@@ -363,6 +366,7 @@ pub fn scan_with_progress(
 ) -> io::Result<ScanResult> {
     scan_with_options(root, false, cancelled, on_progress)
 }
+#[allow(dead_code, reason = "이전 수집 기준·개발 도구·회귀 대조 유지")]
 pub fn scan_with_options(
     root: &Path,
     detailed: bool,
@@ -1774,4 +1778,101 @@ pub fn scan_preview<'a>(
         &crate::metadata::read,
         Some(preview),
     )
+}
+
+/// 필수 정보의 일괄 열거 값을 재사용하고 부족한 항목만 OS 조회로 보완.
+pub fn scan_unified<'a>(
+    root: &Path,
+    parallelism: Parallelism,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    observer: Option<&'a mut preview::Observer<'a>>,
+) -> io::Result<ScanResult> {
+    let source = crate::metadata::Named::for_root(root)?;
+    struct Probe<'a>(&'a crate::metadata::Named);
+    impl MetadataProbe for Probe<'_> {
+        fn read_batch(
+            &self,
+            requests: &[MetadataRequest],
+            stop: &std::sync::atomic::AtomicBool,
+        ) -> Vec<crate::metadata::Report> {
+            requests
+                .iter()
+                .take_while(|_| !stop.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|r| {
+                    if r.attributes & 0xA00 == 0 {
+                        if let (Some(identity), Some(allocation)) = (r.identity, r.allocation) {
+                            return crate::metadata::Report {
+                                values: crate::metadata::Extra {
+                                    identity: crate::metadata::Field::Value(identity),
+                                    allocation: crate::metadata::Field::Value(allocation),
+                                    links: Default::default(),
+                                },
+                                issue: None,
+                            };
+                        }
+                    }
+                    let report = crate::metadata::read_combined(&r.path, self.0, None);
+                    if report.issue.is_none()
+                        && r.identity.is_some()
+                        && report.values.identity.value() != r.identity
+                    {
+                        return crate::metadata::Report::unavailable(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "보완 조회 중 파일이 다른 객체로 변경됐습니다",
+                        ));
+                    }
+                    report
+                })
+                .collect()
+        }
+    }
+    scan_metadata_observed(
+        root,
+        true,
+        parallelism,
+        cancelled,
+        progress,
+        &Probe(&source),
+        observer,
+    )
+}
+
+#[cfg(test)]
+mod unified_tests {
+    #[test]
+    fn unified_scan_keeps_required_allocation_identity_and_preview_without_requiring_link_counts() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("diskweave-unified-{}", std::process::id()));
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("known"), b"1234567890123").unwrap();
+        fs::hard_link(root.join("known"), root.join("child/alias")).unwrap();
+        let mut model = preview::Model::new(root.clone());
+        let result = scan_unified(
+            &root,
+            Parallelism::Two,
+            || false,
+            |_| {},
+            Some(&mut |batch| model.apply(batch)),
+        )
+        .unwrap();
+        assert_eq!(
+            (result.files.len(), result.folders[0].logical_bytes),
+            (2, 26)
+        );
+        let first = &result.files[0];
+        assert!(first.extra.identity.value().is_some());
+        assert!(first.extra.allocation.value().is_some());
+        assert_eq!(first.extra.identity, result.files[1].extra.identity);
+        assert!(first.created.is_some() && first.modified.is_some());
+        assert_eq!((model.folders[0].bytes, model.folders[0].files), (26, 2));
+        assert_eq!(
+            scan_unified(&root, Parallelism::Two, || true, |_| {}, None)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

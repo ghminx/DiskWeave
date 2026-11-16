@@ -233,6 +233,20 @@ impl AnalysisPanel {
                             action = Some((row, OpenAction::OpenFile));
                         }
                         response.context_menu(|ui| {
+                            if ui.button("경로 복사").clicked() {
+                                if let Err(error) = crate::path_copy::copy_with(
+                                    &[crate::search::item_path(&source.scan, hit.item)],
+                                    |text| {
+                                        ui.ctx().copy_text(text);
+                                        Ok(())
+                                    },
+                                ) {
+                                    ui.label(error.to_string());
+                                } else {
+                                    ui.close();
+                                }
+                            }
+
                             if ui.button("기본 앱으로 열기").clicked() {
                                 action = Some((row, OpenAction::OpenFile));
                                 ui.close();

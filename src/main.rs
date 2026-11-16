@@ -19,6 +19,7 @@ mod index_store;
 #[allow(dead_code, reason = "공유 수집기의 제품·개발 경로 대조 시험")]
 #[path = "../tools/ntfs-validation/layout.rs"]
 mod layout;
+mod link_details;
 mod list_selection;
 mod local_date;
 mod locations;
@@ -33,6 +34,7 @@ mod ntfs_native;
 #[allow(dead_code, reason = "MFT 직접·혼합 수집 비교 경계 공유")]
 mod ntfs_tree;
 mod output;
+mod path_copy;
 mod presentation;
 mod recycle;
 mod results_ui;
@@ -128,7 +130,13 @@ fn run() -> io::Result<()> {
     }
 
     let started = Instant::now();
-    let result = scanner::scan(&root, || CANCELLED.load(Ordering::Relaxed))?;
+    let result = scanner::scan_unified(
+        &root,
+        Default::default(),
+        || CANCELLED.load(Ordering::Relaxed),
+        |_| {},
+        None,
+    )?;
 
     let (mut pending, recurse, search_count) = match view {
         View::Tree => (vec![0], true, None),

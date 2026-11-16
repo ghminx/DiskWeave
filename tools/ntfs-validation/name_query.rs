@@ -642,6 +642,7 @@ mod tests {
         let probe = Relative::open(&root).unwrap();
         if probe.available() {
             let request = MetadataRequest {
+                attributes:0,
                 logical_bytes: 0,
                 allocation: None,
                 index: 0,
@@ -762,6 +763,7 @@ mod tests {
         let mut relative = Relative::open(&root).unwrap();
         let by_id = ById::open(&root).unwrap();
         let request = MetadataRequest {
+                attributes:0,
             logical_bytes: 0,
             allocation: None,
             index: 0,
@@ -804,6 +806,7 @@ mod tests {
         let relative = Relative::open(&root).unwrap();
         let by_id = ById::open(&root).unwrap();
         let request = MetadataRequest {
+                attributes:0,
             logical_bytes: 0,
             allocation: None,
             index: 0,
@@ -889,6 +892,7 @@ mod tests {
         std::fs::write(&path, b"new").unwrap();
         let reports = probe.read_batch(
             &[MetadataRequest {
+                attributes:0,
                 logical_bytes: 0,
                 allocation: None,
                 index: 0,

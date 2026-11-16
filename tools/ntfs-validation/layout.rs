@@ -414,6 +414,41 @@ pub fn differences(
     expected: &crate::scanner::ScanResult,
     observed: &crate::scanner::ScanResult,
 ) -> Vec<String> {
+    compare_fields(expected, observed, true)
+}
+/// 단일 스캔의 필수 필드는 동일하게 대조하고 선택적 링크 개수만 분리.
+pub fn required_differences(
+    expected: &crate::scanner::ScanResult,
+    observed: &crate::scanner::ScanResult,
+) -> Vec<String> {
+    let mut diff = compare_fields(expected, observed, false);
+    let links: std::collections::HashMap<_, _> = expected
+        .files
+        .iter()
+        .map(|f| {
+            (
+                expected.folders[f.parent].path.join(&f.name),
+                f.extra.links.value(),
+            )
+        })
+        .collect();
+    for f in &observed.files {
+        if let (Some(a), Some(Some(b))) = (
+            f.extra.links.value(),
+            links.get(&observed.folders[f.parent].path.join(&f.name)),
+        ) {
+            if a != *b {
+                diff.push("확인된 링크 개수 불일치".into());
+            }
+        }
+    }
+    diff
+}
+fn compare_fields(
+    expected: &crate::scanner::ScanResult,
+    observed: &crate::scanner::ScanResult,
+    include_links: bool,
+) -> Vec<String> {
     use crate::metadata::Extra;
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
     type Row = (
@@ -427,7 +462,7 @@ pub fn differences(
         u64,
         (u64, u64, u64, u64, u64),
     );
-    fn rows(scan: &crate::scanner::ScanResult) -> BTreeMap<PathBuf, Row> {
+    fn rows(scan: &crate::scanner::ScanResult, include_links: bool) -> BTreeMap<PathBuf, Row> {
         let mut rows = BTreeMap::new();
         for f in &scan.folders {
             let a = &f.allocation;
@@ -455,7 +490,14 @@ pub fn differences(
                     f.attributes,
                     f.created,
                     f.modified,
-                    f.extra,
+                    if include_links {
+                        f.extra
+                    } else {
+                        Extra {
+                            links: Default::default(),
+                            ..f.extra
+                        }
+                    },
                     0,
                     0,
                     (0, 0, 0, 0, 0),
@@ -464,8 +506,8 @@ pub fn differences(
         }
         rows
     }
-    let left = rows(expected);
-    let right = rows(observed);
+    let left = rows(expected, include_links);
+    let right = rows(observed, include_links);
     let keys: std::collections::BTreeSet<_> = left.keys().chain(right.keys()).collect();
     let mut diff = Vec::new();
     for key in keys {
@@ -513,6 +555,30 @@ pub fn differences(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_comparison_allows_unknown_link_count_but_not_wrong_identity() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-required-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("known"), b"123").unwrap();
+        let expected = crate::scanner::scan_with_options(&root, true, || false, |_| {}).unwrap();
+        let mut actual = crate::scanner::scan_unified(
+            &root,
+            crate::scanner::Parallelism::Two,
+            || false,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        actual.files[0].extra.links = Default::default();
+        assert!(super::required_differences(&expected, &actual).is_empty());
+        let mut id = actual.files[0].extra.identity.value().unwrap();
+        id.file[0] ^= 1;
+        actual.files[0].extra.identity = crate::metadata::Field::Value(id);
+        assert!(!super::required_differences(&expected, &actual).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     fn sample() -> Vec<u8> {

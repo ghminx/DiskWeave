@@ -458,6 +458,28 @@ impl LocationsView {
                             }
                         }
                         response.context_menu(|ui| {
+                            if ui.button("선택한 경로 복사").clicked() {
+                                let paths: Vec<_> = self
+                                    .selection
+                                    .rows()
+                                    .filter_map(|row| results.hits.get(row))
+                                    .map(|hit| {
+                                        crate::search::item_path(
+                                            &results.sources[hit.source].scan,
+                                            hit.item,
+                                        )
+                                    })
+                                    .collect();
+                                if let Err(error) = crate::path_copy::copy_with(&paths, |text| {
+                                    ui.ctx().copy_text(text);
+                                    Ok(())
+                                }) {
+                                    ui.label(error.to_string());
+                                } else {
+                                    ui.close();
+                                }
+                            }
+
                             for kind in [
                                 crate::file_ui::Kind::Rename,
                                 crate::file_ui::Kind::Copy,

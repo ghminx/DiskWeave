@@ -102,7 +102,7 @@ pub fn profile(args: &[std::ffi::OsString]) -> io::Result<()> {
     let report = done.engine.as_ref().ok_or_else(invalid)?;
     let differences = expected
         .as_ref()
-        .map(|r| crate::layout::differences(r, &done.result));
+        .map(|r| crate::layout::required_differences(r, &done.result));
     let count = differences.as_ref().map(Vec::len);
     println!(
         "{}",
@@ -148,8 +148,8 @@ pub fn validate(root: &Path) -> io::Result<()> {
                 || false,
                 |_| {},
             )?;
-            let first_changes = crate::layout::differences(&first, &expected);
-            let control_changes = crate::layout::differences(&expected, &control);
+            let first_changes = crate::layout::required_differences(&first, &expected);
+            let control_changes = crate::layout::required_differences(&expected, &control);
             eprintln!(
                 "기본 방식 자체 대조: 최초 변경 {} · 안정성 변경 {}",
                 first_changes.len(),
@@ -180,7 +180,7 @@ pub fn validate(root: &Path) -> io::Result<()> {
                     }),
                     ntfs_helper::scan_selected,
                 )?;
-                let differences = crate::layout::differences(&expected, &outcome.result);
+                let differences = crate::layout::required_differences(&expected, &outcome.result);
                 if !differences.is_empty() {
                     return Err(io::Error::other(format!(
                         "제품 MFT 필드 차이: {differences:?}"

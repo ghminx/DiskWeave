@@ -20,6 +20,7 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct DiskWeaveApp {
+    link_details: crate::link_details::Controller,
     startup: crate::startup::Controller,
     preview_view: crate::scanner::preview::View,
     preview_location: Option<u64>,
@@ -608,6 +609,44 @@ impl DiskWeaveApp {
     fn file_blocked(&self) -> bool {
         self.file_ui.blocked(&self.file_job) || self.file_refresh.busy()
     }
+    fn copy_selection_paths(&self) -> Vec<PathBuf> {
+        if self.locations_view.global_mode {
+            return self
+                .locations_view
+                .selected_targets()
+                .iter()
+                .filter_map(|(id, generation, item)| {
+                    self.scan
+                        .get(*id)
+                        .filter(|e| e.generation == *generation)
+                        .and_then(|e| e.scan.completed())
+                        .map(|c| crate::search::item_path(&c.result, *item))
+                })
+                .collect();
+        }
+        let Some(source) = self.source() else {
+            return vec![];
+        };
+        let mut paths: Vec<_> = self
+            .search
+            .job
+            .results()
+            .map(|r| {
+                self.search
+                    .selection
+                    .rows()
+                    .filter_map(|row| r.items.get(row).copied())
+                    .map(|item| crate::search::item_path(&source.scan, item))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            if let Some((_, _, item)) = self.selection_target() {
+                paths.push(crate::search::item_path(&source.scan, item));
+            }
+        }
+        paths
+    }
     fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
         let mut selected = if self.locations_view.global_mode {
             self.locations_view.selected_targets()
@@ -819,7 +858,7 @@ impl DiskWeaveApp {
                 .scan
                 .get(id)
                 .and_then(|e| e.scan.completed())
-                .filter(|c| !fresh && c.tracking.is_some())
+                .filter(|c| !fresh && c.tracking.is_some() && c.result.detailed)
                 .map(|c| Arc::new(c.saved_result()));
             let detailed = resume
                 .as_ref()
@@ -1538,14 +1577,7 @@ impl DiskWeaveApp {
                     });
                     ui.small("필요하면 Windows 권한 승인을 요청합니다.");
                     ui.separator();
-                    let mut detailed = self.scan.details_requested();
-                    let response = ui.add_enabled(
-                        !self.scan.is_running() && self.archive_record.is_none(),
-                        egui::Checkbox::new(&mut detailed, "디스크 할당 크기·파일 ID 확인"),
-                    );
-                    if response.on_hover_text("파일별 디스크 할당 크기와 파일 ID를 확인합니다. 끄면 추가 조회를 생략합니다. 변경 사항은 다음 스캔부터 적용됩니다.").changed() {
-                        self.input_error = self.scan.configure(detailed).err().map(|e| e.to_string());
-                    }
+                    ui.small("용량·디스크 할당 크기·파일 ID를 함께 확인합니다.");
                     ui.separator();
                     let mut parallelism=self.scan.parallelism();
                     ui.add_enabled_ui(!self.scan.is_running() && !self.file_blocked() && self.archive_record.is_none(),|ui|{
@@ -2670,7 +2702,30 @@ impl DiskWeaveApp {
             crate::ui_style::property(ui, "만든 날짜", &info.created);
             ui.small(format!("속성 {}", info.attributes));
             if let Item::File(file) = item {
-                crate::ui_style::property(ui, "Hard Link", &info.links);
+                let identity = scan.files[file].extra.identity.value();
+                self.link_details
+                    .select(identity.map(|identity| crate::link_details::Key {
+                        path: info.path.clone(),
+                        identity,
+                        source: id,
+                        generation,
+                    }));
+                self.link_details.poll();
+                let links = match &self.link_details.value {
+                    Some(Ok(n)) => n.to_string(),
+                    Some(Err(error)) => error.clone(),
+                    None => info.links.clone(),
+                };
+                crate::ui_style::property(ui, "같은 파일의 연결 개수", &links);
+                if self.archive_record.is_none() && identity.is_some() {
+                    if self.link_details.busy() {
+                        ui.spinner();
+                        ui.label("연결 개수 확인 중…");
+                        ui.ctx().request_repaint_after(Duration::from_millis(30));
+                    } else if ui.button("연결 개수 확인").clicked() {
+                        self.input_error = self.link_details.start().err().map(|e| e.to_string());
+                    }
+                }
                 ui.small(format!("파일 ID {}", info.identity));
                 if scan.files[file].extra.links.value().is_some_and(|n| n > 1) {
                     ui.small("같은 파일에 여러 이름이 있습니다. 경로별 합계에 중복될 수 있습니다");
@@ -2792,6 +2847,32 @@ impl eframe::App for DiskWeaveApp {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let key = self
+            .selection_target()
+            .and_then(|(source, generation, item)| {
+                let Item::File(file) = item else {
+                    return None;
+                };
+                let entry = self
+                    .scan
+                    .get(source)
+                    .filter(|e| e.generation == generation)?;
+                let scan = &entry.scan.completed()?.result;
+                Some(crate::link_details::Key {
+                    path: scan.folders[scan.files[file].parent]
+                        .path
+                        .join(&scan.files[file].name),
+                    identity: scan.files[file].extra.identity.value()?,
+                    source,
+                    generation,
+                })
+            });
+        self.link_details.select(key);
+        self.link_details.poll();
+        if self.link_details.busy() {
+            ui.ctx().request_repaint_after(Duration::from_millis(30));
+        }
+
         self.startup_tick(ui.ctx());
         if self.archive_record.is_none() {
             if self.scan.is_running() {
@@ -3186,6 +3267,15 @@ impl eframe::App for DiskWeaveApp {
         self.results.windows(ui.ctx(), &export_context);
         if self.results.export_open {
             self.results.export_context = Some(export_context);
+        }
+        if let Some(paths) = self.file_ui.copy_requested.take() {
+            let paths = paths.unwrap_or_else(|| self.copy_selection_paths());
+            self.input_error = crate::path_copy::copy_with(&paths, |text| {
+                ui.ctx().copy_text(text);
+                Ok(())
+            })
+            .err()
+            .map(|e| e.to_string());
         }
         if let Some((kind, paths)) = self.file_ui.requested.take() {
             self.begin_file_action(kind, paths);

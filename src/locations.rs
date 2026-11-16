@@ -195,7 +195,7 @@ impl Locations {
         Self {
             settings: crate::metadata::ScanSettings {
                 parallelism: Default::default(),
-                detailed: record.scan.detailed,
+                detailed: true,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
                 fast_mode: record
                     .engine
@@ -370,6 +370,7 @@ impl Locations {
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
     }
+    #[cfg(test)]
     pub fn configure(&mut self, detailed: bool) -> io::Result<()> {
         if self.is_running() {
             return Err(io::Error::new(
@@ -848,7 +849,8 @@ mod tests {
         });
         let view = Locations::from_saved(&record);
         assert_eq!(view.method(), crate::engine::Method::Ntfs);
-        assert!(!view.details_requested());
+        assert!(view.details_requested());
+        assert!(!view.completed().unwrap().result.detailed);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

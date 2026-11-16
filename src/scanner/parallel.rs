@@ -263,6 +263,7 @@ pub(super) fn scan_observed<'a>(
                                 .map(|index| {
                                     let f = &result.files[index];
                                     MetadataRequest {
+                                        attributes: f.attributes,
                                         index,
                                         path: result.folders[f.parent].path.join(&f.name),
                                         identity: f.extra.identity.value(),
