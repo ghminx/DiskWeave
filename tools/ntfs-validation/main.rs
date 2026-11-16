@@ -1,44 +1,19 @@
 #![allow(dead_code)]
-#[path = "../../src/ntfs_mft.rs"]
-mod ntfs_mft;
-#[path = "../../src/ntfs_tree.rs"]
-mod ntfs_tree;
-#[global_allocator]
-static PROFILE_ALLOCATOR: scanner::profile::Allocator = scanner::profile::Allocator;
+// USN 변경 추적·파일 관리의 독립 시험 볼륨 검증 전용 실행기.
+#[path = "../../src/engine.rs"]
+mod engine;
+#[path = "../../src/explorer.rs"]
+mod explorer;
 mod file_cases;
 #[cfg(test)]
 #[path = "../../src/file_open.rs"]
 mod file_open;
 #[path = "../../src/file_ops.rs"]
 mod file_ops;
-#[cfg(test)]
 #[path = "../../src/global_search.rs"]
 mod global_search;
-mod layout;
-#[cfg(test)]
 #[path = "../../src/local_date.rs"]
 mod local_date;
-mod mft;
-mod name_query;
-mod product;
-#[path = "../../src/recycle.rs"]
-mod recycle;
-mod scan_profile;
-#[cfg(test)]
-#[path = "../../src/search.rs"]
-mod search;
-#[path = "../../src/usn.rs"]
-mod usn;
-mod usn_cases;
-#[path = "../../src/usn_native.rs"]
-mod usn_native;
-
-#[path = "../../src/engine.rs"]
-mod engine;
-#[path = "../../src/explorer.rs"]
-mod explorer;
-#[path = "../../src/index_store.rs"]
-mod index_store;
 #[path = "../../src/locations.rs"]
 mod locations;
 #[path = "../../src/metadata.rs"]
@@ -51,48 +26,27 @@ mod ntfs_helper;
 mod ntfs_native;
 #[path = "../../src/output.rs"]
 mod output;
+#[path = "../../src/recycle.rs"]
+mod recycle;
 #[path = "../../src/scan_job.rs"]
 mod scan_job;
 #[path = "../../src/scanner.rs"]
 mod scanner;
+#[path = "../../src/search.rs"]
+mod search;
 #[path = "../../src/snapshot.rs"]
 mod snapshot;
-
+mod system_watch;
+#[path = "../../src/usn.rs"]
+mod usn;
+mod usn_cases;
+#[path = "../../src/usn_native.rs"]
+mod usn_native;
 use std::{
     collections::BTreeMap,
     io,
     path::{Path, PathBuf},
-    time::Instant,
 };
-struct Timed {
-    source: ntfs_native::Native,
-    enumeration: f64,
-    metadata: f64,
-    links: f64,
-}
-impl ntfs::Source for Timed {
-    fn root_id(&mut self) -> io::Result<ntfs::Id> {
-        self.source.root_id()
-    }
-    fn page(&mut self) -> io::Result<Option<Vec<u8>>> {
-        let t = Instant::now();
-        let r = self.source.page();
-        self.enumeration += t.elapsed().as_secs_f64() * 1000.0;
-        r
-    }
-    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<ntfs::Info> {
-        let t = Instant::now();
-        let r = self.source.inspect(path, detailed);
-        self.metadata += t.elapsed().as_secs_f64() * 1000.0;
-        r
-    }
-    fn links(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let t = Instant::now();
-        let r = self.source.links(path);
-        self.links += t.elapsed().as_secs_f64() * 1000.0;
-        r
-    }
-}
 type Row = (bool, u64, u64, u64, metadata::Allocation);
 fn rows(scan: &scanner::ScanResult) -> BTreeMap<PathBuf, Row> {
     let root = &scan.folders[0].path;
@@ -134,35 +88,14 @@ fn main() {
 }
 fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--profile-scan") {
-        return scan_profile::run(&args[1..]);
-    }
-    if args.first().is_some_and(|a| a == "--profile-product") {
-        return product::profile(&args[1..]);
-    }
-    if args.first().is_some_and(|a| a == "--profile-mft") {
-        return mft::profile(&args[1..], false, false);
-    }
-    if args.first().is_some_and(|a| a == "--check-mft") {
-        return mft::profile(&args[1..], true, false);
-    }
-    if args.first().is_some_and(|a| a == "--profile-mft-bulk") {
-        return mft::profile(&args[1..], false, true);
-    }
-    if args.first().is_some_and(|a| a == "--check-mft-bulk") {
-        return mft::profile(&args[1..], true, true);
-    }
-    if args.first().is_some_and(|a| a == "--profile-query") {
-        return name_query::profile(&args[1..], false);
-    }
-    if args.first().is_some_and(|a| a == "--check-query") {
-        return name_query::profile(&args[1..], true);
-    }
     if args.first().is_some_and(|a| a == "--ntfs-worker") {
         return ntfs_helper::worker(&args[1..]);
     }
+    if args.len() == 2 && args[0] == "--system-watch" {
+        return system_watch::run(Path::new(&args[1]));
+    }
     if args.len() != 1 {
-        return Err(io::Error::other("새 임시 VHD의 요청 파일이 필요함"));
+        return Err(io::Error::other("독립 시험 볼륨의 요청 파일이 필요합니다"));
     }
     let request: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(&args[0])?).map_err(output::json_error)?;
@@ -202,326 +135,7 @@ fn run() -> io::Result<()> {
     if request["usn"].as_bool() == Some(true) {
         return usn_cases::run(root, &target);
     }
-    if request["layout"].as_bool() == Some(true) {
-        return layout::validate(root, &target);
-    }
-    if request["product_mft"].as_bool() == Some(true) {
-        return product::validate(root);
-    }
-    if request["mft"].as_bool() == Some(true) {
-        return mft::validate(root, &target);
-    }
-    let mut timings = Vec::new();
-    ntfs_helper::prepare()?;
-    for round in 0..3 {
-        let t = Instant::now();
-        let basic = scanner::scan_with_options(root, true, || false, |_| {})?;
-        let basic_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let t = Instant::now();
-        let mut preview = scanner::preview::Model::new(root.to_owned());
-        let mut preview_batches = 0u64;
-        let outcome = engine::scan_observed(
-            root,
-            engine::Method::Ntfs,
-            true,
-            scanner::Parallelism::Auto,
-            || false,
-            |p| eprintln!("{:?}: {}", p.stage, p.counts.files_scanned),
-            Some(&mut |batch| {
-                preview_batches += 1;
-                preview.apply(batch)
-            }),
-            ntfs_helper::scan_preview,
-        )?;
-        let fast_ms = t.elapsed().as_secs_f64() * 1000.0;
-        if outcome.report.actual != engine::Method::Ntfs {
-            return Err(io::Error::other(format!(
-                "고속 경로 미실행: {}",
-                outcome.report.label()
-            )));
-        }
-        if preview_batches < 2 || preview.folders.len() != outcome.result.folders.len() {
-            return Err(io::Error::other("관리자 도우미의 중간 폴더 전달 누락"));
-        }
-        for folder in &preview.folders {
-            let final_folder = outcome
-                .result
-                .folders
-                .iter()
-                .find(|f| f.path == folder.path)
-                .ok_or_else(|| io::Error::other("미리보기 경로 누락"))?;
-            if (folder.bytes, folder.files, folder.folders)
-                != (
-                    final_folder.logical_bytes,
-                    final_folder.file_count,
-                    final_folder.folder_count,
-                )
-            {
-                return Err(io::Error::other("관리자 미리보기/완료 집계 불일치"));
-            }
-        }
-        let expected = rows(&basic);
-        let observed = rows(&outcome.result);
-        if expected != observed {
-            let differences: Vec<_> = expected
-                .keys()
-                .chain(observed.keys())
-                .filter(|k| expected.get(*k) != observed.get(*k))
-                .take(20)
-                .map(|k| {
-                    format!(
-                        "{}: {:?} / {:?}",
-                        k.display(),
-                        expected.get(k),
-                        observed.get(k)
-                    )
-                })
-                .collect();
-            return Err(io::Error::other(format!(
-                "기본/NTFS 결과 불일치: {}",
-                differences.join("\n")
-            )));
-        }
-        for (path, bytes) in [
-            ("Cases/regular.bin", 13),
-            ("Cases/sub/alias.bin", 13),
-            ("Cases/empty", 0),
-            ("Cases/sparse.bin", 4_194_304),
-        ] {
-            if observed
-                .get(Path::new(path))
-                .is_none_or(|row| row.0 || row.1 != bytes)
-            {
-                return Err(io::Error::other(format!("독립 manifest 불일치: {path}")));
-            }
-        }
-        let bulk = request["file_count"].as_u64().unwrap_or(0);
-        if observed
-            .iter()
-            .filter(|(p, row)| p.starts_with("Cases/bulk") && !row.0)
-            .count() as u64
-            != bulk
-        {
-            return Err(io::Error::other("독립 bulk manifest 개수 불일치"));
-        }
-        for i in 0..bulk {
-            let path = PathBuf::from(format!("Cases/bulk/entry-{i:05}.bin"));
-            if observed.get(&path).is_none_or(|r| r.0 || r.1 != 8) {
-                return Err(io::Error::other("독립 bulk manifest 크기 불일치"));
-            }
-        }
-        let mut timed = Timed {
-            source: ntfs_native::Native::open(&target)?,
-            enumeration: 0.0,
-            metadata: 0.0,
-            links: 0.0,
-        };
-        let t = Instant::now();
-        let direct = ntfs::collect(root, true, &mut timed, || false, |_| {})?;
-        let direct_ms = t.elapsed().as_secs_f64() * 1000.0;
-        if rows(&direct) != expected {
-            return Err(io::Error::other("직접 수집기와 기본 결과 불일치"));
-        }
-        timings.push(serde_json::json!({"round":round+1,"basic_ms":basic_ms,"ntfs_with_helper_ms":fast_ms,"direct_ntfs_ms":direct_ms,"enum_api_ms":timed.enumeration,"metadata_api_ms":timed.metadata,"link_api_ms":timed.links,"files":basic.files.len(),"folders":basic.folders.len(),"errors":basic.error_count,"reparse_excluded":basic.skipped_reparse_points}));
-    }
-    let mut cancellation = Vec::new();
-    for stage in [engine::Stage::Enumerating, engine::Stage::Transferring] {
-        let cancel = std::cell::Cell::new(false);
-        let fallback = std::cell::Cell::new(false);
-        let started = Instant::now();
-        let result = engine::scan_with(
-            root,
-            engine::Method::Ntfs,
-            true,
-            || cancel.get(),
-            |p| {
-                if p.stage == stage {
-                    cancel.set(true);
-                }
-                if p.stage == engine::Stage::Fallback {
-                    fallback.set(true);
-                }
-            },
-            ntfs_helper::scan,
-        );
-        if !cancel.get()
-            || fallback.get()
-            || result
-                .err()
-                .is_none_or(|e| e.kind() != io::ErrorKind::Interrupted)
-        {
-            return Err(io::Error::other(
-                "실제 도우미 취소·기본 재스캔 금지 검증 실패",
-            ));
-        }
-        cancellation.push(serde_json::json!({"stage":format!("{stage:?}"),"total_ms":started.elapsed().as_secs_f64()*1000.0,"fallback":false}));
-    }
-    println!(
-        "{}",
-        serde_json::json!({"root":target.root,"volume":target.volume,"timings":timings,"cancellation":cancellation,"verified":"실제 새 NTFS VHD에서 전체 경로·논리/할당 합계 및 독립 manifest 대조"})
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod allocation_profile_tests {
-    #[test]
-    fn public_profile_counts_real_rust_allocations_without_treating_bytes_as_live_memory() {
-        use crate::scanner::profile::{self, Stage, Trace};
-        profile::enable_allocations();
-        let trace = Trace::default();
-        {
-            let _phase = profile::scope(Some(&trace), Stage::PathPrepare);
-            std::hint::black_box(Vec::<u8>::with_capacity(8192));
-        }
-        let report = trace.snapshot();
-        let row = &report.stages[Stage::PathPrepare as usize];
-        assert!(row.allocations.unwrap() >= 1);
-        assert!(row.allocated_bytes.unwrap() >= 8192);
-    }
-}
-#[cfg(test)]
-mod prepared_path_profile_tests {
-    #[test]
-    fn repeated_metadata_reads_reuse_path_storage_and_keep_dotted_names_correct() {
-        use crate::{
-            metadata::{self, StatSource},
-            scanner::profile::{self, Stage, Trace},
-        };
-        profile::enable_allocations();
-        let root = std::env::temp_dir().join(format!("diskweave-prepared-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("nested")).unwrap();
-        let long = root.join("a".repeat(180));
-        let short = root.join("x");
-        std::fs::write(&long, b"12345").unwrap();
-        std::fs::write(&short, b"12").unwrap();
-        let dotted = root.join("nested/../x");
-        let source = metadata::Named::for_root(&root).unwrap();
-        if source.stat(&long).unwrap().is_some() {
-            let trace = Trace::default();
-            let expected = metadata::read(&short).values;
-            for _ in 0..16 {
-                let mut metrics = metadata::ReadMetrics {
-                    trace: Some(&trace),
-                    ..Default::default()
-                };
-                assert_eq!(
-                    metadata::read_combined(&short, &source, Some(&mut metrics)).values,
-                    expected
-                );
-            }
-            let report = trace.snapshot();
-            assert!(
-                report.stages[Stage::PathPrepare as usize]
-                    .allocations
-                    .unwrap()
-                    <= 2,
-                "반복 경로 준비가 파일 수만큼 임시 버퍼를 할당하지 않음"
-            );
-            assert_eq!(
-                metadata::read_combined(&dotted, &source, None).values,
-                expected
-            );
-            let relative_source = metadata::Named::for_root(std::path::Path::new(".")).unwrap();
-            assert_eq!(
-                metadata::read_combined(&short, &relative_source, None).values,
-                expected
-            );
-            let other = metadata::Named::for_root(&root.join("nested")).unwrap();
-            assert_eq!(
-                metadata::read_combined(&short, &other, None).values,
-                expected
-            );
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-#[cfg(test)]
-mod result_transfer_profile_tests {
-    #[test]
-    fn scan_result_transfer_keeps_names_without_a_fresh_allocation_per_file() {
-        use crate::scanner::{
-            self,
-            directory::Strategy,
-            profile::{self, Stage},
-            Parallelism, ScanMetrics,
-        };
-        profile::enable_allocations();
-        let root = std::env::temp_dir().join(format!("diskweave-transfer-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        for index in 0..512 {
-            std::fs::write(root.join(format!("file-{index}")), b"12").unwrap();
-        }
-        let metrics = ScanMetrics::default();
-        let scan = scanner::scan_with_strategy(
-            &root,
-            false,
-            Parallelism::Four,
-            Strategy::Combined,
-            || false,
-            |_| {},
-            Some(&metrics),
-        )
-        .unwrap();
-        assert_eq!(
-            (scan.files.len(), scan.folders[0].logical_bytes),
-            (512, 1024)
-        );
-        assert!(scan.files.iter().any(|f| f.name == "file-511"));
-        assert!(
-            metrics.trace.snapshot().stages[Stage::Coordinator as usize]
-                .allocations
-                .unwrap()
-                <= 64,
-            "결과 보관 시 파일명마다 새 버퍼를 만들지 않음"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod bulk_buffer_profile_tests {
-    #[test]
-    fn reusing_directory_pages_avoids_a_new_page_allocation_for_each_folder() {
-        use crate::scanner::{
-            directory::{self, Experiment, Strategy},
-            profile::{self, Stage, Trace},
-        };
-        profile::enable_allocations();
-        let root =
-            std::env::temp_dir().join(format!("diskweave-bulk-reuse-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let mut bytes = vec![];
-        for reuse_buffer in [false, true] {
-            let trace = Trace::default();
-            for _ in 0..16 {
-                directory::collect_folder(
-                    &root,
-                    Strategy::Experimental(Experiment {
-                        shared_handle: true,
-                        reuse_buffer,
-                        ..Default::default()
-                    }),
-                    &|| false,
-                    &mut |items| {
-                        assert!(items.is_empty());
-                        Ok(())
-                    },
-                    &mut |_| {},
-                    Some(&trace),
-                )
-                .unwrap();
-            }
-            bytes.push(
-                trace.snapshot().stages[Stage::Enumerate as usize]
-                    .allocated_bytes
-                    .unwrap(),
-            );
-        }
-        assert!(
-            bytes[0].saturating_sub(bytes[1]) >= 800_000,
-            "폴더마다 64 KiB 페이지를 다시 할당하지 않음"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
+    Err(io::Error::other(
+        "이 실행기는 USN·파일 관리 시험만 지원합니다",
+    ))
 }

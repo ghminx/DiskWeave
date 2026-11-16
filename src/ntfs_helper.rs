@@ -1,7 +1,9 @@
+#[cfg(test)]
+use crate::scanner::ScanResult;
 use crate::{
-    engine::{Collector, FastMode, Method, Outcome, Progress, Report, Stage},
-    ntfs_native::{self, Target},
-    scanner::{ScanProgress, ScanResult},
+    engine::{FastMode, Progress, Stage},
+    ntfs_native::Target,
+    scanner::ScanProgress,
     snapshot::SavedScan,
 };
 use serde::{Deserialize, Serialize};
@@ -31,48 +33,6 @@ fn invalid(message: &str) -> io::Error {
 struct Handle(HANDLE);
 // 독점 소유한 Windows 커널 핸들은 스레드 간 이전 가능. 복제 소유 없이 Mutex로 순차 사용.
 unsafe impl Send for Handle {}
-struct Prepared {
-    handle: Handle,
-    worker: Worker,
-}
-static PREPARED: std::sync::Mutex<Option<Prepared>> = std::sync::Mutex::new(None);
-static SKIP_PROMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn skip_permission_prompt() {
-    SKIP_PROMPT.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-pub fn shutdown() {
-    *PREPARED.lock().unwrap() = None;
-}
-pub fn prepare() -> io::Result<()> {
-    let (pipe, worker) = launch(&|| false)?;
-    *PREPARED.lock().unwrap() = Some(Prepared {
-        handle: pipe.handle,
-        worker,
-    });
-    SKIP_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
-}
-fn prepared<'a>(cancelled: &'a dyn Fn() -> bool) -> io::Result<(Pipe<'a>, Worker)> {
-    if let Some(prepared) = PREPARED.lock().unwrap().take() {
-        if unsafe { WaitForSingleObject(prepared.worker.0 .0, 0) } == WAIT_TIMEOUT {
-            return Ok((
-                Pipe {
-                    handle: prepared.handle,
-                    cancelled,
-                    idle: false,
-                },
-                prepared.worker,
-            ));
-        }
-    }
-    if SKIP_PROMPT.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "이번 실행에서는 고속 스캔 권한 요청을 건너뛰었습니다",
-        ));
-    }
-    launch(cancelled)
-}
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
@@ -101,9 +61,12 @@ impl Drop for Worker {
 }
 
 /// 부모·도우미 양쪽에서 대상과 계산 옵션이 일치한 완료 응답만 수락.
+#[cfg(test)]
 pub fn validate_response(record: SavedScan, root: &Path, detailed: bool) -> io::Result<ScanResult> {
     let correct = record.engine.as_ref().is_some_and(|r| {
-        r.requested == Method::Ntfs && r.actual == Method::Ntfs && r.fallback.is_none()
+        r.requested == crate::engine::Method::Ntfs
+            && r.actual == crate::engine::Method::Ntfs
+            && r.fallback.is_none()
     });
     if !correct
         || record.scan.detailed != detailed
@@ -379,6 +342,7 @@ fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
     )
 }
 #[allow(dead_code, reason = "기존 전송·도구 공개 API의 회귀 대조")]
+#[cfg(test)]
 pub fn read_completed(reader: impl Read, root: &Path, detailed: bool) -> io::Result<ScanResult> {
     validate_response(read_record_from(reader)?, root, detailed)
 }
@@ -394,6 +358,8 @@ impl Pipe<'_> {
 struct Advance {
     next: i64,
     pending: Vec<u64>,
+    confirmed_after: Option<SystemTime>,
+    finished: SystemTime,
 }
 /// 명시적으로 선택한 NTFS 위치의 변경 추적을 제한된 읽기 전용 도우미에서 실행.
 pub fn watch(
@@ -451,7 +417,7 @@ pub fn watch(
                 let mut next = SavedScan::new(
                     Arc::clone(&old.scan),
                     old.started,
-                    SystemTime::now(),
+                    value.finished,
                     old.elapsed,
                 );
                 next.tracking = old.tracking.clone();
@@ -461,6 +427,7 @@ pub fn watch(
                 }
                 state.next = value.next;
                 state.pending = value.pending;
+                state.confirmed_after = value.confirmed_after;
                 state.validate(&next.scan)?;
                 next
             }
@@ -539,17 +506,18 @@ fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
         loop {
             pipe.send(&Message::Checking)?;
             std::thread::sleep(Duration::from_secs(1));
-            let before = (index.checkpoint.next, index.checkpoint.pending.clone());
             let changed = index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
             if changed {
                 let record = index.snapshot(&|| false)?;
                 pipe.send(&Message::Ready)?;
                 pipe.record(&record)?;
-            } else if index.checkpoint.next != before.0 || index.checkpoint.pending != before.1 {
+            } else {
                 pipe.send(&Message::Cursor)?;
                 let value = Advance {
                     next: index.checkpoint.next,
                     pending: index.checkpoint.pending.clone(),
+                    confirmed_after: index.checkpoint.confirmed_after,
+                    finished: SystemTime::now(),
                 };
                 let mut writer = io::BufWriter::with_capacity(
                     65536,
@@ -768,198 +736,6 @@ pub(crate) fn launch(cancelled: &dyn Fn() -> bool) -> io::Result<(Pipe<'_>, Work
     Ok((pipe, worker))
 }
 #[allow(dead_code, reason = "기존 CLI·개발 도구의 비미리보기 호출 경계 유지")]
-pub fn scan(
-    root: &Path,
-    detailed: bool,
-    cancelled: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(Progress),
-) -> io::Result<ScanResult> {
-    scan_preview(root, detailed, cancelled, progress, &mut |_| Ok(()))
-}
-pub fn scan_preview(
-    root: &Path,
-    detailed: bool,
-    cancelled: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(Progress),
-    preview: &mut crate::scanner::preview::Observer<'_>,
-) -> io::Result<ScanResult> {
-    Ok(scan_selected(root, detailed, FastMode::Auto, cancelled, progress, preview)?.result)
-}
-pub fn scan_selected(
-    root: &Path,
-    detailed: bool,
-    mode: FastMode,
-    cancelled: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(Progress),
-    preview: &mut crate::scanner::preview::Observer<'_>,
-) -> io::Result<Outcome> {
-    let target = selected_target(root, mode)?;
-    progress(Progress {
-        stage: Stage::Authorizing,
-        counts: Default::default(),
-    });
-    let (mut pipe, worker) = prepared(cancelled)?;
-    pipe.send(&Request {
-        version: 1,
-        session: true,
-        target: target.clone(),
-        detailed,
-        watch: None,
-        resume: false,
-        fast_mode: mode,
-        scope: (mode == FastMode::Mft).then(|| root.as_os_str().encode_wide().collect()),
-    })?;
-    let mut validation = crate::scanner::preview::ValidatedStream::new(root.to_owned());
-    loop {
-        match pipe.receive()? {
-            Message::Preview(batch) => {
-                validation.accept(batch.clone())?;
-                preview(batch)?;
-            }
-            Message::Progress {
-                stage,
-                files,
-                folders,
-            } => progress(Progress {
-                stage,
-                counts: ScanProgress {
-                    files_scanned: files,
-                    folders_scanned: folders,
-                },
-            }),
-            Message::Failed(e) => return Err(io::Error::other(e)),
-            Message::Ready => break,
-            _ => return Err(invalid("일반 스캔에 잘못된 도우미 응답")),
-        }
-    }
-    progress(Progress {
-        stage: Stage::Transferring,
-        counts: Default::default(),
-    });
-    let result = validate_selected_response(read_record_from(&mut pipe)?, root, detailed, mode)?;
-    if selected_target(root, mode)?.volume != target.volume {
-        return Err(invalid("결과 수신 중 드라이브가 변경됐습니다"));
-    }
-    crate::output::check(&|| cancelled())?;
-    *PREPARED.lock().unwrap() = Some(Prepared {
-        handle: pipe.handle,
-        worker,
-    });
-    Ok(result)
-}
-pub fn selected_target(root: &Path, mode: FastMode) -> io::Result<Target> {
-    if mode == FastMode::Mft {
-        if !root.is_absolute()
-            || root
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            || root.as_os_str().encode_wide().any(|u| u == 0)
-        {
-            return Err(invalid("MFT 분석 폴더의 절대 경로가 올바르지 않습니다"));
-        }
-        crate::usn_native::target(root)
-    } else {
-        ntfs_native::target(root)
-    }
-}
-pub fn validate_selected_response(
-    record: SavedScan,
-    root: &Path,
-    detailed: bool,
-    mode: FastMode,
-) -> io::Result<Outcome> {
-    let report = record
-        .engine
-        .clone()
-        .ok_or_else(|| invalid("실제 수집 방식이 없는 응답"))?;
-    if report.fast_mode != Some(mode)
-        || match mode {
-            FastMode::Mft => report.collector != Some(Collector::MftMixed),
-            _ => report.collector != Some(Collector::NtfsRecords),
-        }
-    {
-        return Err(invalid("요청한 고속 수집 방식과 응답이 일치하지 않습니다"));
-    }
-    Ok(Outcome {
-        result: validate_response(record, root, detailed)?,
-        report,
-    })
-}
-fn send_preview(pipe: &mut Pipe<'_>, batch: crate::scanner::preview::Batch) -> io::Result<()> {
-    use crate::scanner::preview::{Batch, Update};
-    let mut packet = Batch {
-        reset: batch.reset,
-        updates: Vec::new(),
-    };
-    let mut estimated = 64;
-    for update in batch.updates {
-        let bytes = match &update {
-            Update::Folder { name, .. } => 128 + name.len() * 6,
-            Update::Values { .. } => 200,
-            Update::Finished => 32,
-        };
-        if !packet.updates.is_empty()
-            && (estimated + bytes > 192 * 1024 || packet.updates.len() == 128)
-        {
-            pipe.send(&Message::Preview(std::mem::take(&mut packet)))?;
-            estimated = 64;
-        }
-        estimated += bytes;
-        packet.updates.push(update);
-    }
-    if packet.reset || !packet.updates.is_empty() {
-        pipe.send(&Message::Preview(packet))?;
-    }
-    Ok(())
-}
-fn request_scope(request: &Request) -> io::Result<std::path::PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    let root = if request.fast_mode == FastMode::Mft {
-        let units = request
-            .scope
-            .as_ref()
-            .filter(|u| !u.is_empty() && u.len() <= 32768)
-            .ok_or_else(|| invalid("MFT 범위 누락"))?;
-        std::path::PathBuf::from(OsString::from_wide(units))
-    } else {
-        if request.scope.is_some() {
-            return Err(invalid("기존 NTFS 방식에 폴더 범위 지정 불가"));
-        }
-        std::path::PathBuf::from(&request.target.root)
-    };
-    let actual = selected_target(&root, request.fast_mode)?;
-    if actual.root != request.target.root || actual.volume != request.target.volume {
-        return Err(invalid("분석 범위와 볼륨이 일치하지 않습니다"));
-    }
-    Ok(root)
-}
-fn collect_mft<'a>(
-    root: &Path,
-    target: &Target,
-    detailed: bool,
-    cancelled: impl Fn() -> bool,
-    progress: &mut dyn FnMut(ScanProgress),
-    preview: &'a mut crate::scanner::preview::Observer<'a>,
-) -> io::Result<ScanResult> {
-    let mut source = crate::ntfs_mft::Native::open(target)?;
-    // 측정 후보는 별도 선택하며 제품 기본 정책은 검증 후에만 변경.
-    let catalog = crate::ntfs_mft::collect_tuned(
-        &mut source,
-        Default::default(),
-        &cancelled,
-        &mut *progress,
-    )?;
-    crate::output::check(&cancelled)?;
-    Ok(crate::ntfs_mft::scan_bulk_observed(
-        root,
-        &catalog,
-        detailed,
-        cancelled,
-        progress,
-        Some(preview),
-    )?
-    .0)
-}
 pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     if arguments.len() != 2 {
         return Err(invalid("도우미 인자가 올바르지 않습니다"));
@@ -997,150 +773,23 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     if unsafe { GetNamedPipeServerProcessId(pipe.handle.0, &mut server) } == 0 || server != parent {
         return Err(invalid("부모 프로세스가 일치하지 않습니다"));
     }
-    loop {
-        pipe.idle = true;
-        let request: Request = pipe.receive()?;
-        pipe.idle = false;
-        if request.version != 1 {
-            return Err(invalid("지원하지 않는 도우미 버전"));
-        }
-        if request.watch.is_some() {
-            if request.fast_mode != FastMode::Auto || request.scope.is_some() {
-                return Err(invalid("변경 추적 요청에 잘못된 수집 옵션"));
-            }
-            return watch_worker(&mut pipe, &request);
-        }
-        let scope = request_scope(&request)?;
-        let root = scope.as_path();
-        let begin = SystemTime::now();
-        let clock = Instant::now();
-        let disconnected = std::cell::Cell::new(false);
-        let mut last = Instant::now() - Duration::from_secs(1);
-        let mut last_stage = Stage::Authorizing;
-        let shared = std::cell::RefCell::new(&mut pipe);
-        let mut update = |counts: ScanProgress| {
-            let stage = if counts.folders_scanned == 0 {
-                Stage::Enumerating
-            } else {
-                Stage::Metadata
-            };
-            if last_stage != stage || last.elapsed() >= Duration::from_millis(100) {
-                last_stage = stage;
-                if shared
-                    .borrow_mut()
-                    .send(&Message::Progress {
-                        stage,
-                        files: counts.files_scanned,
-                        folders: counts.folders_scanned,
-                    })
-                    .is_err()
-                {
-                    disconnected.set(true);
-                }
-                last = Instant::now();
-            }
-        };
-        let mut observer = |batch| {
-            let result = send_preview(&mut shared.borrow_mut(), batch);
-            if result.is_err() {
-                disconnected.set(true);
-            }
-            result
-        };
-        let result = if request.fast_mode == FastMode::Mft {
-            collect_mft(
-                root,
-                &request.target,
-                request.detailed,
-                || disconnected.get(),
-                &mut update,
-                &mut observer,
-            )
-        } else {
-            ntfs_native::Native::open(&request.target).and_then(|mut source| {
-                crate::ntfs::collect_with_preview(
-                    root,
-                    request.detailed,
-                    &mut source,
-                    || disconnected.get(),
-                    &mut update,
-                    &mut observer,
-                )
-            })
-        };
-        match result {
-            Ok(result) => {
-                let mut record =
-                    SavedScan::new(Arc::new(result), begin, SystemTime::now(), clock.elapsed());
-                record.engine = Some(Report {
-                    requested: Method::Ntfs,
-                    actual: Method::Ntfs,
-                    fallback: None,
-                    fast_mode: Some(request.fast_mode),
-                    collector: Some(if request.fast_mode == FastMode::Mft {
-                        Collector::MftMixed
-                    } else {
-                        Collector::NtfsRecords
-                    }),
-                });
-                pipe.send(&Message::Ready)?;
-                if request.session {
-                    pipe.record(&record)?;
-                } else {
-                    let mut writer = io::BufWriter::with_capacity(256 * 1024, &mut pipe);
-                    crate::snapshot::write_to(&record, &mut writer, || disconnected.get())?;
-                    writer.flush()?;
-                }
-            }
-            Err(e) => pipe.send(&Message::Failed(e.to_string()))?,
-        }
-        if !request.session {
-            break;
-        }
+    pipe.idle = true;
+    let request: Request = pipe.receive()?;
+    pipe.idle = false;
+    if request.version != 1 {
+        return Err(invalid("지원하지 않는 도우미 버전"));
     }
-    Ok(())
+    if request.watch.is_none() || request.fast_mode != FastMode::Auto || request.scope.is_some() {
+        return Err(invalid("이 도우미는 실시간 갱신만 지원합니다"));
+    }
+    watch_worker(&mut pipe, &request)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn selected_response_requires_exact_mode_collector_scope_and_metadata_option() {
-        let root = std::env::temp_dir().join(format!(
-            "diskweave-selected-response-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let make = || {
-            let now = SystemTime::now();
-            let mut record = SavedScan::new(
-                Arc::new(crate::scanner::scan(&root, || false).unwrap()),
-                now,
-                now,
-                Duration::ZERO,
-            );
-            record.engine = Some(Report {
-                requested: Method::Ntfs,
-                actual: Method::Ntfs,
-                fast_mode: Some(FastMode::Mft),
-                collector: Some(Collector::MftMixed),
-                ..Default::default()
-            });
-            record
-        };
-        assert!(validate_selected_response(make(), &root, false, FastMode::Mft).is_ok());
-        assert!(validate_selected_response(make(), &root, false, FastMode::Legacy).is_err());
-        assert!(validate_selected_response(make(), &root, true, FastMode::Mft).is_err());
-        assert!(
-            validate_selected_response(make(), &root.join("other"), false, FastMode::Mft).is_err()
-        );
-        let mut wrong = make();
-        wrong.engine.as_mut().unwrap().collector = Some(Collector::NtfsRecords);
-        assert!(validate_selected_response(wrong, &root, false, FastMode::Mft).is_err());
-        assert!(selected_target(&root, FastMode::Auto).is_err());
-        assert!(selected_target(&root, FastMode::Mft).is_ok());
-        std::fs::remove_dir_all(root).unwrap();
-    }
+    use crate::engine::Report;
+
     #[test]
     fn persistent_response_stops_at_its_frame_without_waiting_for_process_exit() {
         let root =
@@ -1155,8 +804,8 @@ mod tests {
             Duration::ZERO,
         );
         record.engine = Some(Report {
-            requested: Method::Ntfs,
-            actual: Method::Ntfs,
+            requested: crate::engine::Method::Ntfs,
+            actual: crate::engine::Method::Ntfs,
             fallback: None,
             ..Default::default()
         });

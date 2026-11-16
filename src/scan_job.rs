@@ -55,7 +55,7 @@ struct ActiveScan {
 #[derive(Default)]
 pub struct ScanController {
     preview: Option<crate::scanner::preview::Model>,
-    settings: crate::metadata::ScanSettings,
+    parallelism: crate::scanner::Parallelism,
     active: Option<ActiveScan>,
     completed: Option<CompletedScan>,
     status: ScanStatus,
@@ -64,16 +64,6 @@ pub struct ScanController {
 impl ScanController {
     pub(crate) fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
         Self {
-            settings: crate::metadata::ScanSettings {
-                parallelism: Default::default(),
-                detailed: true,
-                method: record.engine.as_ref().map_or_default(|r| r.requested),
-                fast_mode: record
-                    .engine
-                    .as_ref()
-                    .and_then(|r| r.fast_mode)
-                    .unwrap_or_default(),
-            },
             completed: Some(CompletedScan {
                 tracking: record.tracking.clone(),
                 engine: record.engine.clone(),
@@ -87,14 +77,10 @@ impl ScanController {
             ..Default::default()
         }
     }
-    pub(crate) fn seed_saved(&mut self, record: &crate::snapshot::SavedScan) {
-        if self.completed.is_none() {
-            self.completed = Self::from_saved(record).completed;
-        }
-    }
+
     #[cfg(test)]
     pub fn parallelism(&self) -> crate::scanner::Parallelism {
-        self.settings.parallelism
+        self.parallelism
     }
     pub fn configure_parallelism(
         &mut self,
@@ -103,49 +89,13 @@ impl ScanController {
         if self.is_running() {
             return Err("스캔 중에는 동시 작업 수를 변경할 수 없습니다");
         }
-        self.settings.parallelism = value;
-        Ok(())
-    }
-    #[cfg(test)]
-    pub fn method(&self) -> crate::engine::Method {
-        self.settings.method
-    }
-    #[cfg(test)]
-    pub fn fast_mode(&self) -> crate::engine::FastMode {
-        self.settings.fast_mode
-    }
-    pub fn configure_fast_mode(
-        &mut self,
-        mode: crate::engine::FastMode,
-    ) -> Result<(), &'static str> {
-        if self.is_running() {
-            return Err("스캔 중에는 고속 수집 방식을 변경할 수 없습니다");
-        }
-        self.settings.fast_mode = mode;
-        Ok(())
-    }
-    pub fn configure_method(&mut self, method: crate::engine::Method) -> Result<(), &'static str> {
-        if self.is_running() {
-            return Err("스캔 중에는 방식을 변경할 수 없습니다");
-        }
-        self.settings.method = method;
+        self.parallelism = value;
         Ok(())
     }
     pub fn stage(&self) -> Option<crate::engine::Stage> {
         self.active
             .as_ref()
             .map(|a| a.progress.lock().unwrap().stage)
-    }
-    #[cfg(test)]
-    pub fn details_requested(&self) -> bool {
-        self.settings.detailed
-    }
-    pub fn configure(&mut self, detailed: bool) -> Result<(), &'static str> {
-        if self.is_running() {
-            return Err("스캔 중에는 수집 방식을 변경할 수 없습니다");
-        }
-        self.settings.detailed = detailed;
-        Ok(())
     }
     pub fn start(&mut self, path: PathBuf) -> Result<(), &'static str> {
         if self.active.is_some() {
@@ -159,16 +109,15 @@ impl ScanController {
         let worker_progress = Arc::clone(&progress);
         let preview_mail = crate::scanner::preview::Mailbox::default();
         let worker_preview = preview_mail.clone();
-        let settings = self.settings;
+        let parallelism = self.parallelism;
         let clock = SystemTime::now();
         std::thread::spawn(move || {
             let result = crate::engine::scan_selected(
                 &worker_path,
-                &settings,
+                parallelism,
                 || worker_cancelled.load(Ordering::Relaxed),
                 |update| *worker_progress.lock().unwrap() = update,
                 Some(&mut |batch| worker_preview.publish(batch)),
-                crate::ntfs_helper::scan_selected,
             );
             let _ = sender.send((SystemTime::now(), result));
         });
@@ -293,15 +242,12 @@ mod tests {
     use super::*;
     use std::fs;
     #[test]
-    fn selected_engine_is_frozen_while_running_and_saved_with_fallback_reason() {
+    fn general_scan_preserves_the_previous_result_after_cancellation() {
         let root =
             std::env::temp_dir().join(format!("diskweave-method-job-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let mut job = ScanController::default();
-        assert_eq!(job.method(), crate::engine::Method::Basic);
-        job.configure_method(crate::engine::Method::Ntfs).unwrap();
         job.start(root.clone()).unwrap();
-        assert!(job.configure_method(crate::engine::Method::Basic).is_err());
         while job.is_running() {
             job.poll();
             std::thread::yield_now();
@@ -311,7 +257,7 @@ mod tests {
             completed.engine.as_ref().unwrap().actual,
             crate::engine::Method::Basic
         );
-        assert!(completed.saved_result().engine.unwrap().fallback.is_some());
+        assert!(completed.saved_result().engine.unwrap().fallback.is_none());
         job.start(root.clone()).unwrap();
         job.cancel();
         while job.is_running() {
@@ -348,26 +294,16 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn metadata_setting_applies_to_next_scan_and_cancel_preserves_previous_mode() {
+    fn parallelism_stays_fixed_and_cancellation_preserves_the_unified_result() {
         let root =
             std::env::temp_dir().join(format!("diskweave-scan-settings-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("data"), [0; 3]).unwrap();
         let mut controller = ScanController::default();
-        assert!(controller.details_requested());
         controller
             .configure_parallelism(crate::scanner::Parallelism::Two)
             .unwrap();
-        controller.configure(false).unwrap();
-        controller
-            .configure_fast_mode(crate::engine::FastMode::Mft)
-            .unwrap();
         controller.start(root.clone()).unwrap();
-        assert!(controller
-            .configure_fast_mode(crate::engine::FastMode::Legacy)
-            .is_err());
-        assert_eq!(controller.fast_mode(), crate::engine::FastMode::Mft);
-        assert!(controller.configure(true).is_err());
         assert!(controller
             .configure_parallelism(crate::scanner::Parallelism::Eight)
             .is_err());
@@ -377,23 +313,21 @@ mod tests {
             controller.poll();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!controller.completed().unwrap().result.detailed);
+        assert!(controller.completed().unwrap().result.detailed);
         assert_eq!(
             controller.completed().unwrap().result.folders[0]
                 .allocation
-                .not_collected,
+                .known,
             1
         );
-        controller.configure(true).unwrap();
         controller.start(root.clone()).unwrap();
         controller.cancel();
         while controller.is_running() && Instant::now() < deadline {
             controller.poll();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(controller.details_requested());
         assert!(matches!(controller.status(), ScanStatus::Cancelled));
-        assert!(!controller.completed().unwrap().result.detailed);
+        assert!(controller.completed().unwrap().result.detailed);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,18 +1,9 @@
 use crate::explorer::Item;
 use crate::global_search::Hit;
 use crate::locations::Snapshot;
-use crate::metadata::{Allocation, Extra};
-use serde::Serialize;
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::SystemTime;
 
-#[derive(Clone)]
-pub struct ExportSource {
-    pub source: Snapshot,
-    pub started: Option<SystemTime>,
-    pub finished: Option<SystemTime>,
-}
 #[derive(Clone)]
 pub enum ExportScope {
     Folder { source: usize, folder: usize },
@@ -20,49 +11,8 @@ pub enum ExportScope {
     Matches(Vec<Hit>),
     All,
 }
-impl ExportScope {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Folder { .. } => "현재 폴더와 하위 항목",
-            Self::Location(_) => "현재 분석 대상 전체",
-            Self::Matches(_) => "현재 검색 결과",
-            Self::All => "모든 분석 위치",
-        }
-    }
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Csv,
-    Json,
-}
-#[derive(Serialize)]
-struct SourceInfo {
-    root: String,
-    root_utf16: Vec<u16>,
-    started: Option<crate::snapshot::Time>,
-    finished: Option<crate::snapshot::Time>,
-    traversal_errors: u64,
-    metadata_errors: u64,
-    skipped_reparse_points: u64,
-}
-#[derive(Serialize)]
-struct Row {
-    source: usize,
-    name: String,
-    path: String,
-    path_utf16: Vec<u16>,
-    kind: &'static str,
-    logical_bytes: u64,
-    allocation: Allocation,
-    extra: Option<Extra>,
-    created: Option<crate::snapshot::Time>,
-    modified: Option<crate::snapshot::Time>,
-    attributes: u32,
-    files: Option<u64>,
-    folders: Option<u64>,
-}
 fn rows(
-    sources: &[ExportSource],
+    sources: &[Snapshot],
     scope: &ExportScope,
     cancelled: &impl Fn() -> bool,
 ) -> io::Result<Vec<Hit>> {
@@ -75,8 +25,8 @@ fn rows(
                 io::Error::new(io::ErrorKind::InvalidInput, "내보낼 분석 위치가 없습니다")
             })?;
             let valid = match hit.item {
-                Item::Folder(id) => id < source.source.scan.folders.len(),
-                Item::File(id) => id < source.source.scan.files.len(),
+                Item::Folder(id) => id < source.scan.folders.len(),
+                Item::File(id) => id < source.scan.files.len(),
             };
             if !valid {
                 return Err(io::Error::new(
@@ -106,13 +56,13 @@ fn rows(
             ExportScope::All => 0,
             _ => continue,
         };
-        if folder >= s.source.scan.folders.len() {
+        if folder >= s.scan.folders.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "내보낼 폴더가 없습니다",
             ));
         }
-        let scan = &s.source.scan;
+        let scan = &s.scan;
         let mut pending = vec![folder];
         while let Some(id) = pending.pop() {
             crate::output::check(cancelled)?;
@@ -135,59 +85,6 @@ fn rows(
     }
     Ok(hits)
 }
-fn row(sources: &[ExportSource], hit: Hit) -> io::Result<Row> {
-    let scan = &sources[hit.source].source.scan;
-    let path = crate::search::item_path(scan, hit.item);
-    let (created, modified, attributes, allocation, extra, files, folders) = match hit.item {
-        Item::File(id) => {
-            let f = &scan.files[id];
-            let mut a = Allocation::default();
-            a.add(f.extra.allocation)?;
-            (
-                f.created,
-                f.modified,
-                f.attributes,
-                a,
-                Some(f.extra),
-                None,
-                None,
-            )
-        }
-        Item::Folder(id) => {
-            let f = &scan.folders[id];
-            (
-                f.created,
-                f.modified,
-                f.attributes,
-                f.allocation,
-                None,
-                Some(f.file_count),
-                Some(f.folder_count),
-            )
-        }
-    };
-    Ok(Row {
-        source: hit.source,
-        name: crate::search::item_name(scan, hit.item)
-            .to_string_lossy()
-            .into_owned(),
-        path: path.display().to_string(),
-        path_utf16: crate::snapshot::wide(path.as_os_str()),
-        kind: if matches!(hit.item, Item::File(_)) {
-            "file"
-        } else {
-            "folder"
-        },
-        logical_bytes: crate::search::item_bytes(scan, hit.item),
-        allocation,
-        extra,
-        created: created.map(Into::into),
-        modified: modified.map(Into::into),
-        attributes,
-        files,
-        folders,
-    })
-}
 fn text(writer: &mut dyn Write, value: &str) -> io::Result<()> {
     let guarded = matches!(
         value.trim_start().chars().next(),
@@ -201,114 +98,80 @@ fn text(writer: &mut dyn Write, value: &str) -> io::Result<()> {
     )
 }
 pub fn write(
-    sources: &[ExportSource],
+    sources: &[Snapshot],
     scope: &ExportScope,
-    format: Format,
     path: &Path,
     overwrite: bool,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
     for s in sources {
-        crate::output::protect(path, &s.source.scan, &cancelled)?;
+        crate::output::protect(path, &s.scan, &cancelled)?;
     }
     let hits = rows(sources, scope, &cancelled)?;
     crate::output::write(path, overwrite, &cancelled, |writer| {
-        if format == Format::Json {
-            writer.write_all(b"{\"format\":\"DiskWeave export\",\"version\":1,\"rows_are_not_additive\":true,\"scope\":")?;
-            serde_json::to_writer(&mut *writer, scope.label())
-                .map_err(crate::output::json_error)?;
-            writer.write_all(b",\"exported\":")?;
-            serde_json::to_writer(
-                &mut *writer,
-                &crate::snapshot::Time::from(SystemTime::now()),
-            )
-            .map_err(crate::output::json_error)?;
-            writer.write_all(b",\"sources\":[")?;
-            for (i, s) in sources.iter().enumerate() {
-                crate::output::check(&cancelled)?;
-                if i > 0 {
-                    writer.write_all(b",")?;
-                }
-                let scan = &s.source.scan;
-                let root = &scan.folders[0].path;
-                serde_json::to_writer(
-                    &mut *writer,
-                    &SourceInfo {
-                        root: root.display().to_string(),
-                        root_utf16: crate::snapshot::wide(root.as_os_str()),
-                        started: s.started.map(Into::into),
-                        finished: s.finished.map(Into::into),
-                        traversal_errors: scan.error_count,
-                        metadata_errors: scan.metadata_error_count,
-                        skipped_reparse_points: scan.skipped_reparse_points,
-                    },
+        writer.write_all(
+            "\u{feff}이름,전체 경로,종류,크기(Byte),할당 크기(Byte),수정 날짜\r\n".as_bytes(),
+        )?;
+        for hit in hits {
+            crate::output::check(&cancelled)?;
+            let scan = &sources[hit.source].scan;
+            let path = crate::search::item_path(scan, hit.item);
+            let invalid_text = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "텍스트로 정확히 표현할 수 없는 경로가 있습니다. CSV 저장을 중단했습니다",
                 )
-                .map_err(crate::output::json_error)?;
-            }
-            writer.write_all(b"],\"rows\":[")?;
-            for (i, &hit) in hits.iter().enumerate() {
-                crate::output::check(&cancelled)?;
+            };
+            let name = crate::search::item_name(scan, hit.item);
+            let name = name.to_str().ok_or_else(invalid_text)?;
+            let path = path.to_str().ok_or_else(invalid_text)?;
+            let allocated = match hit.item {
+                Item::File(id) => scan.files[id].extra.allocation.value(),
+                Item::Folder(id) => {
+                    let a = scan.folders[id].allocation;
+                    (scan.folders[id].access == crate::scanner::FolderAccess::Complete
+                        && (id != 0 || scan.error_count == 0)
+                        && a.missing() == 0)
+                        .then_some(a.bytes)
+                }
+            };
+            let access = match hit.item {
+                Item::Folder(id) => scan.folders[id].access,
+                Item::File(_) => crate::scanner::FolderAccess::Complete,
+            };
+            let size = if access.unreadable() {
+                String::new()
+            } else {
+                crate::search::item_bytes(scan, hit.item).to_string()
+            };
+            let allocated = allocated.map(|n| n.to_string()).unwrap_or_default();
+            let modified = crate::search::item_modified(scan, hit.item)
+                .map(|t| crate::local_date::display(Some(t)))
+                .unwrap_or_default();
+            let values = [
+                name,
+                path,
+                if matches!(hit.item, Item::File(_)) {
+                    "파일"
+                } else {
+                    match access {
+                        crate::scanner::FolderAccess::Denied => "폴더 · 접근 불가",
+                        crate::scanner::FolderAccess::Unavailable => "폴더 · 조회 실패",
+                        crate::scanner::FolderAccess::Partial => "폴더 · 일부 누락",
+                        _ => "폴더",
+                    }
+                },
+                &size,
+                &allocated,
+                &modified,
+            ];
+            for (i, value) in values.iter().enumerate() {
                 if i > 0 {
                     writer.write_all(b",")?;
                 }
-                serde_json::to_writer(&mut *writer, &row(sources, hit)?)
-                    .map_err(crate::output::json_error)?;
+                text(writer, value)?;
             }
-            writer.write_all(b"]}")?;
-        } else {
-            writer.write_all(b"\xef\xbb\xbfname,path,source_root,kind,logical_bytes,allocated_known_bytes,allocation_missing,created,modified,attributes,files,folders,path_utf16,scan_started,scan_finished,traversal_errors,metadata_errors,scope,file_id,hard_links\r\n")?;
-            for hit in hits {
-                crate::output::check(&cancelled)?;
-                let r = row(sources, hit)?;
-                let source = &sources[hit.source];
-                let scan = &source.source.scan;
-                let values = [
-                    r.name,
-                    r.path,
-                    scan.folders[0].path.display().to_string(),
-                    r.kind.into(),
-                    r.logical_bytes.to_string(),
-                    r.allocation.bytes.to_string(),
-                    format!(
-                        "not_collected:{};unsupported:{};failed:{}",
-                        r.allocation.not_collected, r.allocation.unsupported, r.allocation.failed
-                    ),
-                    crate::local_date::display(match hit.item {
-                        Item::File(id) => scan.files[id].created,
-                        Item::Folder(id) => scan.folders[id].created,
-                    }),
-                    crate::local_date::display(crate::search::item_modified(scan, hit.item)),
-                    r.attributes.to_string(),
-                    r.files.map(|v| v.to_string()).unwrap_or_default(),
-                    r.folders.map(|v| v.to_string()).unwrap_or_default(),
-                    format!(
-                        "u16:{}",
-                        r.path_utf16
-                            .iter()
-                            .map(|v| format!("{v:04X}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ),
-                    crate::local_date::display(source.started),
-                    crate::local_date::display(source.finished),
-                    scan.error_count.to_string(),
-                    scan.metadata_error_count.to_string(),
-                    scope.label().into(),
-                    r.extra
-                        .map(|e| crate::presentation::field_display(e.identity))
-                        .unwrap_or_else(|| "—".into()),
-                    r.extra
-                        .map(|e| crate::presentation::field_display(e.links))
-                        .unwrap_or_else(|| "—".into()),
-                ];
-                for (i, value) in values.iter().enumerate() {
-                    if i > 0 {
-                        writer.write_all(b",")?;
-                    }
-                    text(writer, value)?;
-                }
-                writer.write_all(b"\r\n")?;
-            }
+            writer.write_all(b"\r\n")?;
         }
         Ok(())
     })
@@ -322,6 +185,165 @@ mod tests {
     use std::os::windows::ffi::OsStringExt;
     use std::sync::Arc;
     #[test]
+    fn complete_folder_allocation_is_exported_despite_an_unrelated_scan_error() {
+        let base =
+            std::env::temp_dir().join(format!("diskweave-csv-sibling-{}", std::process::id()));
+        let root = base.join("source");
+        std::fs::create_dir_all(root.join("good")).unwrap();
+        std::fs::create_dir(root.join("denied")).unwrap();
+        std::fs::write(root.join("good/payload"), [1u8; 8192]).unwrap();
+        let mut scan = crate::scanner::scan_with_options(&root, true, || false, |_| {}).unwrap();
+        let good = scan.folder_index(Path::new("good")).unwrap();
+        let denied = scan.folder_index(Path::new("denied")).unwrap();
+        let allocated = scan.folders[good].allocation.bytes;
+        assert!(allocated > 0);
+        scan.error_count = 1;
+        scan.folders[0].access = crate::scanner::FolderAccess::Partial;
+        scan.folders[denied].access = crate::scanner::FolderAccess::Denied;
+        let sources = [Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(scan),
+        }];
+        let path = base.join("good.csv");
+        write(
+            &sources,
+            &ExportScope::Folder {
+                source: 0,
+                folder: good,
+            },
+            &path,
+            false,
+            || false,
+        )
+        .unwrap();
+        let csv = std::fs::read_to_string(&path).unwrap();
+        let folder = csv
+            .lines()
+            .find(|line| line.starts_with("\"good\","))
+            .unwrap();
+        assert_eq!(
+            folder.split(',').nth(4).unwrap(),
+            format!("\"{allocated}\"")
+        );
+        let partial = base.join("partial.csv");
+        write(&sources, &ExportScope::Location(0), &partial, false, || {
+            false
+        })
+        .unwrap();
+        let csv = std::fs::read_to_string(partial).unwrap();
+        let row = csv
+            .lines()
+            .find(|line| line.starts_with("\"source\","))
+            .unwrap();
+        assert_eq!(row.split(',').nth(4).unwrap(), "\"\"");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn csv_contains_only_six_required_columns_and_preserves_exact_bytes() {
+        let base = std::env::temp_dir().join(format!("diskweave-small-csv-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("자료")).unwrap();
+        std::fs::write(base.join("자료/한글.txt"), b"private content").unwrap();
+        let mut scan = crate::scanner::scan(&base.join("자료"), || false).unwrap();
+        scan.files[0].modified = None;
+        scan.files[0].extra.allocation = crate::metadata::Field::Value(4096);
+        let sources = [Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(scan),
+        }];
+        let output = base.join("list.csv");
+        write(
+            &sources,
+            &ExportScope::Matches(vec![Hit {
+                source: 0,
+                item: Item::File(0),
+            }]),
+            &output,
+            false,
+            || false,
+        )
+        .unwrap();
+        let csv = std::fs::read_to_string(&output).unwrap();
+        let expected=format!("\u{feff}이름,전체 경로,종류,크기(Byte),할당 크기(Byte),수정 날짜\r\n\"한글.txt\",\"{}\",\"파일\",\"15\",\"4096\",\"\"\r\n",base.join("자료").join("한글.txt").display());
+        assert_eq!(csv, expected);
+        assert_eq!(
+            std::fs::read(base.join("자료/한글.txt")).unwrap(),
+            b"private content"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn csv_keeps_unknown_allocation_blank_and_escapes_metadata_without_reading_contents() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-csv-escaping-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        std::fs::write(root.join("source/original"), b"123").unwrap();
+        let mut scan = crate::scanner::scan(&root.join("source"), || false).unwrap();
+        scan.files[0].name = "a,\"b\r\n.csv".into();
+        scan.files[0].modified = None;
+        let sources = [Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(scan),
+        }];
+        let output = root.join("list.csv");
+        write(
+            &sources,
+            &ExportScope::Matches(vec![Hit {
+                source: 0,
+                item: Item::File(0),
+            }]),
+            &output,
+            false,
+            || false,
+        )
+        .unwrap();
+        let csv = std::fs::read_to_string(&output).unwrap();
+        assert!(csv.contains("\"a,\"\"b\r\n.csv\","));
+        assert!(csv.ends_with("\"파일\",\"3\",\"\",\"\"\r\n"));
+        assert_eq!(std::fs::read(root.join("source/original")).unwrap(), b"123");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn csv_does_not_present_a_partial_folder_allocation_as_a_complete_size() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-csv-partial-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/file"), b"123").unwrap();
+        let mut scan = crate::scanner::scan_unified(
+            &root.join("data"),
+            Default::default(),
+            || false,
+            |_| {},
+            None,
+        )
+        .unwrap();
+        scan.error_count = 1;
+        scan.folders[0].modified = None;
+        let source = [Snapshot {
+            id: 1,
+            generation: 1,
+            scan: Arc::new(scan),
+        }];
+        let output = root.join("partial.csv");
+        write(
+            &source,
+            &ExportScope::Matches(vec![Hit {
+                source: 0,
+                item: Item::Folder(0),
+            }]),
+            &output,
+            false,
+            || false,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(output)
+            .unwrap()
+            .ends_with("\"폴더\",\"3\",\"\",\"\"\r\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn export_scopes_preserve_exact_rows_and_csv_text_without_readding_matched_folders() {
         let base = std::env::temp_dir().join(format!("diskweave-export-{}", std::process::id()));
         std::fs::create_dir_all(base.join("a/sub")).unwrap();
@@ -330,45 +352,20 @@ mod tests {
         std::fs::write(base.join("a/=SUM(1,2).txt"), [1; 3]).unwrap();
         std::fs::write(base.join("b/other.bin"), [2; 4]).unwrap();
         let unusual = std::ffi::OsString::from_wide(&[0xd800, 0x2e, 0x78]);
-        std::fs::write(base.join("a").join(&unusual), []).unwrap();
-        let sources: Vec<_> = ["a", "b"]
+
+        let mut sources: Vec<_> = ["a", "b"]
             .iter()
             .enumerate()
-            .map(|(i, p)| ExportSource {
-                source: crate::locations::Snapshot {
-                    id: i as u64,
-                    generation: 1,
-                    scan: Arc::new(crate::scanner::scan(&base.join(p), || false).unwrap()),
-                },
-                started: None,
-                finished: None,
+            .map(|(i, p)| Snapshot {
+                id: i as u64,
+                generation: 1,
+                scan: Arc::new(crate::scanner::scan(&base.join(p), || false).unwrap()),
             })
             .collect();
-        let json = base.join("all.json");
-        write(
-            &sources,
-            &ExportScope::All,
-            Format::Json,
-            &json,
-            false,
-            || false,
-        )
-        .unwrap();
-        let data: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
-        assert_eq!(data["rows"].as_array().unwrap().len(), 7);
-        assert!(data["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["path_utf16"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == 0xd800)));
-        assert_eq!(data["sources"].as_array().unwrap().len(), 2);
+        let csv = base.join("rows.csv");
+        write(&sources, &ExportScope::All, &csv, false, || false).unwrap();
+        assert_eq!(std::fs::read_to_string(&csv).unwrap().lines().count(), 7);
         let child = sources[0]
-            .source
             .scan
             .folder_index(std::path::Path::new("sub"))
             .unwrap();
@@ -378,15 +375,12 @@ mod tests {
                 source: 0,
                 folder: child,
             },
-            Format::Json,
-            &json,
+            &csv,
             true,
             || false,
         )
         .unwrap();
-        let data: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
-        assert_eq!(data["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(&csv).unwrap().lines().count(), 3);
         let matches = ExportScope::Matches(vec![
             Hit {
                 source: 0,
@@ -397,26 +391,25 @@ mod tests {
                 item: Item::Folder(child),
             },
         ]);
-        write(&sources, &matches, Format::Json, &json, true, || false).unwrap();
-        let data: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
-        assert_eq!(data["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(data["rows"][0]["logical_bytes"], 7);
-        let csv = base.join("rows.csv");
-        write(
-            &sources,
-            &ExportScope::Location(0),
-            Format::Csv,
-            &csv,
-            false,
-            || false,
-        )
-        .unwrap();
+        write(&sources, &matches, &csv, true, || false).unwrap();
+        assert_eq!(std::fs::read_to_string(&csv).unwrap().lines().count(), 2);
+        write(&sources, &ExportScope::Location(0), &csv, true, || false).unwrap();
         let bytes = std::fs::read(&csv).unwrap();
         assert!(bytes.starts_with(&[0xef, 0xbb, 0xbf]));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("\"'=SUM(1,2).txt\""));
-        assert!(text.contains("path_utf16"));
+        assert!(!text.contains("path_utf16"));
+        let previous = std::fs::read(&csv).unwrap();
+        assert!(write(&sources, &ExportScope::All, &csv, true, || true).is_err());
+        assert_eq!(std::fs::read(&csv).unwrap(), previous);
+        Arc::get_mut(&mut sources[0].scan).unwrap().files[0].name = unusual;
+        assert_eq!(
+            write(&sources, &ExportScope::All, &csv, true, || false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&csv).unwrap(), previous);
         assert_eq!(std::fs::read(base.join("a/=SUM(1,2).txt")).unwrap(), [1; 3]);
         std::fs::remove_dir_all(base).unwrap();
     }

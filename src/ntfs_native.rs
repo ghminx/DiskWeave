@@ -1,4 +1,4 @@
-use crate::ntfs::{Id, Info, Source};
+use crate::ntfs::{Id, Info};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -6,14 +6,10 @@ use std::io;
 use std::os::windows::{
     ffi::{OsStrExt, OsStringExt},
     fs::{MetadataExt, OpenOptionsExt},
-    io::{AsRawHandle, FromRawHandle},
+    io::AsRawHandle,
 };
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::{
-    Foundation::*,
-    Storage::FileSystem::*,
-    System::{Ioctl::*, IO::DeviceIoControl},
-};
+use windows_sys::Win32::Storage::FileSystem::*;
 
 fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(Some(0)).collect()
@@ -83,158 +79,6 @@ pub fn target(path: &Path) -> io::Result<Target> {
         ),
     })
 }
-pub struct Native {
-    guid: String,
-    root: PathBuf,
-    volume: File,
-    cursor: u64,
-    done: bool,
-}
-impl Native {
-    pub fn open(request: &Target) -> io::Result<Self> {
-        let current = target(Path::new(&request.root))?;
-        if current.volume != request.volume {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "선택한 드라이브가 변경됐습니다",
-            ));
-        }
-        let device = wide(format!("\\\\.\\{}", &request.root[..2]));
-        // 볼륨 핸들은 읽기 전용이며 저널 생성·변경 IOCTL을 호출하지 않음
-        let raw = unsafe {
-            CreateFileW(
-                device.as_ptr(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            guid: request.volume.clone(),
-            root: PathBuf::from(&request.root),
-            volume: unsafe { File::from_raw_handle(raw) },
-            cursor: 0,
-            done: false,
-        })
-    }
-}
-impl Source for Native {
-    fn root_id(&mut self) -> io::Result<Id> {
-        let f = File::options()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .share_mode(7)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&self.root)?;
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // 실제 루트 핸들의 64비트 참조 사용. segment 번호와 sequence의 임의 변환 방지
-        if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Id::V2(
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        ))
-    }
-    fn page(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.done {
-            return Ok(None);
-        }
-        let request = MFT_ENUM_DATA_V0 {
-            StartFileReferenceNumber: self.cursor,
-            LowUsn: 0,
-            HighUsn: i64::MAX,
-        };
-        let mut data = vec![0u8; 1024 * 1024];
-        let mut bytes = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                self.volume.as_raw_handle(),
-                FSCTL_ENUM_USN_DATA,
-                (&request as *const MFT_ENUM_DATA_V0).cast(),
-                std::mem::size_of_val(&request) as u32,
-                data.as_mut_ptr().cast(),
-                data.len() as u32,
-                &mut bytes,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
-                self.done = true;
-                return Ok(None);
-            }
-            return Err(e);
-        }
-        data.truncate(bytes as usize);
-        if data.len() < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NTFS 열거 응답이 잘렸습니다",
-            ));
-        }
-        let next = u64::from_le_bytes(data[..8].try_into().unwrap());
-        if next <= self.cursor {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "NTFS 열거 위치가 진행하지 않습니다",
-            ));
-        }
-        self.cursor = next;
-        Ok(Some(data))
-    }
-    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<Info> {
-        inspect_file(path, detailed, &self.guid)
-    }
-    fn links(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let name = wide(path);
-        let mut size = 32768u32;
-        let mut buffer = vec![0u16; size as usize];
-        let handle =
-            unsafe { FindFirstFileNameW(name.as_ptr(), 0, &mut size, buffer.as_mut_ptr()) };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        struct Find(HANDLE);
-        impl Drop for Find {
-            fn drop(&mut self) {
-                unsafe {
-                    FindClose(self.0);
-                }
-            }
-        }
-        let _find = Find(handle);
-        let mut links = Vec::new();
-        loop {
-            let len = buffer.iter().position(|n| *n == 0).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Hard Link 경로가 잘렸습니다")
-            })?;
-            if len < 2 || buffer[0] != 92 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "잘못된 볼륨 상대 경로",
-                ));
-            }
-            links.push(self.root.join(OsString::from_wide(&buffer[1..len])));
-            size = buffer.len() as u32;
-            if unsafe { FindNextFileNameW(handle, &mut size, buffer.as_mut_ptr()) } == 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
-                    break;
-                }
-                return Err(e);
-            }
-        }
-        Ok(links)
-    }
-}
-
-/// 선택한 볼륨의 핸들에서만 메타데이터 조회.
 pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::Result<Info> {
     let f = File::options()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -256,7 +100,6 @@ pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::R
     }
     Ok(Info {
         resolved: Some(resolved),
-        link_count: Some(id.nNumberOfLinks),
         reference: Some(Id::V2(
             (u64::from(id.nFileIndexHigh) << 32) | u64::from(id.nFileIndexLow),
         )),

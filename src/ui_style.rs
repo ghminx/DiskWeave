@@ -10,7 +10,7 @@ pub const MUTED: Color32 = Color32::from_rgb(167, 181, 197);
 pub const SOFT: Color32 = Color32::from_rgb(127, 145, 164);
 pub const ACCENT: Color32 = Color32::from_rgb(104, 184, 255);
 pub const SELECTED: Color32 = Color32::from_rgb(27, 48, 65);
-pub const ROW: f32 = 39.0;
+pub const ROW: f32 = 36.0;
 pub const HEADER: f32 = 36.0;
 pub const MAP_COLORS: [Color32; 7] = [
     Color32::from_rgb(57, 124, 118),
@@ -68,20 +68,35 @@ pub fn apply(ctx: &egui::Context) {
             .text_styles
             .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
     });
-    // Windows 설치 글꼴만 읽고 배포 파일에는 포함하지 않는 시안 글꼴 선택. 없으면 기존 시스템 대체 글꼴 유지.
-    if let Some(windows) = std::env::var_os("WINDIR") {
-        if let Ok(data) = std::fs::read(std::path::PathBuf::from(windows).join("Fonts/segoeui.ttf"))
-        {
-            ctx.add_font(egui::FontInsert {
-                name: "DiskWeave Segoe UI".into(),
-                data: egui::FontData::from_owned(data),
-                families: vec![egui::InsertFontFamily {
-                    family: egui::FontFamily::Proportional,
-                    priority: egui::FontPriority::Highest,
-                }],
-            });
-        }
+    for (name, bytes, family) in [
+        (
+            "Pretendard",
+            include_bytes!("../assets/fonts/Pretendard-Regular.otf").as_slice(),
+            egui::FontFamily::Proportional,
+        ),
+        (
+            "Pretendard Bold",
+            include_bytes!("../assets/fonts/Pretendard-Bold.ttf").as_slice(),
+            egui::FontFamily::Name("Pretendard Bold".into()),
+        ),
+    ] {
+        ctx.add_font(egui::FontInsert {
+            name: name.into(),
+            data: egui::FontData::from_static(bytes),
+            families: vec![egui::InsertFontFamily {
+                family,
+                priority: egui::FontPriority::Highest,
+            }],
+        });
     }
+    ctx.global_style_mut(|style| {
+        style.spacing.icon_width = 18.0;
+        style.spacing.icon_width_inner = 12.0;
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(18.0, egui::FontFamily::Name("Pretendard Bold".into())),
+        );
+    });
 }
 
 pub fn text(ui: &Ui, rect: egui::Rect, value: &str, right: bool, color: Color32, size: f32) {
@@ -282,4 +297,266 @@ pub fn panel_title(ui: &mut Ui, title: &str, note: &str) {
         [rect.left_bottom(), rect.right_bottom()],
         egui::Stroke::new(1.0, LINE),
     );
+}
+
+/// 제목 표시줄의 고정 크기 아이콘 버튼 생성.
+pub fn title_control(ui: &mut Ui, name: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 28.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            if name == "닫기" {
+                Color32::from_rgb(174, 48, 60)
+            } else {
+                SELECTED
+            },
+        );
+    }
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.3, TEXT);
+    let p = ui.painter();
+    match name {
+        "닫기" => {
+            p.line_segment(
+                [c + egui::vec2(-4.5, -4.5), c + egui::vec2(4.5, 4.5)],
+                stroke,
+            );
+            p.line_segment(
+                [c + egui::vec2(-4.5, 4.5), c + egui::vec2(4.5, -4.5)],
+                stroke,
+            );
+        }
+        "최소화" => {
+            p.line_segment(
+                [c + egui::vec2(-5.0, 0.0), c + egui::vec2(5.0, 0.0)],
+                stroke,
+            );
+        }
+        "최대화" | "복원" => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(10.0, 9.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            if name == "복원" {
+                p.line_segment(
+                    [c + egui::vec2(-3.0, -7.0), c + egui::vec2(7.0, -7.0)],
+                    stroke,
+                );
+            }
+        }
+        "더보기" => {
+            for x in [-4.0, 0.0, 4.0] {
+                p.circle_filled(c + egui::vec2(x, 0.0), 1.2, TEXT);
+            }
+        }
+        _ => {
+            p.circle_stroke(c, 4.0, stroke);
+            p.circle_stroke(c, 1.5, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let v = egui::vec2(a.cos(), a.sin());
+                p.line_segment([c + v * 4.0, c + v * 6.0], stroke);
+            }
+        }
+    }
+    response.on_hover_text(name)
+}
+
+/// 폴더 펼침 상태를 글꼴에 의존하지 않는 12px 꺾쇠로 표시.
+pub fn chevron(ui: &Ui, rect: egui::Rect, expanded: bool) {
+    let c = rect.center();
+    let points = if expanded {
+        [
+            c + egui::vec2(-5.0, -2.5),
+            c + egui::vec2(0.0, 2.5),
+            c + egui::vec2(5.0, -2.5),
+        ]
+    } else {
+        [
+            c + egui::vec2(-2.5, -5.0),
+            c + egui::vec2(2.5, 0.0),
+            c + egui::vec2(-2.5, 5.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::line(
+        points.to_vec(),
+        egui::Stroke::new(1.8, MUTED),
+    ));
+}
+
+/// 이전 방향을 나타내는 고정 크기 왼쪽 화살표 버튼 생성.
+pub fn back_button(ui: &mut Ui, enabled: bool) -> Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("").min_size(egui::vec2(34.0, 30.0)),
+    );
+    let c = response.rect.center();
+    let stroke = egui::Stroke::new(1.8, if enabled { TEXT } else { SOFT });
+    ui.painter().line_segment(
+        [c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)],
+        stroke,
+    );
+    ui.painter().add(egui::Shape::line(
+        vec![
+            c + egui::vec2(-1.0, -5.0),
+            c + egui::vec2(-6.0, 0.0),
+            c + egui::vec2(-1.0, 5.0),
+        ],
+        stroke,
+    ));
+    response.on_hover_text("상위 폴더로 이동")
+}
+
+/// 우클릭 메뉴의 항목 높이와 그룹 간격 통일.
+pub fn menu_spacing(ui: &mut Ui) {
+    ui.set_min_width(220.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    ui.spacing_mut().interact_size.y = 34.0;
+    ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
+}
+
+/// 설명과 독립적인 선형 아이콘을 함께 표시하는 메뉴 행 생성.
+pub fn menu_action(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    menu_spacing(ui);
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).color(Color32::TRANSPARENT))
+            .min_size(egui::vec2(220.0, 36.0)),
+    );
+    let danger = label.contains("이름 변경")
+        || label.contains("이동") && !label.contains("분석")
+        || label.contains("휴지통");
+    let color = if !enabled {
+        SOFT
+    } else if danger {
+        Color32::from_rgb(255, 145, 140)
+    } else {
+        ACCENT
+    };
+    let p = ui.painter();
+    p.text(
+        egui::pos2(response.rect.left() + 38.0, response.rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        if !enabled {
+            SOFT
+        } else if danger {
+            color
+        } else {
+            TEXT
+        },
+    );
+    let c = egui::pos2(response.rect.left() + 18.0, response.rect.center().y);
+    let stroke = egui::Stroke::new(1.5, color);
+    if label.contains("휴지통") {
+        p.rect_stroke(
+            egui::Rect::from_center_size(c + egui::vec2(0.0, 1.0), egui::vec2(10.0, 12.0)),
+            1.0,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        p.line_segment(
+            [c + egui::vec2(-7.0, -6.0), c + egui::vec2(7.0, -6.0)],
+            stroke,
+        );
+        p.line_segment(
+            [c + egui::vec2(-2.0, -8.0), c + egui::vec2(2.0, -8.0)],
+            stroke,
+        );
+    } else if label.contains("이름 변경") {
+        p.line_segment(
+            [c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)],
+            egui::Stroke::new(3.0, color),
+        );
+        p.line_segment(
+            [c + egui::vec2(-7.0, 8.0), c + egui::vec2(7.0, 8.0)],
+            stroke,
+        );
+    } else if label.contains("이동") || label.contains("가져오기") {
+        p.line_segment(
+            [c + egui::vec2(-7.0, 0.0), c + egui::vec2(7.0, 0.0)],
+            stroke,
+        );
+        p.add(egui::Shape::line(
+            vec![
+                c + egui::vec2(2.0, -5.0),
+                c + egui::vec2(7.0, 0.0),
+                c + egui::vec2(2.0, 5.0),
+            ],
+            stroke,
+        ));
+    } else if label.contains("경로") {
+        for x in [-4.0, 4.0] {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c + egui::vec2(x, 0.0), egui::vec2(10.0, 7.0)),
+                3.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+    } else if label.contains("복사") {
+        for offset in [egui::vec2(-2.0, -2.0), egui::vec2(2.0, 2.0)] {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c + offset, egui::vec2(9.0, 11.0)),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+    } else {
+        p.rect_stroke(
+            egui::Rect::from_center_size(c, egui::vec2(15.0, 11.0)),
+            1.0,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        p.line_segment(
+            [c + egui::vec2(-7.0, -7.0), c + egui::vec2(-1.0, -7.0)],
+            stroke,
+        );
+        if label.contains("새 폴더") {
+            p.line_segment(
+                [c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 0.0)],
+                stroke,
+            );
+            p.line_segment(
+                [c + egui::vec2(0.0, -3.0), c + egui::vec2(0.0, 3.0)],
+                stroke,
+            );
+        }
+    }
+    response
+}
+
+/// 12px 꺾쇠와 왼쪽 정렬 제목을 사용하는 고정 높이 선택 버튼 생성.
+pub fn scope_button(ui: &mut Ui, label: &str, width: f32) -> Response {
+    let response = ui.add_sized(
+        [width, 32.0],
+        egui::Button::new(egui::RichText::new(label).color(Color32::TRANSPARENT)),
+    );
+    let rect = response.rect;
+    text(
+        ui,
+        egui::Rect::from_min_max(
+            rect.min + egui::vec2(10.0, 0.0),
+            rect.max - egui::vec2(30.0, 0.0),
+        ),
+        label,
+        false,
+        TEXT,
+        12.0,
+    );
+    chevron(
+        ui,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            egui::vec2(18.0, 18.0),
+        ),
+        true,
+    );
+    response
 }

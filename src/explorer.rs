@@ -1,5 +1,5 @@
 use crate::scanner::ScanResult;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -19,13 +19,16 @@ impl Explorer {
     /// 변경 세대의 인덱스를 경로로 다시 연결하고 사라진 폴더는 남은 상위로 복귀.
     pub fn rebase(&self, old: &ScanResult, new: &ScanResult) -> Self {
         let mut next = Self::new(new);
-        let root = &new.folders[0].path;
+        let folders: HashMap<_, _> = new
+            .folders
+            .iter()
+            .enumerate()
+            .map(|(id, folder)| (folder.path.as_path(), id))
+            .collect();
         let mut path = old.folders[self.folder].path.as_path();
         let folder = loop {
-            if let Ok(relative) = path.strip_prefix(root) {
-                if let Ok(id) = new.folder_index(relative) {
-                    break id;
-                }
+            if let Some(&id) = folders.get(path) {
+                break id;
             }
             let Some(parent) = path.parent() else {
                 break 0;
@@ -34,11 +37,7 @@ impl Explorer {
         };
         next.open_folder(new, folder);
         for id in &self.expanded {
-            if let Some(id) = new
-                .folders
-                .iter()
-                .position(|f| f.path == old.folders[*id].path)
-            {
+            if let Some(&id) = folders.get(old.folders[*id].path.as_path()) {
                 next.expanded.insert(id);
             }
         }
@@ -48,7 +47,7 @@ impl Explorer {
                 .path
                 .join(&old.files[id].name),
         };
-        if let Some(id) = new.folders.iter().position(|f| f.path == selected) {
+        if let Some(&id) = folders.get(selected.as_path()) {
             next.selected = Item::Folder(id);
         } else if let Some(id) = new.files.iter().enumerate().find_map(|(id, f)| {
             (new.folders[f.parent].path.join(&f.name) == selected).then_some(id)

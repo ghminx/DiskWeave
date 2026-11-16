@@ -195,16 +195,17 @@ impl FileUi {
         count: usize,
         has_folder: bool,
     ) {
-        if ui
-            .add_enabled(
-                count > 0,
-                egui::Button::new(if count > 1 {
-                    "선택한 경로 복사"
-                } else {
-                    "경로 복사"
-                }),
-            )
-            .clicked()
+        crate::ui_style::menu_spacing(ui);
+        if crate::ui_style::menu_action(
+            ui,
+            if count > 1 {
+                "선택한 경로 복사"
+            } else {
+                "경로 복사"
+            },
+            count > 0,
+        )
+        .clicked()
         {
             self.copy_requested = Some(paths.clone());
             ui.close();
@@ -212,30 +213,34 @@ impl FileUi {
         ui.separator();
         for kind in [
             Kind::Folder,
-            Kind::Rename,
             Kind::Copy,
+            Kind::Rename,
             Kind::Move,
             Kind::Recycle,
         ] {
+            if kind == Kind::Folder {
+                ui.small("만들기 · 복사");
+            }
+            if kind == Kind::Rename {
+                ui.separator();
+                ui.small("원본 변경");
+            }
+            if kind == Kind::Recycle {
+                ui.separator();
+            }
             let available = enabled
                 && match kind {
                     Kind::Folder => has_folder,
                     Kind::Rename => count == 1,
                     Kind::Copy | Kind::Move | Kind::Recycle => count > 0,
                 };
-            if ui
-                .add_enabled(available, egui::Button::new(kind.label()))
-                .clicked()
-            {
+            if crate::ui_style::menu_action(ui, kind.label(), available).clicked() {
                 self.requested = Some((kind, paths.clone()));
                 ui.close();
             }
         }
         ui.separator();
-        if ui
-            .add_enabled(enabled, egui::Button::new("파일 가져오기…"))
-            .clicked()
-        {
+        if crate::ui_style::menu_action(ui, "파일 가져오기…", enabled).clicked() {
             self.importing = true;
             ui.close();
         }
@@ -265,6 +270,14 @@ impl FileUi {
                 ui.set_width(width);
                 let d = self.dialog.as_mut().unwrap();
                 ui.heading(d.kind.label());
+                ui.add_space(12.0);
+                ui.label("1. 작업 설정   →   2. 변경 내용 검토   →   3. 실행");
+                ui.small(
+                    "이 화면에서는 파일이 변경되지 않습니다. 다음 단계에서 검토 후 실행합니다.",
+                );
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
                 if d.transfer_choice {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut d.kind, Kind::Copy, "복사");
@@ -300,24 +313,33 @@ impl FileUi {
                     }
                 } else if d.kind == Kind::Recycle {
                     ui.colored_label(
-                        egui::Color32::YELLOW,
+                        egui::Color32::from_rgb(255, 145, 140),
                         "선택한 항목과 하위 항목을 휴지통으로 옮깁니다.",
                     );
                     ui.label("휴지통 지원을 확인할 수 없으면 실행하지 않습니다.");
                 } else {
-                    ui.label("이름");
+                    ui.label(if d.kind == Kind::Rename {
+                        "새 이름"
+                    } else {
+                        "폴더 이름"
+                    });
                     ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
                     if let Some(parent) = &d.context.current {
                         ui.add(egui::Label::new(parent.display().to_string()).wrap());
                     }
                 }
                 if let Some(error) = &self.error {
-                    ui.colored_label(egui::Color32::YELLOW, error);
+                    ui.colored_label(egui::Color32::from_rgb(255, 145, 140), error);
                 }
                 ui.add_space(12.0);
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     cancel = ui.button("취소").clicked();
-                    submit = ui.button("대상 확인").clicked();
+                    submit = ui
+                        .add(egui::Button::new("변경 내용 검토 →").fill(crate::ui_style::SELECTED))
+                        .clicked();
                 });
             });
             if cancel {
@@ -411,7 +433,8 @@ impl FileUi {
                                 if let Some(issue) = &item.issue {
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(issue).color(egui::Color32::YELLOW),
+                                            egui::RichText::new(issue)
+                                                .color(egui::Color32::from_rgb(255, 145, 140)),
                                         )
                                         .truncate(),
                                     )
@@ -479,7 +502,18 @@ impl FileUi {
                         confirm = ui
                             .add_enabled(
                                 self.execution_allowed(plan),
-                                egui::Button::new("확인한 작업 실행"),
+                                egui::Button::new(plan.action.label()).fill(
+                                    if matches!(
+                                        plan.action,
+                                        Action::Recycle
+                                            | Action::Rename { .. }
+                                            | Action::Move { .. }
+                                    ) {
+                                        egui::Color32::from_rgb(123, 43, 49)
+                                    } else {
+                                        crate::ui_style::SELECTED
+                                    },
+                                ),
                             )
                             .clicked();
                     });

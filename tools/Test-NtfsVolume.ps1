@@ -1,5 +1,6 @@
-﻿param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=10000,[switch]$Usn,[switch]$FileManagement,[switch]$WaitForClient,[switch]$Layout,[switch]$Mft,[switch]$ProductMft)
+﻿param([string]$Runner,[ValidateRange(0,10000)][int]$FileCount=0,[switch]$Usn,[switch]$FileManagement,[switch]$WaitForClient)
 $ErrorActionPreference='Stop'
+if($Usn.IsPresent -eq $FileManagement.IsPresent){throw 'USN 또는 파일 관리 시험 하나를 지정해야 함'}
 $OutputEncoding=[Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $workspace=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -45,10 +46,6 @@ try {
     [IO.File]::WriteAllText((Join-Path $root ('.diskweave-validation-'+$token)),$token,[Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllBytes((Join-Path $root 'Cases/regular.bin'),[byte[]](1..13))
     New-Item -ItemType HardLink -Path (Join-Path $root 'Cases/sub/alias.bin') -Target (Join-Path $root 'Cases/regular.bin') | Out-Null
-    if($Layout -or $Mft){
-        [void][IO.Directory]::CreateDirectory((Join-Path $root 'Outside'))
-        New-Item -ItemType HardLink -Path (Join-Path $root 'Outside/alias.bin') -Target (Join-Path $root 'Cases/regular.bin') | Out-Null
-    }
     [IO.File]::WriteAllBytes((Join-Path $root 'Cases/empty'),[byte[]]@())
     $sparse=Join-Path $root 'Cases/sparse.bin'
     [IO.File]::WriteAllBytes($sparse,[byte[]]@())
@@ -64,7 +61,7 @@ try {
     for($i=0;$i -lt $FileCount;$i++){[IO.File]::WriteAllBytes((Join-Path $root ('Cases/bulk/entry-{0:D5}.bin' -f $i)),[byte[]](1..8))}
     $guid=(Get-Volume -DriveLetter $volume.DriveLetter).Path
     $request=Join-Path $runDir 'request.json'
-    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount;usn=$Usn.IsPresent;file_management=$FileManagement.IsPresent;layout=$Layout.IsPresent;mft=$Mft.IsPresent;product_mft=$ProductMft.IsPresent}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($request,(@{root=$root;volume=$guid;token=$token;file_count=$FileCount;usn=$Usn.IsPresent;file_management=$FileManagement.IsPresent}|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
     if($WaitForClient){
         if(-not $FileManagement){throw '별도 클라이언트 대기는 파일 관리 시험에 한정함'}
         [IO.File]::WriteAllText((Join-Path $runDir 'client-ready.txt'),$request,[Text.UTF8Encoding]::new($false))

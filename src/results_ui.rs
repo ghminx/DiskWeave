@@ -1,6 +1,7 @@
 use crate::documents::{Documents, Status, Task};
-use crate::export::{ExportScope, ExportSource, Format};
+use crate::export::ExportScope;
 use crate::global_search::Hit;
+use crate::locations::Snapshot;
 use crate::snapshot::SavedScan;
 use eframe::egui;
 use std::path::PathBuf;
@@ -11,17 +12,16 @@ use std::sync::{
 
 #[derive(Default)]
 pub struct ExportContext {
-    pub sources: Vec<ExportSource>,
+    pub sources: Vec<Snapshot>,
     pub selected: Option<usize>,
     pub folder: Option<usize>,
-    pub matches: Option<(Vec<ExportSource>, Vec<Hit>)>,
+    pub matches: Option<(Vec<Snapshot>, Vec<Hit>)>,
 }
 enum Draft {
     Save(Arc<SavedScan>),
     Export {
-        sources: Vec<ExportSource>,
+        sources: Vec<Snapshot>,
         scope: ExportScope,
-        format: Format,
     },
 }
 impl Draft {
@@ -32,14 +32,9 @@ impl Draft {
                 path,
                 overwrite,
             },
-            Self::Export {
+            Self::Export { sources, scope } => Task::Export {
                 sources,
                 scope,
-                format,
-            } => Task::Export {
-                sources,
-                scope,
-                format,
                 path,
                 overwrite,
             },
@@ -61,7 +56,6 @@ pub struct ResultsUi {
     pub export_open: bool,
     pub compare_open: bool,
     pub scope: usize,
-    format: Option<Format>,
     pub before: Option<PathBuf>,
     pub after: Option<PathBuf>,
     chooser: Option<Receiver<Picked>>,
@@ -245,8 +239,9 @@ impl ResultsUi {
     pub fn windows(&mut self, ctx: &egui::Context, context: &ExportContext) {
         if self.export_open {
             let mut open = true;
-            dialog("파일 목록 내보내기",ctx,440.0).open(&mut open).show(ctx, |ui| {
+            dialog("파일 목록 내보내기",ctx,440.0).vscroll(false).open(&mut open).show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y=6.0;
+                egui::ScrollArea::vertical().id_salt("export_body").max_height((ctx.content_rect().height()-if matches!(self.job.status,Status::Idle){200.0}else{280.0}).max(100.0)).show(ui,|ui| {
                 ui.label("저장할 범위");
                 ui.small("이 창을 열었을 때의 결과를 저장합니다.");
                 for (index, label, enabled) in [
@@ -258,14 +253,19 @@ impl ResultsUi {
                 if self.scope < 2 {
                     if let Some(source) = context.selected.and_then(|id| context.sources.get(id)) {
                         let folder = if self.scope == 0 { context.folder.unwrap_or(0) } else { 0 };
-                        let path = source.source.scan.folders[folder].path.display().to_string();
+                        let path = source.scan.folders[folder].path.display().to_string();
                         ui.add(egui::Label::new(&path).truncate()).on_hover_text(path);
                     }
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| { ui.label("형식"); let format = self.format.get_or_insert(Format::Csv); ui.selectable_value(format, Format::Csv,"CSV · Excel용"); ui.selectable_value(format, Format::Json,"JSON"); });
+                ui.label("CSV · Excel에서 열 수 있는 파일 목록");
+                ui.small("확인하지 못한 할당 크기와 날짜는 빈칸으로 저장합니다.");
+                if context.sources.iter().any(|s|s.scan.error_count>0 || s.scan.metadata_error_count>0) {
+                    ui.colored_label(egui::Color32::YELLOW,"일부 항목을 읽지 못한 분석 결과입니다.");
+                }
                 ui.small("파일 내용은 저장하지 않습니다. 폴더 크기는 하위 항목을 포함하므로 행의 크기를 모두 더하면 중복됩니다.");
-                ui.small("CSV에서는 파일명이 수식으로 실행되지 않도록 텍스트로 저장합니다. 특수문자가 있는 경로도 원문을 함께 보존합니다.");
+                ui.small("CSV에서는 파일명이 수식으로 실행되지 않도록 텍스트로 저장합니다. 이름·전체 경로·종류·크기·할당 크기·수정 날짜만 저장합니다.");
+                });
                 self.status(ui);
                 let scope = match self.scope {
                     0 => context.selected.zip(context.folder).map(|(source,folder)| ExportScope::Folder{source,folder}),
@@ -277,8 +277,7 @@ impl ResultsUi {
                 ui.horizontal(|ui| {
                     if ui.add_enabled(scope.is_some() && !self.busy(), egui::Button::new(egui::RichText::new("저장 위치 선택…").color(crate::ui_style::BG)).fill(crate::ui_style::ACCENT)).clicked() {
                         let sources = if self.scope == 2 { context.matches.as_ref().unwrap().0.clone() } else { context.sources.clone() };
-                        let format = self.format.unwrap_or(Format::Csv);
-                        self.destination(Draft::Export{sources,scope:scope.unwrap(),format},if format==Format::Csv{"csv"}else{"json"},if format==Format::Csv{"DiskWeave.csv"}else{"DiskWeave.json"});
+                        self.destination(Draft::Export{sources,scope:scope.unwrap()},"csv","DiskWeave.csv");
                         self.export_open = false;
                     }
                     if ui.button("닫기").clicked() { self.export_open = false; }

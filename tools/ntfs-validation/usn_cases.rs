@@ -118,6 +118,29 @@ fn compare(
         serde_json::json!({"case":label,"files":reference.files.len(),"bytes":reference.folders[0].logical_bytes,"ms":start.elapsed().as_secs_f64()*1000.0}),
     )
 }
+struct ReplaceDuringRead<'a> {
+    source: &'a mut usn_native::Native,
+    replace: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+impl usn::Source for ReplaceDuringRead<'_> {
+    fn journal(&mut self) -> io::Result<usn::Journal> {
+        usn::Source::journal(self.source)
+    }
+    fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<usn::Event>> {
+        let events = usn::Source::read(self.source, start, end)?;
+        if let Some((path, previous)) = self.replace.take() {
+            fs::rename(&path, previous)?;
+            fs::write(path, b"123")?;
+        }
+        Ok(events)
+    }
+    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+        usn::Source::inspect(self.source, path, detailed)
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+        usn::Source::list(self.source, path)
+    }
+}
 pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     let mut total = 0;
     let path: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -138,15 +161,27 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     let mut whole_source = usn_native::Native::open(root)?;
     let mut whole = usn::Index::begin(root, true, &mut whole_source, &|| false)?;
     let whole_record = whole.snapshot(&|| false)?;
-    let whole_reference = crate::ntfs::collect(
-        root,
-        true,
-        &mut crate::ntfs_native::Native::open(target)?,
-        || false,
-        |_| {},
-    )?;
-    if super::rows(&whole_record.scan) != super::rows(&whole_reference) {
-        return Err(io::Error::other("전체 드라이브 기준 대조 불일치"));
+    let whole_reference = crate::scanner::scan_with_options(root, true, || false, |_| {})?;
+    let protected_path = root.join("System Volume Information");
+    if whole_reference
+        .issues
+        .iter()
+        .any(|e| e.path != protected_path)
+    {
+        return Err(io::Error::other("일반 기준 수집의 예상하지 못한 오류"));
+    }
+    // 보호 폴더 내부는 일반 열거 권한과 다르므로 별도 존재 검증. 나머지 경로는 전체 대조.
+    let visible = |rows: std::collections::BTreeMap<std::path::PathBuf, super::Row>| {
+        rows.into_iter()
+            .filter(|(p, _)| {
+                !p.as_os_str().is_empty() && !p.starts_with("System Volume Information")
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    if visible(super::rows(&whole_record.scan)) != visible(super::rows(&whole_reference)) {
+        return Err(io::Error::other(
+            "전체 드라이브의 일반 접근 가능 경로 대조 불일치",
+        ));
     }
     let protected = root.join("System Volume Information");
     if !whole_record
@@ -161,7 +196,7 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     }
     let ordinary_access = fs::read_dir(&protected).is_ok();
     let mut cases = vec![
-        serde_json::json!({"case":"whole-drive-baseline","matched":true,"protected_collected":true,"protected_standard_access":ordinary_access}),
+        serde_json::json!({"case":"whole-drive-baseline","matched_visible_rows":true,"protected_contents_compared":false,"protected_collected":true,"protected_standard_access":ordinary_access}),
     ];
     eprintln!("USN: 전체 드라이브·보호 폴더 일치");
     drop(whole_source);
@@ -169,6 +204,28 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     let mut source = usn_native::Native::open(&scope)?;
     let mut index = usn::Index::begin(&scope, true, &mut source, &|| false)?;
     cases.push(compare(&mut index, &mut source, &scope, "baseline")?);
+    let replacement = scope.join("replace-save.bin");
+    fs::write(&replacement, b"12345")?;
+    cases.push(compare(
+        &mut index,
+        &mut source,
+        &scope,
+        "replacement-created",
+    )?);
+    fs::write(&replacement, b"123456")?;
+    let mut racing = ReplaceDuringRead {
+        source: &mut source,
+        replace: Some((replacement, root.join("previous-save.bin"))),
+    };
+    index.refresh(&mut racing, &|| false)?;
+    let replaced = index.snapshot(&|| false)?;
+    let reference = crate::scanner::scan_with_options(&scope, true, || false, |_| {})?;
+    if super::rows(&replaced.scan) != super::rows(&reference) {
+        return Err(io::Error::other(
+            "실제 저널 읽기 이후 파일 교체 대조 불일치",
+        ));
+    }
+    cases.push(serde_json::json!({"case":"replacement-after-usn-read","matched":true}));
     fs::hard_link(scope.join("regular.bin"), root.join("external-alias"))?;
     fs::write(root.join("external-alias"), b"123456789")?;
     cases.push(compare(

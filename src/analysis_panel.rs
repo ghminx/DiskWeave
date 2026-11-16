@@ -233,6 +233,7 @@ impl AnalysisPanel {
                             action = Some((row, OpenAction::OpenFile));
                         }
                         response.context_menu(|ui| {
+                            crate::ui_style::menu_spacing(ui);
                             if ui.button("경로 복사").clicked() {
                                 if let Err(error) = crate::path_copy::copy_with(
                                     &[crate::search::item_path(&source.scan, hit.item)],
@@ -247,15 +248,19 @@ impl AnalysisPanel {
                                 }
                             }
 
-                            if ui.button("기본 앱으로 열기").clicked() {
+                            if crate::ui_style::menu_action(ui, "기본 앱으로 열기", true).clicked()
+                            {
                                 action = Some((row, OpenAction::OpenFile));
                                 ui.close();
                             }
-                            if ui.button("파일 위치 열기").clicked() {
+                            if crate::ui_style::menu_action(ui, "파일 위치 열기", true).clicked()
+                            {
                                 action = Some((row, OpenAction::RevealFile));
                                 ui.close();
                             }
-                            if ui.button("용량 분석으로 이동").clicked() {
+                            if crate::ui_style::menu_action(ui, "용량 분석으로 이동", true)
+                                .clicked()
+                            {
                                 analyze = Some(row);
                                 ui.close();
                             }

@@ -33,6 +33,9 @@ pub trait Source {
     fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<Event>>;
     fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info>;
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 /// USN 페이지의 길이·형식·이름·단조 증가를 확인한 뒤 변경 ID만 반환.
 pub fn decode(page: &[u8], start: i64) -> io::Result<(i64, Vec<Event>)> {
@@ -93,6 +96,83 @@ pub struct Excluded {
     pub attributes: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnavailableReason {
+    Os(i32),
+    Changing,
+}
+impl UnavailableReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Os(5) => "접근 권한 없음",
+            Self::Os(32) => "다른 프로그램에서 사용 중",
+            Self::Os(33) => "파일 잠금 충돌",
+            Self::Os(_) => "조회 실패",
+            Self::Changing => "계속 변경 중 · 확인 대기",
+        }
+    }
+    pub fn error(&self) -> io::Error {
+        match self {
+            Self::Os(code) => io::Error::from_raw_os_error(*code),
+            Self::Changing => io::Error::other(self.label()),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unavailable {
+    pub path: Vec<u16>,
+    pub parent: u64,
+    pub previous_id: Option<u64>,
+    pub directory: bool,
+    pub reason: UnavailableReason,
+    pub listing: bool,
+    pub checked: SystemTime,
+}
+impl Unavailable {
+    pub fn relative(&self) -> PathBuf {
+        std::ffi::OsString::from_wide(&self.path).into()
+    }
+}
+fn skippable(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+fn confirmed_missing(source: &mut impl Source, path: &Path) -> io::Result<bool> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("조회 대상의 부모가 없습니다"))?;
+    let entries = source.list(parent).map_err(|e| context(parent, e))?;
+    if entries.iter().any(|p| p.parent() != Some(parent)) {
+        return Err(invalid("삭제 재확인의 부모 경로 오류"));
+    }
+    Ok(!entries.iter().any(|p| p == path))
+}
+fn context(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+fn inspect_present(
+    source: &mut impl Source,
+    path: &Path,
+    detailed: bool,
+) -> io::Result<Option<crate::ntfs::Info>> {
+    match source.inspect(path, detailed) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if confirmed_missing(source, path)? {
+                return Ok(None);
+            }
+            // 삭제·재생성 경합에서 부모가 이름을 확인한 경우에만 한 번 재조회.
+            match source.inspect(path, detailed) {
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound && confirmed_missing(source, path)? =>
+                {
+                    Ok(None)
+                }
+                value => value.map(Some),
+            }
+        }
+        value => value.map(Some),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub version: u32,
     pub volume: String,
@@ -103,6 +183,11 @@ pub struct Checkpoint {
     pub files: Vec<u64>,
     pub excluded: Vec<Excluded>,
     pub pending: Vec<u64>,
+    #[serde(default)]
+    pub unavailable: Vec<Unavailable>,
+    #[serde(default)]
+    /// 마지막으로 성공한 갱신의 시작 시각. 진행 알림·수신 시각과 분리.
+    pub confirmed_after: Option<SystemTime>,
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -147,13 +232,16 @@ pub struct Index {
     root: PathBuf,
     detailed: bool,
     nodes: BTreeMap<PathBuf, Node>,
+    unavailable: BTreeMap<PathBuf, Unavailable>,
     pub checkpoint: Checkpoint,
     scan: Option<Arc<ScanResult>>,
     started: SystemTime,
 }
 impl Checkpoint {
     pub fn validate(&self, scan: &ScanResult) -> io::Result<()> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 3)
+            || self.version == 1 && !self.unavailable.is_empty()
+            || scan.error_count != self.unavailable.len() as u64
             || self.volume.is_empty()
             || self.root == 0
             || self.next < 0
@@ -194,6 +282,96 @@ impl Checkpoint {
                 return Err(invalid("제외 경로의 추적 정보가 올바르지 않습니다"));
             }
         }
+        let root = &scan.folders[0].path;
+        let mut parents = HashMap::new();
+        for (i, (f, id)) in scan.folders.iter().zip(&self.folders).enumerate() {
+            if if i == 0 {
+                f.parent.is_some()
+            } else {
+                f.parent.is_none_or(|p| p >= i)
+            } {
+                return Err(invalid("추적 폴더 부모 관계 오류"));
+            }
+            let path = f
+                .path
+                .strip_prefix(root)
+                .map_err(|_| invalid("추적 폴더 범위 오류"))?;
+            if parents.insert(path, (*id, i)).is_some() {
+                return Err(invalid("중복된 추적 폴더 경로"));
+            }
+        }
+        let mut expected = vec![crate::scanner::FolderAccess::Complete; scan.folders.len()];
+        let mut blocked_names: HashMap<usize, HashSet<std::ffi::OsString>> = HashMap::new();
+        for e in &self.unavailable {
+            let p = e.relative();
+            if p.as_os_str().is_empty()
+                || e.path.len() > 32767
+                || e.path.contains(&0)
+                || !p
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                || !paths.insert(p.clone())
+                || matches!(e.reason, UnavailableReason::Os(code) if ![5, 32, 33].contains(&code))
+                || matches!(e.reason, UnavailableReason::Changing) && e.listing
+                || e.previous_id == Some(0)
+                || parents.get(p.parent().unwrap()).map(|v| v.0) != Some(e.parent)
+                || e.listing
+                    && (!e.directory || parents.get(p.as_path()).map(|v| v.0) != e.previous_id)
+                || !e.listing && parents.contains_key(p.as_path())
+            {
+                return Err(invalid("미수집 경로와 추적 기준점이 일치하지 않습니다"));
+            }
+            let parent = parents[p.parent().unwrap()].1;
+            blocked_names
+                .entry(parent)
+                .or_default()
+                .insert(p.file_name().unwrap().to_owned());
+            let mut ancestor = Some(parent);
+            while let Some(i) = ancestor {
+                if expected[i] == crate::scanner::FolderAccess::Complete {
+                    expected[i] = crate::scanner::FolderAccess::Partial;
+                }
+                ancestor = scan.folders[i].parent;
+            }
+            if e.listing {
+                expected[parents[p.as_path()].1] = if e.reason == UnavailableReason::Os(5) {
+                    crate::scanner::FolderAccess::Denied
+                } else {
+                    crate::scanner::FolderAccess::Unavailable
+                };
+            }
+        }
+        let unreadable = |i: usize| {
+            matches!(
+                expected[i],
+                crate::scanner::FolderAccess::Denied | crate::scanner::FolderAccess::Unavailable
+            )
+        };
+        if scan
+            .folders
+            .iter()
+            .any(|f| f.parent.is_some_and(unreadable))
+        {
+            return Err(invalid("미확인 폴더 안에 수집된 하위 폴더가 있습니다"));
+        }
+        for f in &scan.files {
+            if f.parent >= scan.folders.len()
+                || unreadable(f.parent)
+                || blocked_names
+                    .get(&f.parent)
+                    .is_some_and(|names| names.contains(&f.name))
+            {
+                return Err(invalid("미수집 경로와 정상 파일 목록이 겹칩니다"));
+            }
+        }
+        if scan
+            .folders
+            .iter()
+            .zip(expected)
+            .any(|(f, expected)| f.access != expected)
+        {
+            return Err(invalid("미수집 목록과 폴더 수집 상태가 일치하지 않습니다"));
+        }
         Ok(())
     }
 }
@@ -206,12 +384,17 @@ impl Index {
     ) -> io::Result<Self> {
         let started = SystemTime::now();
         let journal = source.journal()?;
-        let first = Node::from_info(source.inspect(root, false)?)?;
+        let first = Node::from_info(source.inspect(root, false).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("기준 폴더 확인 [{}]: {e}", root.display()),
+            )
+        })?)?;
         if !first.dir() || first.excluded() {
             return Err(invalid("일반 폴더만 변경 추적할 수 있습니다"));
         }
         let checkpoint = Checkpoint {
-            version: 1,
+            version: 3,
             volume: journal.volume,
             root: first.id,
             journal: journal.id,
@@ -220,20 +403,71 @@ impl Index {
             files: vec![],
             excluded: vec![],
             pending: vec![],
+            unavailable: vec![],
+            confirmed_after: None,
         };
         let mut nodes = BTreeMap::new();
         nodes.insert(PathBuf::new(), first);
-        Self::collect(root, Path::new(""), detailed, source, cancelled, &mut nodes)?;
+        let mut unavailable = BTreeMap::new();
+        Self::collect(
+            root,
+            Path::new(""),
+            detailed,
+            source,
+            cancelled,
+            &mut nodes,
+            &mut unavailable,
+        )?;
         let mut index = Self {
             root: root.to_owned(),
             detailed,
             nodes,
+            unavailable,
             checkpoint,
             scan: None,
             started,
         };
         index.refresh(source, cancelled)?;
         Ok(index)
+    }
+    fn exclude(
+        relative: &Path,
+        reason: UnavailableReason,
+        listing: bool,
+        now: SystemTime,
+        nodes: &mut BTreeMap<PathBuf, Node>,
+        unavailable: &mut BTreeMap<PathBuf, Unavailable>,
+    ) -> io::Result<()> {
+        if relative.as_os_str().is_empty() {
+            return Err(context(relative, reason.error()));
+        }
+        let parent = nodes
+            .get(relative.parent().unwrap())
+            .ok_or_else(|| invalid("미수집 항목의 부모가 없습니다"))?
+            .id;
+        let previous = nodes.get(relative).cloned();
+        let value = Unavailable {
+            path: relative.as_os_str().encode_wide().collect(),
+            parent,
+            previous_id: previous
+                .as_ref()
+                .map(|n| n.id)
+                .or_else(|| unavailable.get(relative).and_then(|e| e.previous_id)),
+            directory: previous.as_ref().is_some_and(Node::dir),
+            reason,
+            listing,
+            checked: now,
+        };
+        match &previous {
+            None => {}
+            Some(node) if !node.dir() => {
+                nodes.remove(relative);
+            }
+            Some(_) => nodes.retain(|p, _| !p.starts_with(relative) || listing && p == relative),
+        }
+        unavailable.retain(|p, _| !p.starts_with(relative));
+        unavailable.insert(relative.to_owned(), value);
+        Ok(())
     }
     fn collect(
         root: &Path,
@@ -242,12 +476,28 @@ impl Index {
         source: &mut impl Source,
         cancelled: &impl Fn() -> bool,
         nodes: &mut BTreeMap<PathBuf, Node>,
+        unavailable: &mut BTreeMap<PathBuf, Unavailable>,
     ) -> io::Result<()> {
         let mut pending = vec![relative.to_owned()];
         while let Some(parent) = pending.pop() {
             crate::output::check(cancelled)?;
             let absolute = root.join(&parent);
-            for path in source.list(&absolute)? {
+            let children = match source.list(&absolute) {
+                Ok(v) => v,
+                Err(e) if !parent.as_os_str().is_empty() && skippable(&e) => {
+                    Self::exclude(
+                        &parent,
+                        UnavailableReason::Os(e.raw_os_error().unwrap()),
+                        true,
+                        source.now(),
+                        nodes,
+                        unavailable,
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(context(&absolute, e)),
+            };
+            for path in children {
                 crate::output::check(cancelled)?;
                 if path.parent() != Some(absolute.as_path()) {
                     return Err(invalid("열거한 항목의 부모 경로가 다릅니다"));
@@ -256,7 +506,23 @@ impl Index {
                     .strip_prefix(root)
                     .map_err(|_| invalid("추적 범위 밖 항목"))?
                     .to_owned();
-                let node = Node::from_info(source.inspect(&path, detailed)?)?;
+                let info = match inspect_present(source, &path, detailed) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,
+                    Err(e) if skippable(&e) => {
+                        Self::exclude(
+                            &rel,
+                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            false,
+                            source.now(),
+                            nodes,
+                            unavailable,
+                        )?;
+                        continue;
+                    }
+                    Err(e) => return Err(context(&path, e)),
+                };
+                let node = Node::from_info(info)?;
                 if node.dir() && !node.excluded() {
                     pending.push(rel.clone());
                 }
@@ -271,7 +537,7 @@ impl Index {
             .as_ref()
             .ok_or_else(|| invalid("저장된 변경 추적 기준점이 없습니다"))?;
         state.validate(&record.scan)?;
-        if record.scan.error_count != 0 {
+        if record.scan.error_count != state.unavailable.len() as u64 {
             return Err(invalid("누락된 결과에서 변경 추적을 이어갈 수 없습니다"));
         }
         let root = record.scan.folders[0].path.clone();
@@ -353,6 +619,11 @@ impl Index {
             root,
             detailed: record.scan.detailed,
             nodes,
+            unavailable: state
+                .unavailable
+                .iter()
+                .map(|e| (e.relative(), e.clone()))
+                .collect(),
             checkpoint: state.clone(),
             scan: Some(Arc::clone(&record.scan)),
             started: record.started,
@@ -374,6 +645,7 @@ impl Index {
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<bool> {
         crate::output::check(cancelled)?;
+        let confirmed_after = source.now();
         let journal = source.journal()?;
         self.verify(&journal)?;
         let root = Node::from_info(source.inspect(&self.root, false)?)?;
@@ -383,7 +655,20 @@ impl Index {
             ));
         }
         let events = source.read(self.checkpoint.next, journal.next)?;
-        if events.is_empty()
+        let now = source.now();
+        let retry_ready: HashSet<_> = self
+            .unavailable
+            .iter()
+            .filter(|(_, e)| {
+                now.duration_since(e.checked)
+                    .is_ok_and(|d| d >= Duration::from_secs(30))
+            })
+            .take(64)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut attempted = HashSet::new();
+        if retry_ready.is_empty()
+            && events.is_empty()
             && self.checkpoint.pending.is_empty()
             && self.nodes[Path::new("")] == root
         {
@@ -395,6 +680,7 @@ impl Index {
             }
             crate::output::check(cancelled)?;
             self.checkpoint.next = journal.next;
+            self.checkpoint.confirmed_after = Some(confirmed_after);
             return Ok(false);
         }
         let mut by_id: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -443,6 +729,13 @@ impl Index {
                 }
             }
         }
+        for p in &retry_ready {
+            if self.unavailable[p].listing && self.nodes.contains_key(p) {
+                directories.insert(p.clone());
+            } else {
+                directories.insert(p.parent().unwrap().to_owned());
+            }
+        }
         for id in &pending {
             if let Some(paths) = by_id.get(id) {
                 for p in paths {
@@ -453,73 +746,205 @@ impl Index {
             }
         }
         let mut next = self.nodes.clone();
+        let mut unavailable = self.unavailable.clone();
         next.insert(PathBuf::new(), root);
+        let mut replacements = HashMap::new();
         let mut directories: Vec<_> = directories.into_iter().collect();
         directories.sort_by_key(|p| p.components().count());
-        for directory in directories {
-            crate::output::check(cancelled)?;
-            if !next
-                .get(&directory)
-                .is_some_and(|n| n.dir() && !n.excluded())
-            {
-                continue;
-            }
-            let absolute = self.root.join(&directory);
-            let current = Node::from_info(source.inspect(&absolute, false)?)?;
-            if current.id != next[&directory].id || !current.dir() || current.excluded() {
-                return Err(invalid("반영 중 상위 폴더가 교체되었습니다"));
-            }
-            next.insert(directory.clone(), current);
-            let children = source.list(&absolute)?;
-            let mut seen = HashSet::new();
-            for path in children {
-                if path.parent() != Some(absolute.as_path()) {
-                    return Err(invalid("열거한 경로가 추적 부모와 다릅니다"));
+        let mut remaining_files = Some(files);
+        // 구조 변경을 먼저 반영하고 남은 파일의 교체만 부모 재확인으로 연결.
+        loop {
+            for directory in std::mem::take(&mut directories) {
+                crate::output::check(cancelled)?;
+                if !next
+                    .get(&directory)
+                    .is_some_and(|n| n.dir() && !n.excluded())
+                {
+                    continue;
                 }
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| invalid("추적 범위 밖 경로"))?
-                    .to_owned();
-                let node = Node::from_info(source.inspect(&path, self.detailed)?)?;
-                seen.insert(rel.clone());
-                let replaced = next.get(&rel).is_none_or(|old| {
-                    old.id != node.id || old.attributes & 0x410 != node.attributes & 0x410
-                });
-                if replaced {
-                    next.retain(|p, _| !p.starts_with(&rel));
+                if unavailable.contains_key(&directory)
+                    && (!retry_ready.contains(&directory) || !attempted.insert(directory.clone()))
+                {
+                    continue;
                 }
-                let descend = replaced && node.dir() && !node.excluded();
-                next.insert(rel.clone(), node);
-                if descend {
-                    Self::collect(
-                        &self.root,
-                        &rel,
-                        self.detailed,
-                        source,
-                        cancelled,
-                        &mut next,
-                    )?;
+                let absolute = self.root.join(&directory);
+                let observed = if directory.as_os_str().is_empty() {
+                    source.inspect(&absolute, false).map(Some)
+                } else {
+                    inspect_present(source, &absolute, false)
+                };
+                let info = match observed {
+                    Ok(Some(v)) => v,
+                    Err(e) if !directory.as_os_str().is_empty() && skippable(&e) => {
+                        Self::exclude(
+                            &directory,
+                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            false,
+                            now,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                        continue;
+                    }
+                    Ok(None) => {
+                        next.retain(|p, _| !p.starts_with(&directory));
+                        unavailable.retain(|p, _| !p.starts_with(&directory));
+                        continue;
+                    }
+                    Err(e) => return Err(context(&absolute, e)),
+                };
+                let current = Node::from_info(info)?;
+                if current.id != next[&directory].id || !current.dir() || current.excluded() {
+                    return Err(invalid(&format!(
+                        "반영 중 상위 폴더가 교체되었습니다 [{}]",
+                        absolute.display()
+                    )));
+                }
+                next.insert(directory.clone(), current);
+                let children = match source.list(&absolute) {
+                    Ok(v) => v,
+                    Err(e) if !directory.as_os_str().is_empty() && skippable(&e) => {
+                        Self::exclude(
+                            &directory,
+                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            true,
+                            now,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                        continue;
+                    }
+                    Err(e) => return Err(context(&absolute, e)),
+                };
+                unavailable.remove(&directory);
+                let mut seen = HashSet::new();
+                for path in children {
+                    crate::output::check(cancelled)?;
+                    if path.parent() != Some(absolute.as_path()) {
+                        return Err(invalid("열거한 경로가 추적 부모와 다릅니다"));
+                    }
+                    let rel = path
+                        .strip_prefix(&self.root)
+                        .map_err(|_| invalid("추적 범위 밖 경로"))?
+                        .to_owned();
+                    seen.insert(rel.clone());
+                    if unavailable.contains_key(&rel)
+                        && (!retry_ready.contains(&rel) || !attempted.insert(rel.clone()))
+                    {
+                        continue;
+                    }
+                    let info = match inspect_present(source, &path, self.detailed) {
+                        Ok(Some(v)) => v,
+                        Err(e) if skippable(&e) => {
+                            Self::exclude(
+                                &rel,
+                                UnavailableReason::Os(e.raw_os_error().unwrap()),
+                                false,
+                                now,
+                                &mut next,
+                                &mut unavailable,
+                            )?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            seen.remove(&rel);
+                            continue;
+                        }
+                        Err(e) => return Err(context(&path, e)),
+                    };
+                    let node = Node::from_info(info)?;
+                    if replacements
+                        .get(&rel)
+                        .is_some_and(|expected| *expected != (node.id, node.attributes & 0x410))
+                    {
+                        Self::exclude(
+                            &rel,
+                            UnavailableReason::Changing,
+                            false,
+                            now,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                        continue;
+                    }
+                    let recovered = unavailable.remove(&rel).is_some();
+                    let replaced = next.get(&rel).is_none_or(|old| {
+                        old.id != node.id || old.attributes & 0x410 != node.attributes & 0x410
+                    });
+                    if replaced {
+                        // 새 경로에는 기존 하위 노드가 없으므로 전체 목록 순회 생략.
+                        if next.contains_key(&rel) {
+                            next.retain(|p, _| !p.starts_with(&rel));
+                        }
+                        unavailable.retain(|p, _| !p.starts_with(&rel));
+                    }
+                    let descend = (replaced || recovered) && node.dir() && !node.excluded();
+                    next.insert(rel.clone(), node);
+                    if descend {
+                        Self::collect(
+                            &self.root,
+                            &rel,
+                            self.detailed,
+                            source,
+                            cancelled,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                    }
+                }
+                let removed: Vec<_> = next
+                    .keys()
+                    .chain(unavailable.keys())
+                    .filter(|p| p.parent() == Some(directory.as_path()) && !seen.contains(*p))
+                    .cloned()
+                    .collect();
+                for p in removed {
+                    next.retain(|key, _| !key.starts_with(&p));
+                    unavailable.retain(|key, _| !key.starts_with(&p));
                 }
             }
-            let removed: Vec<_> = next
-                .keys()
-                .filter(|p| p.parent() == Some(directory.as_path()) && !seen.contains(*p))
-                .cloned()
-                .collect();
-            for p in removed {
-                next.retain(|key, _| !key.starts_with(&p));
+            let Some(files) = remaining_files.take() else {
+                break;
+            };
+            for path in files {
+                crate::output::check(cancelled)?;
+                if !next.contains_key(&path) || next[&path].id != self.nodes[&path].id {
+                    continue;
+                }
+                let absolute = self.root.join(&path);
+                let info = match inspect_present(source, &absolute, self.detailed) {
+                    Ok(Some(v)) => v,
+                    Err(e) if skippable(&e) => {
+                        Self::exclude(
+                            &path,
+                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            false,
+                            now,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                        continue;
+                    }
+                    Ok(None) => {
+                        next.retain(|p, _| !p.starts_with(&path));
+                        unavailable.retain(|p, _| !p.starts_with(&path));
+                        continue;
+                    }
+                    Err(e) => return Err(context(&absolute, e)),
+                };
+                let node = Node::from_info(info)?;
+                if node.id != next[&path].id || node.dir() || node.excluded() {
+                    replacements.insert(path.clone(), (node.id, node.attributes & 0x410));
+                    directories.push(path.parent().unwrap().to_owned());
+                    continue;
+                }
+                next.insert(path, node);
             }
-        }
-        for path in files {
-            crate::output::check(cancelled)?;
-            if !next.contains_key(&path) || next[&path].id != self.nodes[&path].id {
-                continue;
+            if directories.is_empty() {
+                break;
             }
-            let node = Node::from_info(source.inspect(&self.root.join(&path), self.detailed)?)?;
-            if node.id != next[&path].id {
-                return Err(invalid("변경 확인 중 파일이 교체되었습니다"));
-            }
-            next.insert(path, node);
+            directories.sort_by_key(|p| p.components().count());
+            directories.dedup();
         }
         let final_root = Node::from_info(source.inspect(&self.root, false)?)?;
         if final_root.id != self.checkpoint.root || final_root.excluded() {
@@ -531,9 +956,11 @@ impl Index {
             return Err(invalid("반영 중 변경 기록이 유실되었습니다"));
         }
         crate::output::check(cancelled)?;
-        let changed = self.nodes != next;
+        let changed = self.nodes != next || self.unavailable != unavailable;
         self.nodes = next;
+        self.unavailable = unavailable;
         self.checkpoint.next = journal.next;
+        self.checkpoint.confirmed_after = Some(confirmed_after);
         let file_ids: HashSet<_> = self
             .nodes
             .values()
@@ -588,6 +1015,7 @@ impl Index {
                 folders.insert(p.clone(), scan.folders.len());
                 refs.push(n.id);
                 scan.folders.push(Folder {
+                    access: Default::default(),
                     path: self.root.join(p),
                     parent,
                     logical_bytes: 0,
@@ -643,10 +1071,35 @@ impl Index {
                 });
                 files.push(n.id);
             }
+            for (p, e) in &self.unavailable {
+                let parent = *folders
+                    .get(p.parent().unwrap())
+                    .ok_or_else(|| invalid("미수집 경로의 분석 부모가 없습니다"))?;
+                scan.folders[parent].access = crate::scanner::FolderAccess::Partial;
+                if e.listing {
+                    let id = *folders
+                        .get(p)
+                        .ok_or_else(|| invalid("미수집 폴더 ID가 없습니다"))?;
+                    scan.folders[id].access = if e.reason == UnavailableReason::Os(5) {
+                        crate::scanner::FolderAccess::Denied
+                    } else {
+                        crate::scanner::FolderAccess::Unavailable
+                    };
+                }
+                scan.error_count += 1;
+                if scan.issues.len() < 20 {
+                    scan.issues.push(crate::scanner::ScanIssue {
+                        path: self.root.join(p),
+                        error: e.reason.error(),
+                    });
+                }
+            }
             crate::scanner::finish(&mut scan)?;
             self.checkpoint.folders = refs;
             self.checkpoint.files = files;
             self.checkpoint.excluded = excluded;
+            self.checkpoint.unavailable = self.unavailable.values().cloned().collect();
+            self.checkpoint.version = 3;
             self.scan = Some(Arc::new(scan));
         }
         let mut record = SavedScan::new(
@@ -671,9 +1124,21 @@ mod tests {
         root: PathBuf,
         journal: Journal,
         events: Vec<Event>,
+        blocked: Option<PathBuf>,
+        failures: HashMap<PathBuf, i32>,
+        list_failures: HashMap<PathBuf, i32>,
+        clock: SystemTime,
+        queries: Vec<PathBuf>,
+        vanish: Option<PathBuf>,
+        replace_after: Option<(PathBuf, usize)>,
+        not_found_once: Option<PathBuf>,
+        advance_on_journal: Option<Duration>,
     }
     impl Source for Fixture {
         fn journal(&mut self) -> io::Result<Journal> {
+            if let Some(elapsed) = self.advance_on_journal.take() {
+                self.clock += elapsed;
+            }
             Ok(self.journal.clone())
         }
         fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<Event>> {
@@ -684,22 +1149,57 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        fn now(&self) -> SystemTime {
+            self.clock
+        }
         fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+            self.queries.push(path.to_owned());
+            if self.not_found_once.as_deref() == Some(path) {
+                self.not_found_once = None;
+                return Err(io::Error::from_raw_os_error(2));
+            }
+            if let Some((target, remaining)) = &mut self.replace_after {
+                if path == target {
+                    if *remaining == 0 {
+                        fs::rename(path, self.root.join("raced-previous.bin"))?;
+                        fs::write(path, b"999")?;
+                        self.replace_after = None;
+                    } else {
+                        *remaining -= 1;
+                    }
+                }
+            }
+            if self.vanish.as_deref() == Some(path) {
+                self.vanish = None;
+                fs::remove_file(path)?;
+                return Err(io::Error::from_raw_os_error(2));
+            }
+            if let Some(code) = self.failures.get(path) {
+                return Err(io::Error::from_raw_os_error(*code));
+            }
+            if self.blocked.as_deref() == Some(path) {
+                return Err(io::Error::from_raw_os_error(32));
+            }
             crate::ntfs_native::inspect_file(path, detailed, &self.journal.volume)
         }
         fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            if let Some(code) = self.list_failures.get(path) {
+                return Err(io::Error::from_raw_os_error(*code));
+            }
             fs::read_dir(path)?.map(|e| e.map(|e| e.path())).collect()
         }
     }
     impl Fixture {
         fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "diskweave-usn-{}-{}",
+                "diskweave-usn-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir_all(root.join("scope")).unwrap();
             let drive = root.components().take(2).collect::<PathBuf>();
@@ -714,6 +1214,15 @@ mod tests {
                     next: 100,
                 },
                 events: vec![],
+                blocked: None,
+                failures: HashMap::new(),
+                list_failures: HashMap::new(),
+                clock: SystemTime::now(),
+                queries: Vec::new(),
+                vanish: None,
+                replace_after: None,
+                not_found_once: None,
+                advance_on_journal: None,
             }
         }
         fn id(&mut self, path: &Path) -> u64 {
@@ -735,6 +1244,406 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn deletion_between_enumeration_and_inspection_is_confirmed_before_ignoring() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let path = root.join("gone.bin");
+        fs::write(&path, b"1").unwrap();
+        f.vanish = Some(path);
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 0);
+        let bad = root.join("still-present.bin");
+        fs::write(&bad, b"1").unwrap();
+        f.failures.insert(bad, 2);
+        assert!(Index::begin(&root, true, &mut f, &|| false).is_err());
+    }
+    #[test]
+    fn denied_subtree_round_trips_and_recovers_without_claiming_unknown_bytes() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        fs::write(scope.join("data.bin"), b"12345").unwrap();
+        fs::write(f.root.join("ok.bin"), b"123").unwrap();
+        f.list_failures.insert(scope.clone(), 5);
+        let root = f.root.clone();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.error_count, 1);
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+        assert_eq!(
+            record.scan.folders[record.scan.folder_index(Path::new("scope")).unwrap()].access,
+            crate::scanner::FolderAccess::Denied
+        );
+        let mut bytes = Vec::new();
+        crate::snapshot::write_to(&record, &mut bytes, || false).unwrap();
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        corrupt["folders"][0]["access"] = serde_json::json!("Complete");
+        assert!(crate::snapshot::read_from(
+            serde_json::to_vec(&corrupt).unwrap().as_slice(),
+            || false
+        )
+        .is_err());
+        let mut record = crate::snapshot::read_from(bytes.as_slice(), || false).unwrap();
+        let hidden = record.scan.folder_index(Path::new("scope")).unwrap();
+        Arc::get_mut(&mut record.scan).unwrap().files[0].parent = hidden;
+        assert!(record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .is_err());
+        Arc::get_mut(&mut record.scan).unwrap().files[0].parent = 0;
+        let mut resumed = Index::restore(&record).unwrap();
+        let mut bad = record.tracking.clone().unwrap();
+        bad.unavailable[0].parent = 0;
+        assert!(bad.validate(&record.scan).is_err());
+        f.list_failures.clear();
+        f.clock += Duration::from_secs(30);
+        assert!(resumed.refresh(&mut f, &|| false).unwrap());
+        let restored = resumed.snapshot(&|| false).unwrap();
+        assert_eq!(restored.scan.error_count, 0);
+        assert_eq!(restored.scan.folders[0].logical_bytes, 8);
+        restored
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&restored.scan)
+            .unwrap();
+    }
+    #[test]
+    fn successful_confirmation_covers_only_cycles_started_before_the_journal_boundary() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let started = f.clock;
+        f.advance_on_journal = Some(Duration::from_secs(1));
+        assert!(!index.refresh(&mut f, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(
+            record.tracking.as_ref().unwrap().confirmed_after,
+            Some(started)
+        );
+        let before = record.tracking.clone();
+        assert!(index.refresh(&mut f, &|| true).is_err());
+        assert_eq!(index.snapshot(&|| false).unwrap().tracking, before);
+        let mut encoded = Vec::new();
+        crate::snapshot::write_to(&record, &mut encoded, || false).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        legacy["tracking"]
+            .as_object_mut()
+            .unwrap()
+            .remove("confirmed_after");
+        let restored =
+            crate::snapshot::read_from(serde_json::to_vec(&legacy).unwrap().as_slice(), || false)
+                .unwrap();
+        assert_eq!(restored.tracking.unwrap().confirmed_after, None);
+    }
+    #[test]
+    fn a_file_update_and_parent_move_out_in_one_batch_remove_the_subtree() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let folder = scope.join("sub");
+        fs::create_dir(&folder).unwrap();
+        let file = folder.join("data.bin");
+        fs::write(&file, b"123").unwrap();
+        let root_id = f.id(&scope);
+        let folder_id = f.id(&folder);
+        let file_id = f.id(&file);
+        let outside_parent = f.id(&f.root.clone());
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        fs::write(&file, b"12345").unwrap();
+        fs::rename(&folder, f.root.join("outside")).unwrap();
+        f.event(file_id, folder_id, 0x80000003);
+        f.event(folder_id, root_id, 0x80001000);
+        f.event(folder_id, outside_parent, 0x80002000);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 0);
+        assert_eq!(record.scan.folders.len(), 1);
+        assert!(record.scan.files.is_empty());
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+    }
+    #[test]
+    fn transient_not_found_is_reconfirmed_once_when_the_parent_still_lists_the_name() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("racing.bin");
+        fs::write(&file, b"123").unwrap();
+        f.not_found_once = Some(file.clone());
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        assert_eq!(
+            index.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
+            3
+        );
+        assert_eq!(f.queries.iter().filter(|p| **p == file).count(), 2);
+    }
+    #[test]
+    fn atomic_file_replacement_is_reconfirmed_without_reusing_the_old_identity() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("saved.bin");
+        fs::write(&file, b"12345").unwrap();
+        let parent = f.id(&scope);
+        let old = f.id(&file);
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        fs::rename(&file, f.root.join("previous.bin")).unwrap();
+        fs::write(&file, b"123").unwrap();
+        let current = f.id(&file);
+        assert_ne!(old, current);
+        f.event(old, parent, 0x80000001);
+        f.list_failures.insert(scope.clone(), 5);
+        assert!(index.refresh(&mut f, &|| false).is_err());
+        let failed = index.snapshot(&|| false).unwrap();
+        assert_eq!(failed.tracking, before.tracking);
+        assert!(Arc::ptr_eq(&failed.scan, &before.scan));
+        f.list_failures.clear();
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+        assert_eq!(record.tracking.as_ref().unwrap().files, vec![current]);
+        assert_eq!(record.scan.error_count, 0);
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+    }
+    #[test]
+    fn replacement_type_changes_recollect_only_the_confirmed_subtree() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("entry");
+        fs::write(&file, b"12345").unwrap();
+        fs::write(scope.join("entry-other"), b"123").unwrap();
+        let parent = f.id(&scope);
+        let old = f.id(&file);
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        fs::rename(&file, f.root.join("old-file")).unwrap();
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join("payload"), b"1234567").unwrap();
+        let directory = f.id(&file);
+        f.event(old, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(
+            (
+                record.scan.folders[0].logical_bytes,
+                record.scan.folders[0].folder_count
+            ),
+            (10, 1)
+        );
+        fs::rename(&file, f.root.join("old-folder")).unwrap();
+        fs::write(&file, b"12").unwrap();
+        f.event(directory, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(
+            (
+                record.scan.folders[0].logical_bytes,
+                record.scan.folders[0].folder_count
+            ),
+            (5, 0)
+        );
+        assert_eq!(record.scan.files.len(), 2);
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+    }
+    #[test]
+    fn repeated_replacement_is_deferred_and_recovers_after_a_confirmed_retry() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("saved.bin");
+        fs::write(&file, b"12345").unwrap();
+        let parent = f.id(&scope);
+        let old = f.id(&file);
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        fs::rename(&file, f.root.join("previous.bin")).unwrap();
+        fs::write(&file, b"12").unwrap();
+        f.replace_after = Some((file.clone(), 1));
+        f.event(old, parent, 0x80000001);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let pending = index.snapshot(&|| false).unwrap();
+        let reason = &pending.tracking.as_ref().unwrap().unavailable[0].reason;
+        assert_eq!(reason, &UnavailableReason::Changing);
+        assert_eq!(reason.error().raw_os_error(), None);
+        assert!(reason.label().contains("확인 대기"));
+        assert_eq!(pending.scan.error_count, 1);
+        assert_eq!(pending.scan.folders[0].logical_bytes, 0);
+        assert!(pending.scan.files.is_empty());
+        assert_ne!(pending.tracking, before.tracking);
+        let mut bytes = Vec::new();
+        crate::snapshot::write_to(&pending, &mut bytes, || false).unwrap();
+        let record = crate::snapshot::read_from(bytes.as_slice(), || false).unwrap();
+        let mut resumed = Index::restore(&record).unwrap();
+        f.clock += Duration::from_secs(30);
+        resumed.refresh(&mut f, &|| false).unwrap();
+        let recovered = resumed.snapshot(&|| false).unwrap();
+        assert_eq!(recovered.scan.error_count, 0);
+        assert_eq!(recovered.scan.folders[0].logical_bytes, 3);
+    }
+    #[test]
+    fn cancelling_an_exclusion_retry_keeps_the_previous_result_and_cursor() {
+        let mut f = Fixture::new();
+        for i in 0..70 {
+            let path = f.root.join(format!("retry-{i}.bin"));
+            fs::write(&path, b"1").unwrap();
+            f.failures.insert(path, 32);
+        }
+        let root = f.root.clone();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        f.failures.clear();
+        f.queries.clear();
+        f.clock += Duration::from_secs(30);
+        let polls = std::cell::Cell::new(0);
+        assert!(index
+            .refresh(&mut f, &|| {
+                polls.set(polls.get() + 1);
+                polls.get() >= 20
+            })
+            .is_err());
+        assert!(f.queries.len() < 64);
+        let after = index.snapshot(&|| false).unwrap();
+        assert_eq!(after.tracking, before.tracking);
+        assert!(Arc::ptr_eq(&after.scan, &before.scan));
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        assert_eq!(
+            index.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
+            64
+        );
+    }
+    #[test]
+    fn retry_batch_is_bounded_and_root_or_unexpected_failures_still_stop() {
+        let mut f = Fixture::new();
+        for i in 0..70 {
+            let p = f.root.join(format!("locked-{i}.bin"));
+            fs::write(&p, b"1").unwrap();
+            f.failures.insert(p, 33);
+        }
+        let root = f.root.clone();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 70);
+        f.queries.clear();
+        f.clock += Duration::from_secs(30);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        assert_eq!(
+            f.queries
+                .iter()
+                .filter(|p| f.failures.contains_key(*p))
+                .count(),
+            64
+        );
+        f.queries.clear();
+        index.refresh(&mut f, &|| false).unwrap();
+        assert_eq!(
+            f.queries
+                .iter()
+                .filter(|p| f.failures.contains_key(*p))
+                .count(),
+            6
+        );
+        f.failures.insert(root.clone(), 5);
+        assert!(index.refresh(&mut f, &|| false).is_err());
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 70);
+        f.failures.remove(&root);
+        f.failures.insert(root.join("locked-0.bin"), 1117);
+        f.clock += Duration::from_secs(30);
+        assert!(index.refresh(&mut f, &|| false).is_err());
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 70);
+    }
+    #[test]
+    fn excluded_path_deletion_and_replacement_do_not_reuse_the_previous_identity() {
+        let mut f = Fixture::new();
+        let root = f.root.join("scope");
+        let path = root.join("a.bin");
+        fs::write(&path, b"12345").unwrap();
+        let old = f.id(&path);
+        let parent = f.id(&root);
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        f.failures.insert(path.clone(), 32);
+        f.event(old, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        fs::rename(&path, f.root.join("outside.bin")).unwrap();
+        fs::write(&path, b"123").unwrap();
+        f.failures.clear();
+        let new = f.id(&path);
+        assert_ne!(old, new);
+        f.clock += Duration::from_secs(30);
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+        assert_eq!(record.tracking.unwrap().files, vec![new]);
+        f.failures.insert(path.clone(), 5);
+        f.event(new, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        fs::remove_file(&path).unwrap();
+        f.event(new, parent, 0x80000200);
+        index.refresh(&mut f, &|| false).unwrap();
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 0);
+    }
+    #[test]
+    fn live_lock_is_excluded_and_recovers_only_after_the_retry_interval() {
+        let mut f = Fixture::new();
+        let path = f.root.join("live.bin");
+        fs::write(&path, b"12345").unwrap();
+        let id = f.id(&path);
+        let root = f.root.clone();
+        let parent = f.id(&root);
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        f.failures.insert(path.clone(), 32);
+        f.event(id, parent, 0x80000001);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 0);
+        assert_eq!(record.scan.error_count, 1);
+        f.queries.clear();
+        f.clock += Duration::from_secs(5);
+        f.event(id, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        assert!(!f.queries.contains(&path));
+        f.failures.clear();
+        f.clock += Duration::from_secs(25);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 5);
+        assert_eq!(record.scan.error_count, 0);
+    }
+    #[test]
+    fn locked_baseline_item_is_excluded_without_stopping_other_files() {
+        let mut f = Fixture::new();
+        let blocked = f.root.join("locked.bin");
+        fs::write(&blocked, b"fixture").unwrap();
+        fs::write(f.root.join("visible.bin"), b"123").unwrap();
+        f.blocked = Some(blocked);
+        let root = f.root.clone();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+        assert_eq!(record.scan.error_count, 1);
+        assert_eq!(
+            record.scan.folders[0].access,
+            crate::scanner::FolderAccess::Partial
+        );
+        assert!(!record.scan.files.iter().any(|f| f.name == "locked.bin"));
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
     }
     #[test]
     fn scoped_updates_include_incoming_subtrees_and_external_hard_link_writes() {

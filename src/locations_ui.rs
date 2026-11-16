@@ -80,24 +80,31 @@ impl LocationsView {
         &mut self,
         ui: &mut egui::Ui,
         running: bool,
-        current: &str,
+        _current: &str,
     ) -> Option<PathBuf> {
         if !self.drives.started {
             self.drives.refresh();
         }
         self.drives.poll();
-        let label = current
-            .get(..2)
-            .filter(|s| s.ends_with(':'))
-            .unwrap_or("위치");
         let mut path = None;
         ui.add_enabled_ui(!running, |ui| {
-            ui.menu_button(format!("{label}  ▾"), |ui| {
+            ui.menu_button("드라이브 선택", |ui| {
                 if self.drives.running() {
                     ui.label("드라이브 조회 중…");
                 }
                 for drive in &self.drives.entries {
-                    if ui.button(drive.path.display().to_string()).clicked() {
+                    let label = format!(
+                        "{} · {}",
+                        drive.path.display(),
+                        drive
+                            .available
+                            .map(|n| format!(
+                                "여유 {}",
+                                crate::presentation::SizeDisplay::new(n).text
+                            ))
+                            .unwrap_or_else(|| "용량 확인 불가".into())
+                    );
+                    if ui.button(label).clicked() {
                         path = Some(drive.path.clone());
                         ui.close();
                     }
@@ -178,36 +185,9 @@ impl LocationsView {
         self.drives.poll();
         let mut path = None;
         let previous_global = self.global_mode;
-        ui.collapsing("드라이브·분석 위치", |ui| {
-            if ui.button("드라이브 새로고침").clicked() {
-                self.drives.refresh();
-            }
-            for drive in &self.drives.entries {
-                let capacity = drive
-                    .available
-                    .map(|n| format!("여유 {n} B"))
-                    .unwrap_or_else(|| "드라이브 정보를 확인할 수 없습니다".into());
-                if ui
-                    .add_enabled(
-                        !locations.is_running(),
-                        egui::Button::new(format!(
-                            "{} · {} · {capacity}",
-                            drive.path.display(),
-                            if drive.kind == 2 {
-                                "이동식"
-                            } else {
-                                "고정"
-                            }
-                        )),
-                    )
-                    .clicked()
-                {
-                    path = Some(drive.path.clone());
-                }
-            }
-            if let Some(error) = &self.drives.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            }
+        ui.scope(|ui| {
+            ui.strong("등록한 분석 위치");
+            ui.small("목록에서 제거해도 원본 파일은 삭제되지 않습니다.");
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
@@ -265,8 +245,6 @@ impl LocationsView {
                         } else {
                             "스캔 실패 · 결과 없음"
                         }
-                    } else if entry.restored {
-                        "저장된 목록 · 갱신 필요"
                     } else if entry.scan.completed().is_some() {
                         "스캔 완료"
                     } else {
@@ -294,7 +272,9 @@ impl LocationsView {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
         });
-        ui.checkbox(&mut self.global_mode, "모든 분석 위치 검색");
+        if locations.snapshots().len() > 1 || self.global_mode {
+            ui.checkbox(&mut self.global_mode, "모든 스캔 위치에서 검색");
+        }
         if previous_global != self.global_mode {
             self.live_selection = None;
             self.selection.clear();
@@ -458,6 +438,7 @@ impl LocationsView {
                             }
                         }
                         response.context_menu(|ui| {
+                            crate::ui_style::menu_spacing(ui);
                             if ui.button("선택한 경로 복사").clicked() {
                                 let paths: Vec<_> = self
                                     .selection
@@ -501,7 +482,9 @@ impl LocationsView {
                             }
                             ui.separator();
                             ui.add_enabled_ui(self.selection.count() == 1, |ui| {
-                                if ui.button("용량 분석으로 이동").clicked() {
+                                if crate::ui_style::menu_action(ui, "용량 분석으로 이동", true)
+                                    .clicked()
+                                {
                                     analyze = Some((source.id, source.generation, hit.item));
                                     ui.close();
                                 }
@@ -515,7 +498,8 @@ impl LocationsView {
                                     ui.close();
                                 }
                                 if matches!(hit.item, Item::File(_))
-                                    && ui.button("파일 위치 열기").clicked()
+                                    && crate::ui_style::menu_action(ui, "파일 위치 열기", true)
+                                        .clicked()
                                 {
                                     open = Some(OpenRequest::for_item(
                                         &source.scan,

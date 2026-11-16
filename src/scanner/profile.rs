@@ -22,13 +22,8 @@ pub enum Stage {
     WorkerIdle,
     Finish,
     MetadataTask,
-    MftRead,
-    MftMerge,
-    MftCompact,
-    MftNormalize,
-    MftGraph,
 }
-const N: usize = 19;
+const N: usize = 14;
 #[allow(dead_code, reason = "개발 도구의 보고서에서만 사용하는 단계 이름")]
 const NAMES: [&str; N] = [
     "overall",
@@ -45,11 +40,6 @@ const NAMES: [&str; N] = [
     "worker_idle",
     "finish",
     "metadata_task",
-    "mft_read",
-    "mft_merge",
-    "mft_compact",
-    "mft_normalize",
-    "mft_graph",
 ];
 static ALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 thread_local! {

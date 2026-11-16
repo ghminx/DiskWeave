@@ -29,10 +29,12 @@ struct Active {
 }
 #[derive(Default)]
 pub struct Controller {
-    progress: Arc<Mutex<(crate::engine::Progress, Option<SystemTime>)>>,
+    progress: Arc<Mutex<crate::engine::Progress>>,
     pub location: Option<u64>,
     pub status: Status,
     pub checked: Option<SystemTime>,
+    pub confirmed_after: Option<SystemTime>,
+    pub excluded: usize,
     active: Option<Active>,
 }
 impl Controller {
@@ -44,7 +46,7 @@ impl Controller {
         resume: Option<Arc<SavedScan>>,
     ) -> io::Result<()> {
         crate::usn_native::target(&root)?;
-        let progress = Arc::new(Mutex::new((crate::engine::Progress::default(), None)));
+        let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
         let worker_progress = Arc::clone(&progress);
         self.start_with(
             id,
@@ -53,11 +55,7 @@ impl Controller {
             resume,
             move |root, detailed, resume, cancel, publish| {
                 crate::ntfs_helper::watch(root, detailed, resume, cancel, publish, |event| {
-                    let mut state = worker_progress.lock().unwrap();
-                    if event.stage == crate::engine::Stage::Basic {
-                        state.1 = Some(SystemTime::now());
-                    }
-                    state.0 = event;
+                    *worker_progress.lock().unwrap() = event;
                 })
             },
         )?;
@@ -104,7 +102,9 @@ impl Controller {
         });
         self.location = Some(id);
         self.checked = None;
+        self.confirmed_after = None;
         self.status = Status::Starting;
+        self.excluded = 0;
         self.active = Some(Active {
             cancel,
             output,
@@ -124,11 +124,6 @@ impl Controller {
     }
     pub fn poll(&mut self) -> Option<SavedScan> {
         let active = self.active.as_ref()?;
-        if matches!(self.status, Status::Following) {
-            if let Some(checked) = self.progress.lock().unwrap().1.take() {
-                self.checked = Some(checked);
-            }
-        }
         let mut output = active.output.lock().unwrap();
         let record = output.record.take();
         let mut finish = output.finished.take();
@@ -145,7 +140,9 @@ impl Controller {
             valid
         });
         if let Some(record) = &record {
+            self.excluded = record.tracking.as_ref().map_or(0, |c| c.unavailable.len());
             self.checked = Some(record.finished);
+            self.confirmed_after = record.tracking.as_ref().unwrap().confirmed_after;
             self.status = Status::Following;
         }
         if let Some(result) = finish {
@@ -165,16 +162,18 @@ impl Controller {
         match &self.status {
             Status::Stopped => "실시간 갱신 중지됨",
             Status::Starting => "권한 승인·기준 수집·변경 내용 확인 중…",
+            Status::Following if self.excluded > 0 && self.applying() => "변경 반영 중 · 일부 제외",
+            Status::Following if self.excluded > 0 => "갱신 중 · 일부 제외",
             Status::Following if self.applying() => "변경 내용 반영 중",
             Status::Following => "변경 확인 중",
             Status::Failed(_) => "실시간 갱신 중단 · 갱신 필요",
         }
     }
     pub fn applying(&self) -> bool {
-        self.running() && self.progress.lock().unwrap().0.stage == crate::engine::Stage::Metadata
+        self.running() && self.progress.lock().unwrap().stage == crate::engine::Stage::Metadata
     }
     pub fn progress(&self) -> crate::scanner::ScanProgress {
-        self.progress.lock().unwrap().0.counts
+        self.progress.lock().unwrap().counts
     }
 }
 impl Drop for Controller {
@@ -210,8 +209,71 @@ mod tests {
             files: vec![],
             excluded: vec![],
             pending: vec![],
+            unavailable: vec![],
+            confirmed_after: None,
         });
         r
+    }
+    #[test]
+    fn partial_following_state_is_visible_and_bad_records_do_not_replace_it() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-partial-ui-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut value = record(&root);
+        let scan = Arc::get_mut(&mut value.scan).unwrap();
+        scan.error_count = 1;
+        scan.folders[0].access = crate::scanner::FolderAccess::Partial;
+        let state = value.tracking.as_mut().unwrap();
+        state.version = 3;
+        state.unavailable.push(crate::usn::Unavailable {
+            path: "locked.bin".encode_utf16().collect(),
+            parent: 1,
+            previous_id: None,
+            directory: false,
+            reason: crate::usn::UnavailableReason::Os(32),
+            listing: false,
+            checked: SystemTime::now(),
+        });
+        let cleanup = root.clone();
+        let (publish_bad, wait_bad) = mpsc::channel();
+        let mut controller = Controller::default();
+        controller
+            .start_with(
+                1,
+                root.clone(),
+                false,
+                None,
+                move |_, _, _, cancel, publish| {
+                    publish(value);
+                    wait_bad.recv().unwrap();
+                    let mut bad = record(&root);
+                    bad.tracking.as_mut().unwrap().root = 0;
+                    publish(bad);
+                    while !cancel() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if controller.poll().is_some() {
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(controller.label().contains("일부 제외"));
+        publish_bad.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !matches!(controller.status, Status::Failed(_)) {
+            assert!(controller.poll().is_none());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        controller.stop();
+        fs::remove_dir_all(cleanup).unwrap();
     }
     #[test]
     fn tracking_start_stop_and_late_responses_cannot_replace_the_current_session() {

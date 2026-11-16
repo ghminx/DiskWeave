@@ -183,6 +183,7 @@ impl MapView {
                     event = Some(MapEvent::Pick(row));
                 }
                 response.context_menu(|ui| {
+                    crate::ui_style::menu_spacing(ui);
                     if ui.button("경로 복사").clicked() {
                         let path =
                             crate::search::item_path(&output.sources[hit.source].scan, hit.item);
@@ -195,7 +196,8 @@ impl MapView {
                             ui.close();
                         }
                     }
-                    if ui.button("용량 분석으로 이동").clicked() {
+                    if crate::ui_style::menu_action(ui, "용량 분석으로 이동", true).clicked()
+                    {
                         event = Some(MapEvent::Analyze(row));
                         ui.close();
                     }
@@ -217,7 +219,8 @@ impl MapView {
                         ));
                         ui.close();
                     }
-                    if matches!(hit.item, Item::File(_)) && ui.button("파일 위치 열기").clicked()
+                    if matches!(hit.item, Item::File(_))
+                        && crate::ui_style::menu_action(ui, "파일 위치 열기", true).clicked()
                     {
                         event = Some(MapEvent::Open(row, OpenAction::RevealFile));
                         ui.close();

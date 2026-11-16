@@ -267,7 +267,6 @@ pub(super) fn scan_observed<'a>(
                                         index,
                                         path: result.folders[f.parent].path.join(&f.name),
                                         identity: f.extra.identity.value(),
-                                        logical_bytes: f.logical_bytes,
                                         allocation: f.extra.allocation.value(),
                                     }
                                 })
@@ -307,6 +306,7 @@ pub(super) fn scan_observed<'a>(
                                 Ok(v) => v,
                                 Err((path, e)) => {
                                     preview.error(parent);
+                                    result.folders[parent].access = super::FolderAccess::Partial;
                                     result.record_error(path, e);
                                     continue;
                                 }
@@ -319,6 +319,7 @@ pub(super) fn scan_observed<'a>(
                             if m.attributes & 0x10 != 0 {
                                 preview.folder(Some(parent), path.file_name().unwrap());
                                 result.folders.push(Folder {
+                                    access: Default::default(),
                                     allocation: Default::default(),
                                     created: m.created,
                                     attributes: m.attributes,
@@ -376,6 +377,12 @@ pub(super) fn scan_observed<'a>(
                             }
                             Err(e) => {
                                 preview.error(index);
+                                result.folders[index].access =
+                                    if e.kind() == io::ErrorKind::PermissionDenied {
+                                        super::FolderAccess::Denied
+                                    } else {
+                                        super::FolderAccess::Unavailable
+                                    };
                                 result.record_error(result.folders[index].path.clone(), e);
                             }
                         }

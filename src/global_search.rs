@@ -1,6 +1,6 @@
 use crate::explorer::Item;
 use crate::locations::Snapshot;
-use crate::search::{item_bytes, item_modified, item_name, item_path, SearchInput, SortField};
+use crate::search::{SearchInput, SortKey};
 use std::io;
 use std::sync::Arc;
 
@@ -21,46 +21,26 @@ pub fn search_all(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<GlobalResults> {
     let query = input.compile(0)?;
-    let mut hits = Vec::new();
+    let mut keyed = Vec::new();
     let mut unknown_dates = 0;
     for (source, snapshot) in sources.iter().enumerate() {
-        let result = crate::search::search(&snapshot.scan, &query, &cancelled)?;
+        let result = crate::search::matching(&snapshot.scan, &query, &cancelled)?;
         unknown_dates += result.unknown_dates;
-        hits.extend(result.items.into_iter().map(|item| Hit { source, item }));
+        for item in result.items {
+            crate::output::check(&cancelled)?;
+            keyed.push((
+                Hit { source, item },
+                SortKey::new(&snapshot.scan, item, input.sort),
+            ));
+        }
     }
-    hits.sort_unstable_by(|a, b| {
-        let left = &sources[a.source].scan;
-        let right = &sources[b.source].scan;
-        let order = match input.sort {
-            SortField::Size => item_bytes(left, a.item).cmp(&item_bytes(right, b.item)),
-            SortField::Name => item_name(left, a.item)
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&item_name(right, b.item).to_string_lossy().to_lowercase()),
-            SortField::Path => item_path(left, a.item).cmp(&item_path(right, b.item)),
-            SortField::Modified => item_modified(left, a.item).cmp(&item_modified(right, b.item)),
-        };
-        let missing = if input.sort == SortField::Modified {
-            item_modified(left, a.item)
-                .is_none()
-                .cmp(&item_modified(right, b.item).is_none())
-        } else {
-            std::cmp::Ordering::Equal
-        };
-        missing
-            .then(if input.descending {
-                order.reverse()
-            } else {
-                order
-            })
-            .then_with(|| item_path(left, a.item).cmp(&item_path(right, b.item)))
-    });
+    keyed.sort_unstable_by(|a, b| a.1.compare(&b.1, input.descending, false));
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
     }
     Ok(GlobalResults {
         sources,
-        hits,
+        hits: keyed.into_iter().map(|(hit, _)| hit).collect(),
         unknown_dates,
     })
 }
@@ -148,6 +128,101 @@ impl Drop for GlobalController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::SortField;
+    #[test]
+    fn sorting_across_locations_preserves_case_folding_path_ties_and_unknown_dates() {
+        use crate::search::{item_path, EntryKind};
+        let root =
+            std::env::temp_dir().join(format!("diskweave-global-sort-{}", std::process::id()));
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        for (path, bytes) in [
+            ("a/alpha.bin", 3),
+            ("a/Beta.bin", 7),
+            ("b/ALPHA.bin", 5),
+            ("b/gamma.bin", 7),
+        ] {
+            std::fs::write(root.join(path), vec![0; bytes]).unwrap();
+        }
+        let sources: Vec<_> = ["a", "b"]
+            .into_iter()
+            .enumerate()
+            .map(|(id, name)| {
+                let mut scan = crate::scanner::scan(&root.join(name), || false).unwrap();
+                for file in &mut scan.files {
+                    file.modified = match file.name.to_str().unwrap() {
+                        "alpha.bin" => {
+                            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+                        }
+                        "ALPHA.bin" => {
+                            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2))
+                        }
+                        _ => None,
+                    };
+                }
+                Snapshot {
+                    id: id as u64,
+                    generation: 1,
+                    scan: Arc::new(scan),
+                }
+            })
+            .collect();
+        for (sort, ascending, descending) in [
+            (
+                SortField::Name,
+                ["a/alpha.bin", "b/ALPHA.bin", "a/Beta.bin", "b/gamma.bin"],
+                ["b/gamma.bin", "a/Beta.bin", "a/alpha.bin", "b/ALPHA.bin"],
+            ),
+            (
+                SortField::Path,
+                ["a/Beta.bin", "a/alpha.bin", "b/ALPHA.bin", "b/gamma.bin"],
+                ["b/gamma.bin", "b/ALPHA.bin", "a/alpha.bin", "a/Beta.bin"],
+            ),
+            (
+                SortField::Size,
+                ["a/alpha.bin", "b/ALPHA.bin", "a/Beta.bin", "b/gamma.bin"],
+                ["a/Beta.bin", "b/gamma.bin", "b/ALPHA.bin", "a/alpha.bin"],
+            ),
+            (
+                SortField::Modified,
+                ["a/alpha.bin", "b/ALPHA.bin", "a/Beta.bin", "b/gamma.bin"],
+                ["b/ALPHA.bin", "a/alpha.bin", "a/Beta.bin", "b/gamma.bin"],
+            ),
+        ] {
+            for (descending, expected) in [(false, ascending), (true, descending)] {
+                let result = search_all(
+                    sources.clone(),
+                    &SearchInput {
+                        kind: EntryKind::Files,
+                        sort,
+                        descending,
+                        ..Default::default()
+                    },
+                    || false,
+                )
+                .unwrap();
+                let paths: Vec<_> = result
+                    .hits
+                    .iter()
+                    .map(|hit| item_path(&result.sources[hit.source].scan, hit.item))
+                    .collect();
+                assert_eq!(
+                    paths,
+                    expected.map(|p| root.join(p)),
+                    "{sort:?} descending={descending}"
+                );
+            }
+        }
+        assert_eq!(
+            search_all(sources, &SearchInput::default(), || true)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn global_controller_only_publishes_latest_request_and_reports_errors() {
         use std::time::{Duration, Instant};

@@ -14,7 +14,30 @@ use std::time::SystemTime;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const MAX_REPORTED_ERRORS: usize = 20;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FolderAccess {
+    #[default]
+    Complete,
+    Partial,
+    Denied,
+    Unavailable,
+}
+impl FolderAccess {
+    pub fn unreadable(self) -> bool {
+        matches!(self, Self::Denied | Self::Unavailable)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "",
+            Self::Partial => "일부 누락",
+            Self::Denied => "접근 불가",
+            Self::Unavailable => "조회 실패",
+        }
+    }
+}
+
 pub struct Folder {
+    pub access: FolderAccess,
     pub allocation: crate::metadata::Allocation,
     pub created: Option<SystemTime>,
     pub attributes: u32,
@@ -97,13 +120,14 @@ impl ScanResult {
             .iter()
             .enumerate()
             .filter(|(_, folder)| {
-                folder
-                    .path
-                    .file_name()
-                    .unwrap_or(folder.path.as_os_str())
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&query)
+                !folder.access.unreadable()
+                    && folder
+                        .path
+                        .file_name()
+                        .unwrap_or(folder.path.as_os_str())
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
             })
             .map(|(index, _)| index)
             .collect();
@@ -150,11 +174,7 @@ pub struct MetadataRequest {
     pub attributes: u32,
     pub index: usize,
     pub path: PathBuf,
-    #[allow(dead_code, reason = "개발용 파일 ID 조회 후보에 열거 출처 전달")]
     pub identity: Option<crate::metadata::Identity>,
-    #[allow(dead_code, reason = "개발용 MFT 조합에서 현재 열거와 크기/할당량 대조")]
-    pub logical_bytes: u64,
-    #[allow(dead_code, reason = "개발용 MFT 조합에서 현재 열거와 크기/할당량 대조")]
     pub allocation: Option<u64>,
 }
 pub trait MetadataProbe: Sync {
@@ -416,6 +436,12 @@ pub fn scan_with_probe(
                 if folder_index == 0 {
                     return Err(error);
                 }
+                result.folders[folder_index].access =
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        FolderAccess::Denied
+                    } else {
+                        FolderAccess::Unavailable
+                    };
                 result.record_error(path, error);
                 continue;
             }
@@ -431,6 +457,7 @@ pub fn scan_with_probe(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
+                    result.folders[folder_index].access = FolderAccess::Partial;
                     result.record_error(path.clone(), error);
                     break;
                 }
@@ -440,6 +467,7 @@ pub fn scan_with_probe(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    result.folders[folder_index].access = FolderAccess::Partial;
                     result.record_error(entry_path, error);
                     continue;
                 }
@@ -451,6 +479,7 @@ pub fn scan_with_probe(
                 match fs::symlink_metadata(&entry_path) {
                     Ok(metadata) => metadata,
                     Err(error) => {
+                        result.folders[folder_index].access = FolderAccess::Partial;
                         result.record_error(entry_path, error);
                         continue;
                     }
@@ -465,6 +494,7 @@ pub fn scan_with_probe(
             } else if metadata.is_dir() {
                 let child_index = result.folders.len();
                 result.folders.push(Folder {
+                    access: Default::default(),
                     allocation: Default::default(),
                     created: metadata.created().ok(),
                     attributes: metadata.file_attributes(),
@@ -542,6 +572,7 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
         metadata_error_count: 0,
         metadata_issues: Vec::new(),
         folders: vec![Folder {
+            access: Default::default(),
             allocation: Default::default(),
             created: metadata.created().ok(),
             attributes: metadata.file_attributes(),
@@ -568,6 +599,9 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
         let (parents, child_and_later) = result.folders.split_at_mut(child_index);
         let child = &child_and_later[0];
         let parent = &mut parents[child.parent.expect("루트 외 폴더의 부모")];
+        if child.access != FolderAccess::Complete {
+            parent.access = FolderAccess::Partial;
+        }
         parent.allocation.merge(child.allocation)?;
         parent.logical_bytes = parent
             .logical_bytes
@@ -582,6 +616,11 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
         parent.folder_count += child.folder_count + 1;
     }
 
+    for folder in &mut result.folders {
+        if folder.access.unreadable() && (folder.file_count > 0 || folder.folder_count > 0) {
+            folder.access = FolderAccess::Partial;
+        }
+    }
     result.children = vec![Vec::new(); result.folders.len()];
     result.file_children = vec![Vec::new(); result.folders.len()];
     for (index, file) in result.files.iter().enumerate() {
@@ -662,9 +701,7 @@ mod tests {
                 stop: &std::sync::atomic::AtomicBool,
             ) -> Vec<crate::metadata::Report> {
                 assert!(requests.iter().all(|r| r.identity.is_some()));
-                assert!(requests
-                    .iter()
-                    .all(|r| r.logical_bytes == 3 && r.allocation.is_some()));
+                assert!(requests.iter().all(|r| r.allocation.is_some()));
                 self.maximum.fetch_max(requests.len(), Ordering::SeqCst);
                 requests
                     .iter()
@@ -1756,7 +1793,8 @@ mod tests {
 #[path = "scanner/preview.rs"]
 pub mod preview;
 
-/// 중간 폴더 갱신과 완료 결과를 분리하여 전달하는 GUI 수집 경계.
+/// 과거 수집 모드의 미리보기 계약 검증용 수집.
+#[cfg(test)]
 pub fn scan_preview<'a>(
     root: &Path,
     detailed: bool,

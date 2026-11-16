@@ -9,9 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Location {
-    checkpoint_written: Option<std::time::Instant>,
-    pub checkpoint_revision: u64,
-    pub restored: bool,
     pub id: u64,
     pub path: PathBuf,
     identity: PathBuf,
@@ -40,8 +37,7 @@ impl Snapshot {
 }
 #[derive(Default)]
 pub struct Locations {
-    removed: Vec<PathBuf>,
-    settings: crate::metadata::ScanSettings,
+    parallelism: crate::scanner::Parallelism,
     pub entries: Vec<Location>,
     next_id: u64,
     selected: Option<u64>,
@@ -108,26 +104,16 @@ impl Locations {
             ));
         }
         entry.scan = ScanController::from_saved(record);
-        entry.restored = false;
         entry.stale = false;
         entry.generation += 1;
-        entry.checkpoint_revision += 1;
         self.epoch += 1;
         Ok(true)
     }
-    /// 검증된 추적 완료 결과를 게시하고 화면 세대와 저장 기준점 변경을 분리.
+    /// 검증된 추적 결과와 기준점을 함께 교체하고 화면 변경 시에만 세대 갱신.
     pub fn accept_tracking(
         &mut self,
         id: u64,
         record: &crate::snapshot::SavedScan,
-    ) -> io::Result<bool> {
-        self.accept_tracking_at(id, record, std::time::Instant::now())
-    }
-    pub fn accept_tracking_at(
-        &mut self,
-        id: u64,
-        record: &crate::snapshot::SavedScan,
-        now: std::time::Instant,
     ) -> io::Result<bool> {
         let entry = self
             .entries
@@ -153,19 +139,9 @@ impl Locations {
             .scan
             .completed()
             .is_none_or(|old| !Arc::ptr_eq(&old.result, &record.scan));
-        let state_changed = entry.stale || entry.restored;
+        let state_changed = entry.stale;
         entry.scan = ScanController::from_saved(record);
-        entry.restored = false;
         entry.stale = false;
-        if changed
-            || state_changed
-            || entry
-                .checkpoint_written
-                .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(60))
-        {
-            entry.checkpoint_revision += 1;
-            entry.checkpoint_written = Some(now);
-        }
         if changed {
             entry.generation += 1;
         }
@@ -173,14 +149,6 @@ impl Locations {
             self.epoch += 1;
         }
         Ok(changed)
-    }
-    pub fn flush_tracking_checkpoint(&mut self, id: u64) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
-            if entry.scan.completed().is_some_and(|c| c.tracking.is_some()) {
-                entry.checkpoint_revision += 1;
-                entry.checkpoint_written = Some(std::time::Instant::now());
-            }
-        }
     }
     pub fn tracking_failed(&mut self, id: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
@@ -193,20 +161,7 @@ impl Locations {
     pub fn from_saved(record: &crate::snapshot::SavedScan) -> Self {
         let path = record.scan.folders[0].path.clone();
         Self {
-            settings: crate::metadata::ScanSettings {
-                parallelism: Default::default(),
-                detailed: true,
-                method: record.engine.as_ref().map_or_default(|r| r.requested),
-                fast_mode: record
-                    .engine
-                    .as_ref()
-                    .and_then(|r| r.fast_mode)
-                    .unwrap_or_default(),
-            },
             entries: vec![Location {
-                restored: false,
-                checkpoint_revision: 0,
-                checkpoint_written: None,
                 id: 1,
                 identity: path.clone(),
                 path,
@@ -221,111 +176,8 @@ impl Locations {
             ..Default::default()
         }
     }
-    pub fn export_catalog(&self) -> crate::index_store::Catalog {
-        crate::index_store::Catalog {
-            selected: self.selected,
-            locations: self
-                .entries
-                .iter()
-                .map(|e| crate::index_store::CachedLocation {
-                    id: e.id,
-                    path: e.path.clone(),
-                    identity: e.identity.clone(),
-                    enabled: e.enabled,
-                    stale: e.stale,
-                    generation: e.generation,
-                    record: e.scan.completed().map(|c| Arc::new(c.saved_result())),
-                })
-                .collect(),
-        }
-    }
-    /// 원본 경로를 조회하지 않고 저장 목록을 병합하되 이번 실행의 완료 결과 유지.
-    pub fn restore_catalog(&mut self, catalog: &crate::index_store::Catalog) -> io::Result<bool> {
-        let before = self
-            .selected
-            .and_then(|id| self.get(id))
-            .and_then(|e| e.scan.completed().map(|_| (e.id, e.generation)));
-        let was_empty = self.entries.is_empty();
-        let mut selection = None;
-        for c in &catalog.locations {
-            let mut removed = false;
-            for identity in &self.removed {
-                if contains_path(identity, &c.identity)? && contains_path(&c.identity, identity)? {
-                    removed = true;
-                    break;
-                }
-            }
-            if removed {
-                continue;
-            }
-            let mut overlap = None;
-            for (i, e) in self.entries.iter().enumerate() {
-                if contains_path(&e.identity, &c.identity)?
-                    || contains_path(&c.identity, &e.identity)?
-                {
-                    overlap = Some(i);
-                    break;
-                }
-            }
-            let id = if let Some(i) = overlap {
-                let e = &mut self.entries[i];
-                let exact = contains_path(&e.path, &c.path)? && contains_path(&c.path, &e.path)?;
-                if exact && (e.scan.completed().is_none() || (e.restored && !e.scan.is_running())) {
-                    if let Some(record) = &c.record {
-                        if e.scan.is_running() {
-                            e.scan.seed_saved(record);
-                        } else {
-                            e.scan = ScanController::from_saved(record);
-                        }
-                        e.restored = true;
-                        e.stale |= c.stale;
-                        e.generation += 1;
-                        self.epoch += 1;
-                    }
-                }
-                if !exact {
-                    continue;
-                }
-                e.id
-            } else {
-                self.next_id = self
-                    .next_id
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
-                let scan = c
-                    .record
-                    .as_ref()
-                    .map_or_else(ScanController::default, |r| ScanController::from_saved(r));
-                self.entries.push(Location {
-                    restored: c.record.is_some(),
-                    checkpoint_revision: 0,
-                    checkpoint_written: None,
-                    id: self.next_id,
-                    path: c.path.clone(),
-                    identity: c.identity.clone(),
-                    scan,
-                    stale: c.stale,
-                    enabled: c.enabled,
-                    generation: u64::from(c.record.is_some()),
-                });
-                self.epoch += 1;
-                self.next_id
-            };
-            if catalog.selected == Some(c.id) {
-                selection = Some(id);
-            }
-        }
-        if was_empty {
-            self.selected = selection.or_else(|| self.entries.first().map(|e| e.id));
-        }
-        let after = self
-            .selected
-            .and_then(|id| self.get(id))
-            .and_then(|e| e.scan.completed().map(|_| (e.id, e.generation)));
-        Ok(before != after)
-    }
     pub fn parallelism(&self) -> crate::scanner::Parallelism {
-        self.settings.parallelism
+        self.parallelism
     }
     pub fn configure_parallelism(&mut self, value: crate::scanner::Parallelism) -> io::Result<()> {
         if self.is_running() {
@@ -333,53 +185,13 @@ impl Locations {
                 "스캔 중에는 동시 작업 수를 변경할 수 없습니다",
             ));
         }
-        self.settings.parallelism = value;
-        Ok(())
-    }
-    pub fn method(&self) -> crate::engine::Method {
-        self.settings.method
-    }
-    pub fn fast_mode(&self) -> crate::engine::FastMode {
-        self.settings.fast_mode
-    }
-    pub fn configure_fast_mode(&mut self, mode: crate::engine::FastMode) -> io::Result<()> {
-        if self.is_running() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "스캔 중에는 고속 수집 방식을 변경할 수 없습니다",
-            ));
-        }
-        self.settings.fast_mode = mode;
-        Ok(())
-    }
-    pub fn configure_method(&mut self, method: crate::engine::Method) -> io::Result<()> {
-        if self.is_running() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "스캔 중에는 방식을 변경할 수 없습니다",
-            ));
-        }
-        self.settings.method = method;
+        self.parallelism = value;
         Ok(())
     }
     pub fn stage(&self) -> Option<crate::engine::Stage> {
         self.active
             .and_then(|id| self.get(id))
             .and_then(|e| e.scan.stage())
-    }
-    pub fn details_requested(&self) -> bool {
-        self.settings.detailed
-    }
-    #[cfg(test)]
-    pub fn configure(&mut self, detailed: bool) -> io::Result<()> {
-        if self.is_running() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "수집 중에는 방식을 변경할 수 없습니다",
-            ));
-        }
-        self.settings.detailed = detailed;
-        Ok(())
     }
     pub fn add(&mut self, path: &Path) -> io::Result<u64> {
         let metadata = std::fs::symlink_metadata(path)?;
@@ -405,9 +217,6 @@ impl Locations {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
         self.entries.push(Location {
-            restored: false,
-            checkpoint_revision: 0,
-            checkpoint_written: None,
             id: self.next_id,
             path: std::path::absolute(path)?,
             identity,
@@ -435,7 +244,6 @@ impl Locations {
             .iter()
             .position(|entry| entry.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "등록 위치가 없습니다"))?;
-        self.removed.push(self.entries[index].identity.clone());
         self.entries.remove(index);
         self.epoch += 1;
         if self.selected == Some(id) {
@@ -516,20 +324,8 @@ impl Locations {
                 .expect("등록된 대기 위치");
             entry
                 .scan
-                .configure_parallelism(self.settings.parallelism)
+                .configure_parallelism(self.parallelism)
                 .expect("대기 위치의 동시 작업 설정");
-            entry
-                .scan
-                .configure(self.settings.detailed)
-                .expect("대기 중인 위치의 수집 설정");
-            entry
-                .scan
-                .configure_method(self.settings.method)
-                .expect("대기 중인 위치의 스캔 방식");
-            entry
-                .scan
-                .configure_fast_mode(self.settings.fast_mode)
-                .expect("대기 위치의 고속 수집 방식");
             entry
                 .scan
                 .start(entry.path.clone())
@@ -547,7 +343,6 @@ impl Locations {
                 .expect("활성 등록 위치");
             if entry.scan.poll() {
                 entry.stale = false;
-                entry.restored = false;
                 entry.generation += 1;
                 self.epoch += 1;
                 changed |= self.selected == Some(id);
@@ -649,11 +444,7 @@ mod tests {
             std::path::absolute(root.join("first")).unwrap()
         );
         assert!(locations.snapshots().is_empty());
-        assert!(locations
-            .export_catalog()
-            .locations
-            .iter()
-            .all(|e| e.record.is_none()));
+        assert!(locations.snapshots().is_empty());
         assert_eq!(locations.get(first).unwrap().generation, 0);
         locations.choose(second);
         assert!(locations.preview().is_none());
@@ -678,7 +469,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn accepted_tracking_checkpoints_are_saved_even_when_the_visible_data_is_unchanged() {
+    fn tracking_cursor_updates_preserve_visible_generation_without_losing_the_checkpoint() {
         let root =
             std::env::temp_dir().join(format!("diskweave-tracked-location-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -701,28 +492,37 @@ mod tests {
             files: vec![],
             excluded: vec![],
             pending: vec![],
+            unavailable: vec![],
+            confirmed_after: None,
         });
-        let now = std::time::Instant::now();
-        assert!(locations.accept_tracking_at(id, &record, now).unwrap());
+        assert!(locations.accept_tracking(id, &record).unwrap());
         let generation = locations.get(id).unwrap().generation;
-        let revision = locations.get(id).unwrap().checkpoint_revision;
+        let epoch = locations.epoch;
         record.tracking.as_mut().unwrap().next = 108;
-        assert!(!locations
-            .accept_tracking_at(id, &record, now + Duration::from_secs(1))
-            .unwrap());
+        record.tracking.as_mut().unwrap().confirmed_after = Some(now);
+        assert!(!locations.accept_tracking(id, &record).unwrap());
         assert_eq!(locations.get(id).unwrap().generation, generation);
-        assert_eq!(locations.get(id).unwrap().checkpoint_revision, revision);
-        assert!(!locations
-            .accept_tracking_at(id, &record, now + Duration::from_secs(61))
-            .unwrap());
-        assert!(locations.get(id).unwrap().checkpoint_revision > revision);
-        let revision = locations.get(id).unwrap().checkpoint_revision;
-        locations.flush_tracking_checkpoint(id);
-        assert!(locations.get(id).unwrap().checkpoint_revision > revision);
+        assert_eq!(locations.epoch, epoch);
         assert_eq!(
-            locations.export_catalog().locations[0]
-                .record
+            locations.entries[0]
+                .scan
+                .completed()
+                .unwrap()
+                .tracking
                 .as_ref()
+                .unwrap()
+                .confirmed_after,
+            Some(now)
+        );
+        locations.tracking_failed(id);
+        let stale_epoch = locations.epoch;
+        assert!(!locations.accept_tracking(id, &record).unwrap());
+        assert!(!locations.get(id).unwrap().stale);
+        assert!(locations.epoch > stale_epoch);
+        assert_eq!(
+            locations.entries[0]
+                .scan
+                .completed()
                 .unwrap()
                 .tracking
                 .as_ref()
@@ -731,104 +531,6 @@ mod tests {
             108
         );
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn delayed_restoration_preserves_live_results_selection_and_explicit_removal() {
-        let p =
-            std::env::temp_dir().join(format!("diskweave-restore-newer-{}", std::process::id()));
-        let a = p.join("a");
-        let b = p.join("b");
-        for root in [&a, &b] {
-            std::fs::create_dir_all(root).unwrap();
-            std::fs::write(root.join("known"), b"12345").unwrap();
-        }
-        let wait = |l: &mut Locations| {
-            let t = Instant::now();
-            while l.is_running() && t.elapsed() < Duration::from_secs(5) {
-                l.poll();
-                std::thread::yield_now();
-            }
-            assert!(!l.is_running());
-        };
-        let mut before = Locations::default();
-        before.start(a.clone()).unwrap();
-        wait(&mut before);
-        before.start(b.clone()).unwrap();
-        wait(&mut before);
-        let catalog = before.export_catalog();
-        std::fs::write(b.join("known"), b"123456789").unwrap();
-        let mut live = Locations::default();
-        live.start(b).unwrap();
-        wait(&mut live);
-        let selected = live.selected_id();
-        assert!(!live.restore_catalog(&catalog).unwrap());
-        assert_eq!(live.selected_id(), selected);
-        assert_eq!(live.completed().unwrap().result.folders[0].logical_bytes, 9);
-        assert!(!live.entries[0].restored);
-        assert_eq!(live.entries.len(), 2);
-        let cached = live.entries.iter().find(|e| e.path == a).unwrap().id;
-        assert_ne!(Some(cached), selected);
-        live.remove(cached).unwrap();
-        live.restore_catalog(&catalog).unwrap();
-        assert_eq!(live.entries.len(), 1);
-        std::fs::remove_dir_all(p).unwrap();
-    }
-    #[test]
-    fn restored_locations_search_offline_and_refresh_without_losing_previous_results_on_failure() {
-        let p =
-            std::env::temp_dir().join(format!("diskweave-restored-model-{}", std::process::id()));
-        let root = p.join("source");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("known.bin"), b"12345").unwrap();
-        let mut first = Locations::default();
-        first.start(root.clone()).unwrap();
-        let wait = |locations: &mut Locations| {
-            let t = Instant::now();
-            while locations.is_running() && t.elapsed() < Duration::from_secs(5) {
-                locations.poll();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(!locations.is_running());
-        };
-        wait(&mut first);
-        let catalog = first.export_catalog();
-        std::fs::remove_dir_all(&root).unwrap();
-        let mut restored = Locations::default();
-        assert!(restored.restore_catalog(&catalog).unwrap());
-        assert!(restored.entries[0].restored);
-        assert_eq!(restored.snapshots().len(), 1);
-        let hits = crate::global_search::search_all(
-            restored.snapshots(),
-            &crate::search::SearchInput {
-                text: "known".into(),
-                ..Default::default()
-            },
-            || false,
-        )
-        .unwrap();
-        assert_eq!(hits.hits.len(), 1);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("known.bin"), b"123456789").unwrap();
-        restored.start(root.clone()).unwrap();
-        wait(&mut restored);
-        assert!(!restored.entries[0].restored);
-        assert_eq!(
-            restored.completed().unwrap().result.folders[0].logical_bytes,
-            9
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-        restored.start(root).unwrap();
-        wait(&mut restored);
-        assert!(restored.entries[0].stale);
-        assert!(restored.snapshots().is_empty());
-        assert_eq!(
-            restored.completed().unwrap().result.folders[0].logical_bytes,
-            9
-        );
-        let id = restored.selected_id().unwrap();
-        restored.remove(id).unwrap();
-        assert!(restored.export_catalog().locations.is_empty());
-        std::fs::remove_dir_all(p).unwrap();
     }
     #[test]
     fn saved_workspace_displays_the_recorded_engine_and_collection_options() {
@@ -848,9 +550,11 @@ mod tests {
             ..Default::default()
         });
         let view = Locations::from_saved(&record);
-        assert_eq!(view.method(), crate::engine::Method::Ntfs);
-        assert!(view.details_requested());
         assert!(!view.completed().unwrap().result.detailed);
+        assert_eq!(
+            view.completed().unwrap().engine.as_ref().unwrap().actual,
+            crate::engine::Method::Ntfs
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -862,14 +566,17 @@ mod tests {
             std::fs::write(root.join(name).join("data"), [0; 3]).unwrap();
         }
         let mut locations = Locations::default();
-        assert!(locations.details_requested());
         let ids = [
             locations.add(&root.join("a")).unwrap(),
             locations.add(&root.join("b")).unwrap(),
         ];
-        locations.configure(false).unwrap();
+        locations
+            .configure_parallelism(crate::scanner::Parallelism::Two)
+            .unwrap();
         locations.start_selected(&ids).unwrap();
-        assert!(locations.configure(true).is_err());
+        assert!(locations
+            .configure_parallelism(crate::scanner::Parallelism::Eight)
+            .is_err());
         let deadline = Instant::now() + Duration::from_secs(5);
         while locations.is_running() && Instant::now() < deadline {
             locations.poll();
@@ -877,25 +584,10 @@ mod tests {
         }
         assert!(!locations.is_running());
         for id in ids {
-            assert!(
-                !locations
-                    .get(id)
-                    .unwrap()
-                    .scan
-                    .completed()
-                    .unwrap()
-                    .result
-                    .detailed
+            assert_eq!(
+                locations.get(id).unwrap().scan.parallelism(),
+                crate::scanner::Parallelism::Two
             );
-        }
-        locations.configure(true).unwrap();
-        locations.start_selected(&ids).unwrap();
-        while locations.is_running() && Instant::now() < deadline {
-            locations.poll();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(!locations.is_running());
-        for id in ids {
             let result = &locations.get(id).unwrap().scan.completed().unwrap().result;
             assert!(result.detailed);
             assert_eq!(result.folders[0].allocation.known, 1);

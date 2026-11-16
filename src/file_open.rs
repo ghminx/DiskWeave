@@ -139,51 +139,6 @@ pub fn open_with(
     shell(&request)
 }
 
-// Windows ABI와 동일한 C 필드 순서·포인터 크기 유지.
-#[repr(C)]
-struct ShellExecuteInfo {
-    size: u32,
-    mask: u32,
-    window: *mut std::ffi::c_void,
-    verb: *const u16,
-    file: *const u16,
-    parameters: *const u16,
-    directory: *const u16,
-    show: i32,
-    instance: *mut std::ffi::c_void,
-    id_list: *mut std::ffi::c_void,
-    class: *const u16,
-    class_key: *mut std::ffi::c_void,
-    hot_key: u32,
-    icon_or_monitor: *mut std::ffi::c_void,
-    process: *mut std::ffi::c_void,
-}
-
-#[link(name = "shell32")]
-extern "system" {
-    fn ShellExecuteExW(info: *mut ShellExecuteInfo) -> i32;
-    fn SHParseDisplayName(
-        name: *const u16,
-        context: *mut std::ffi::c_void,
-        pidl: *mut *mut std::ffi::c_void,
-        attributes: u32,
-        result_attributes: *mut u32,
-    ) -> i32;
-    fn SHOpenFolderAndSelectItems(
-        pidl: *const std::ffi::c_void,
-        count: u32,
-        items: *const *const std::ffi::c_void,
-        flags: u32,
-    ) -> i32;
-}
-
-#[link(name = "ole32")]
-extern "system" {
-    fn CoInitializeEx(reserved: *mut std::ffi::c_void, flags: u32) -> i32;
-    fn CoUninitialize();
-    fn CoTaskMemFree(memory: *mut std::ffi::c_void);
-}
-
 fn check_hresult(code: i32) -> io::Result<()> {
     if code < 0 {
         Err(io::Error::other(format!(
@@ -198,6 +153,15 @@ fn check_hresult(code: i32) -> io::Result<()> {
 fn windows_shell(request: &OpenRequest) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+        COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteExW, SEE_MASK_FLAG_NO_UI,
+        SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let path: Vec<u16> = request
         .path()
         .as_os_str()
@@ -206,7 +170,10 @@ fn windows_shell(request: &OpenRequest) -> io::Result<()> {
         .collect();
     // 작업 스레드의 STA 초기화 및 성공한 초기화마다 동일 스레드에서 해제.
     unsafe {
-        check_hresult(CoInitializeEx(null_mut(), 0x2 | 0x4))?;
+        check_hresult(CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        ))?;
         let result = {
             if request.action == OpenAction::RevealFile {
                 let mut pidl = null_mut();
@@ -218,18 +185,17 @@ fn windows_shell(request: &OpenRequest) -> io::Result<()> {
                     // cidl=0일 때 절대 파일 PIDL의 부모 폴더를 열고 파일 선택.
                     check_hresult(SHOpenFolderAndSelectItems(pidl, 0, null(), 0))
                 };
-                CoTaskMemFree(pidl);
+                CoTaskMemFree(pidl.cast());
                 result
             } else {
-                // 숫자·raw pointer로만 구성된 ABI 구조체의 예약 필드 0 초기화.
-                let mut info: ShellExecuteInfo = std::mem::zeroed();
+                let mut info = SHELLEXECUTEINFOW::default();
                 let verb = [b'o' as u16, b'p' as u16, b'e' as u16, b'n' as u16, 0];
-                info.size = std::mem::size_of::<ShellExecuteInfo>() as u32;
+                info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
                 // 메시지 루프 없는 worker의 요청 완료 대기 및 자체 오류 안내 사용.
-                info.mask = 0x100 | 0x400;
-                info.verb = verb.as_ptr();
-                info.file = path.as_ptr();
-                info.show = 1;
+                info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+                info.lpVerb = verb.as_ptr();
+                info.lpFile = path.as_ptr();
+                info.nShow = SW_SHOWNORMAL;
                 if ShellExecuteExW(&mut info) == 0 {
                     Err(io::Error::last_os_error())
                 } else {

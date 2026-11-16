@@ -15,9 +15,8 @@ pub enum Task {
         overwrite: bool,
     },
     Export {
-        sources: Vec<crate::export::ExportSource>,
+        sources: Vec<crate::locations::Snapshot>,
         scope: crate::export::ExportScope,
-        format: crate::export::Format,
         path: PathBuf,
         overwrite: bool,
     },
@@ -97,12 +96,11 @@ impl Documents {
                 Task::Export {
                     sources,
                     scope,
-                    format,
                     path,
                     overwrite,
                 } => {
                     *progress.lock().unwrap() = "파일 목록 내보내는 중…";
-                    crate::export::write(&sources, &scope, format, &path, overwrite, cancel)?;
+                    crate::export::write(&sources, &scope, &path, overwrite, cancel)?;
                     Ok(Outcome::Written(path))
                 }
                 Task::Load(path) => {

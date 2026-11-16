@@ -312,26 +312,6 @@ struct Pending {
     values: HashMap<usize, Values>,
     finished: bool,
 }
-/// 관리자 IPC의 단일 시작·부모 우선·범위·집계 계약 검증.
-pub struct ValidatedStream {
-    model: Model,
-    started: bool,
-}
-impl ValidatedStream {
-    pub fn new(root: PathBuf) -> Self {
-        Self {
-            model: Model::new(root),
-            started: false,
-        }
-    }
-    pub fn accept(&mut self, batch: Batch) -> io::Result<()> {
-        if batch.reset == self.started || batch.updates.len() > 128 {
-            return Err(invalid());
-        }
-        self.started = true;
-        self.model.apply(batch)
-    }
-}
 /// 폴더별 미표시 갱신을 덮어써 파일별 대기열 축적을 방지하는 전달 경계.
 #[derive(Clone, Default)]
 pub struct Mailbox(std::sync::Arc<std::sync::Mutex<Pending>>);
@@ -738,91 +718,6 @@ mod tests {
         assert_eq!(result.folders[id].path, root.join("z/deep"));
         assert!(final_view.is_expanded(result.folder_index(std::path::Path::new("z")).unwrap()));
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn helper_stream_rejects_escape_unknown_parent_duplicate_reset_and_overflow() {
-        let root = PathBuf::from("C:\\preview");
-        for bad in [
-            Update::Folder {
-                id: 1,
-                parent: Some(99),
-                name: vec![65],
-            },
-            Update::Folder {
-                id: 1,
-                parent: Some(0),
-                name: "..".encode_utf16().collect(),
-            },
-            Update::Values {
-                id: 9,
-                value: Values::default(),
-            },
-        ] {
-            let mut stream = ValidatedStream::new(root.clone());
-            stream
-                .accept(Batch {
-                    reset: true,
-                    updates: vec![Update::Folder {
-                        id: 0,
-                        parent: None,
-                        name: vec![],
-                    }],
-                })
-                .unwrap();
-            assert_eq!(
-                stream
-                    .accept(Batch {
-                        reset: false,
-                        updates: vec![bad]
-                    })
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
-        let mut stream = ValidatedStream::new(root);
-        stream
-            .accept(Batch {
-                reset: true,
-                updates: vec![Update::Folder {
-                    id: 0,
-                    parent: None,
-                    name: vec![],
-                }],
-            })
-            .unwrap();
-        assert!(stream
-            .accept(Batch {
-                reset: true,
-                updates: vec![]
-            })
-            .is_err());
-        assert!(stream
-            .accept(Batch {
-                reset: false,
-                updates: vec![
-                    Update::Folder {
-                        id: 1,
-                        parent: Some(0),
-                        name: vec![65]
-                    },
-                    Update::Values {
-                        id: 0,
-                        value: Values {
-                            bytes: u64::MAX,
-                            ..Default::default()
-                        }
-                    },
-                    Update::Values {
-                        id: 1,
-                        value: Values {
-                            bytes: 1,
-                            ..Default::default()
-                        }
-                    },
-                ]
-            })
-            .is_err());
     }
     #[test]
     fn discovered_folders_are_visible_before_return_and_match_final_totals() {

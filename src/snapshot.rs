@@ -71,6 +71,8 @@ impl Time {
 }
 #[derive(Serialize, Deserialize)]
 struct Directory {
+    #[serde(default)]
+    access: crate::scanner::FolderAccess,
     name: Vec<u16>,
     parent: Option<usize>,
     created: Option<Time>,
@@ -163,6 +165,7 @@ fn encoded(record: &SavedScan, cancelled: &impl Fn() -> bool) -> io::Result<Arch
         .map(|f| {
             crate::output::check(cancelled)?;
             Ok(Directory {
+                access: f.access,
                 name: wide(f.path.file_name().unwrap_or(OsStr::new(""))),
                 parent: f.parent,
                 created: f.created.map(Into::into),
@@ -355,6 +358,7 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
             path
         };
         scan.folders.push(Folder {
+            access: f.access,
             path,
             parent: f.parent,
             created: f.created.map(Time::decode).transpose()?,

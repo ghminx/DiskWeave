@@ -13,12 +13,6 @@ mod file_refresh;
 mod file_ui;
 mod global_search;
 mod gui;
-mod index_job;
-mod index_store;
-#[cfg(test)]
-#[allow(dead_code, reason = "공유 수집기의 제품·개발 경로 대조 시험")]
-#[path = "../tools/ntfs-validation/layout.rs"]
-mod layout;
 mod link_details;
 mod list_selection;
 mod local_date;
@@ -28,11 +22,7 @@ mod map_job;
 mod metadata;
 mod ntfs;
 mod ntfs_helper;
-#[allow(dead_code, reason = "제품 수집기와 개발용 독립 비교 경계 공유")]
-mod ntfs_mft;
 mod ntfs_native;
-#[allow(dead_code, reason = "MFT 직접·혼합 수집 비교 경계 공유")]
-mod ntfs_tree;
 mod output;
 mod path_copy;
 mod presentation;
@@ -44,7 +34,6 @@ mod search;
 mod search_job;
 mod search_view;
 mod snapshot;
-mod startup;
 mod target_selection;
 mod tracking;
 mod treemap;
@@ -152,16 +141,26 @@ fn run() -> io::Result<()> {
             (pending, false, None)
         }
     };
-    println!("논리 크기(Byte)\t파일 수\t하위 폴더 수\t경로");
+    println!("논리 크기(Byte)\t파일 수\t하위 폴더 수\t경로\t수집 상태");
     while let Some(index) = pending.pop() {
         let folder = &result.folders[index];
-        println!(
-            "{}\t{}\t{}\t{}",
-            folder.logical_bytes,
-            folder.file_count,
-            folder.folder_count,
-            folder.path.display()
-        );
+        let status = if folder.access == scanner::FolderAccess::Complete {
+            "정상"
+        } else {
+            folder.access.label()
+        };
+        if folder.access.unreadable() {
+            println!("\t\t\t{}\t{}", folder.path.display(), status);
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                folder.logical_bytes,
+                folder.file_count,
+                folder.folder_count,
+                folder.path.display(),
+                status
+            );
+        }
         if recurse {
             pending.extend(result.children[index].iter().rev());
         }

@@ -2,14 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct TargetSelection {
-    explicit: bool,
     path: Option<PathBuf>,
     text: String,
 }
 impl Default for TargetSelection {
     fn default() -> Self {
         Self {
-            explicit: false,
             path: Some(PathBuf::from(r"C:\")),
             text: r"C:\".into(),
         }
@@ -31,13 +29,11 @@ impl TargetSelection {
             Err(error) => return Err(format!("경로를 확인할 수 없습니다: {error}")),
         }
         self.path = Some(path.clone());
-        self.explicit = true;
         self.text = path.to_string_lossy().into_owned();
         Ok(())
     }
 
     pub fn set_text(&mut self, text: String) {
-        self.explicit = true;
         self.path = if text.trim().is_empty() {
             None
         } else {
@@ -47,18 +43,9 @@ impl TargetSelection {
     }
     /// 등록된 경로를 오프라인에서도 선택하고 실재 검증은 재스캔에 위임.
     pub fn choose_registered(&mut self, path: PathBuf) {
-        self.explicit = true;
         self.text = path.to_string_lossy().into_owned();
         self.path = Some(path);
     }
-    /// 복원 중 사용자가 지정한 경로를 보호하며 오프라인 저장 경로도 초기 표시.
-    pub fn restore_default(&mut self, path: PathBuf) {
-        if !self.explicit {
-            self.text = path.to_string_lossy().into_owned();
-            self.path = Some(path);
-        }
-    }
-
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -74,21 +61,11 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     #[test]
-    fn restored_target_can_be_offline_but_never_replaces_explicit_input() {
-        let mut target = TargetSelection::default();
-        target.restore_default(PathBuf::from(r"Z:\offline"));
-        assert_eq!(target.text(), r"Z:\offline");
-        target.set_text(r"C:\".into());
-        target.restore_default(PathBuf::from(r"Z:\offline"));
-        assert_eq!(target.text(), r"C:\");
-    }
-    #[test]
     fn choosing_an_offline_registered_location_keeps_the_original_scan_target() {
         let path = PathBuf::from(r"Z:\diskweave-offline-location");
         let mut target = TargetSelection::default();
         target.choose_registered(path.clone());
         assert_eq!(target.path(), Some(path.as_path()));
-        target.restore_default(PathBuf::from(r"C:\"));
         assert_eq!(target.path(), Some(path.as_path()));
     }
     #[test]

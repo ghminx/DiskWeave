@@ -38,6 +38,7 @@ pub enum EntryKind {
     #[default]
     All,
     Files,
+    #[allow(dead_code)] // 필터 UI 제거 후 기존 검색 API 조건 유지
     Folders,
 }
 impl Default for SearchInput {
@@ -175,7 +176,80 @@ pub fn item_bytes(result: &ScanResult, item: Item) -> u64 {
     }
 }
 
+// 위치별 검색과 전체 검색의 정렬 규칙 공유 및 비교마다 문자열 재변환 방지.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortValue {
+    Name(String),
+    Path,
+    Size(u64),
+    Modified(Option<SystemTime>),
+}
+pub(crate) struct SortKey {
+    path: PathBuf,
+    value: SortValue,
+    is_file: bool,
+}
+impl SortKey {
+    pub(crate) fn new(result: &ScanResult, item: Item, field: SortField) -> Self {
+        Self {
+            path: item_path(result, item),
+            value: match field {
+                SortField::Name => {
+                    SortValue::Name(item_name(result, item).to_string_lossy().to_lowercase())
+                }
+                SortField::Path => SortValue::Path,
+                SortField::Size => SortValue::Size(item_bytes(result, item)),
+                SortField::Modified => SortValue::Modified(item_modified(result, item)),
+            },
+            is_file: matches!(item, Item::File(_)),
+        }
+    }
+    // 동일한 정렬 조건의 키끼리 비교. 미확인 날짜는 마지막, 동률 경로는 오름차순 유지.
+    pub(crate) fn compare(
+        &self,
+        other: &Self,
+        descending: bool,
+        folders_first: bool,
+    ) -> std::cmp::Ordering {
+        let group = if folders_first {
+            self.is_file.cmp(&other.is_file)
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        let missing = matches!(self.value, SortValue::Modified(None))
+            .cmp(&matches!(other.value, SortValue::Modified(None)));
+        let order = if matches!(self.value, SortValue::Path) {
+            self.path.cmp(&other.path)
+        } else {
+            self.value.cmp(&other.value)
+        };
+        group
+            .then(missing)
+            .then(if descending { order.reverse() } else { order })
+            .then_with(|| self.path.cmp(&other.path))
+    }
+}
+
 pub fn search(
+    result: &ScanResult,
+    query: &Query,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<SearchResults> {
+    let result_items = matching(result, query, &cancelled)?;
+    let mut keyed = Vec::with_capacity(result_items.items.len());
+    for item in result_items.items {
+        crate::output::check(&cancelled)?;
+        keyed.push((item, SortKey::new(result, item, query.sort)));
+    }
+    keyed.sort_unstable_by(|a, b| a.1.compare(&b.1, query.descending, !query.active));
+    crate::output::check(&cancelled)?;
+    Ok(SearchResults {
+        items: keyed.into_iter().map(|(item, _)| item).collect(),
+        unknown_dates: result_items.unknown_dates,
+    })
+}
+
+pub(crate) fn matching(
     result: &ScanResult,
     query: &Query,
     cancelled: impl Fn() -> bool,
@@ -206,6 +280,11 @@ pub fn search(
                 (query.kind, item),
                 (EntryKind::Files, Item::Folder(_)) | (EntryKind::Folders, Item::File(_))
             ) {
+                continue;
+            }
+            if query.active
+                && matches!(item, Item::Folder(id) if result.folders[id].access.unreadable())
+            {
                 continue;
             }
             let bytes = item_bytes(result, item);
@@ -251,62 +330,8 @@ pub fn search(
             pending.extend(result.children[folder].iter().copied());
         }
     }
-    // 대량 동률 정렬에서 경로·소문자 이름의 비교마다 재할당 방지. 정렬 후 임시 키 해제.
-    struct SortEntry {
-        item: Item,
-        path: PathBuf,
-        name: String,
-    }
-    let mut keyed = Vec::with_capacity(items.len());
-    for item in items {
-        if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
-        }
-        keyed.push(SortEntry {
-            item,
-            path: item_path(result, item),
-            name: if query.sort == SortField::Name {
-                item_name(result, item).to_string_lossy().to_lowercase()
-            } else {
-                String::new()
-            },
-        });
-    }
-    keyed.sort_unstable_by(|a, b| {
-        let group = if query.active {
-            std::cmp::Ordering::Equal
-        } else {
-            matches!(a.item, Item::File(_)).cmp(&matches!(b.item, Item::File(_)))
-        };
-        let order = match query.sort {
-            SortField::Name => a.name.cmp(&b.name),
-            SortField::Path => a.path.cmp(&b.path),
-            SortField::Size => item_bytes(result, a.item).cmp(&item_bytes(result, b.item)),
-            SortField::Modified => {
-                item_modified(result, a.item).cmp(&item_modified(result, b.item))
-            }
-        };
-        let missing = if query.sort == SortField::Modified {
-            item_modified(result, a.item)
-                .is_none()
-                .cmp(&item_modified(result, b.item).is_none())
-        } else {
-            std::cmp::Ordering::Equal
-        };
-        group
-            .then(missing)
-            .then(if query.descending {
-                order.reverse()
-            } else {
-                order
-            })
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    if cancelled() {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
-    }
     Ok(SearchResults {
-        items: keyed.into_iter().map(|entry| entry.item).collect(),
+        items,
         unknown_dates,
     })
 }

@@ -158,8 +158,8 @@ impl Controller {
         let mut updates = vec![];
         if let Some((id, after)) = self.waiting {
             match tracking {
-                Some((active, checked, true)) if active == id => {
-                    if checked.is_some_and(|when| when >= after) {
+                Some((active, confirmed_after, true)) if active == id => {
+                    if confirmed_after.is_some_and(|when| when >= after) {
                         self.waiting = None;
                     }
                 }
@@ -229,6 +229,112 @@ mod tests {
         time::{Duration, Instant},
     };
     #[test]
+    fn a_cycle_started_before_the_file_operation_does_not_release_refresh_waiting() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-confirmation-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mut locations = Locations::default();
+        let id = locations.add(&root).unwrap();
+        locations.start_selected(&[id]).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() {
+            locations.poll();
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let old = Arc::clone(&locations.completed().unwrap().result);
+        let cycle_before_operation = SystemTime::now();
+        fs::write(root.join("new.bin"), b"12345").unwrap();
+        let mut refresh = Controller::default();
+        refresh
+            .begin(&locations, &[root.join("new.bin")], Some(id))
+            .unwrap();
+        let make_record = |scan: Arc<ScanResult>, since| {
+            let mut record = SavedScan::new(
+                scan,
+                cycle_before_operation,
+                SystemTime::now(),
+                Duration::ZERO,
+            );
+            record.tracking = Some(crate::usn::Checkpoint {
+                version: 3,
+                volume: "test".into(),
+                root: 1,
+                journal: 7,
+                next: 100,
+                folders: vec![1],
+                files: (2..2 + record.scan.files.len() as u64).collect(),
+                excluded: vec![],
+                pending: vec![],
+                unavailable: vec![],
+                confirmed_after: Some(since),
+            });
+            record
+        };
+        let (send, receive) = mpsc::channel();
+        let mut tracking = crate::tracking::Controller::default();
+        tracking
+            .start_with(
+                id,
+                root.clone(),
+                true,
+                None,
+                move |_, _, _, cancel, publish| {
+                    while !cancel() {
+                        if let Ok(record) = receive.recv_timeout(Duration::from_millis(5)) {
+                            publish(record);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        send.send(make_record(old, cycle_before_operation)).unwrap();
+        loop {
+            if let Some(record) = tracking.poll() {
+                locations.accept_tracking(id, &record).unwrap();
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        refresh.poll(
+            &mut locations,
+            Some((id, tracking.confirmed_after, tracking.running())),
+        );
+        assert!(refresh.busy());
+        assert_eq!(
+            locations.completed().unwrap().result.folders[0].logical_bytes,
+            0
+        );
+        let since = SystemTime::now();
+        let updated = Arc::new(
+            crate::scanner::scan_unified(&root, Default::default(), || false, |_| {}, None)
+                .unwrap(),
+        );
+        send.send(make_record(updated, since)).unwrap();
+        loop {
+            if let Some(record) = tracking.poll() {
+                locations.accept_tracking(id, &record).unwrap();
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        refresh.poll(
+            &mut locations,
+            Some((id, tracking.confirmed_after, tracking.running())),
+        );
+        assert!(!refresh.busy());
+        assert_eq!(
+            locations.completed().unwrap().result.folders[0].logical_bytes,
+            5
+        );
+        tracking.stop();
+        fs::remove_file(root.join("new.bin")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
     fn failed_post_operation_refresh_preserves_the_previous_result_and_marks_it_stale() {
         let root = std::env::temp_dir().join(format!(
             "diskweave-refresh-failure-{}-{}",
@@ -271,7 +377,7 @@ mod tests {
         fs::remove_dir_all(root.with_extension("moved")).unwrap();
     }
     #[test]
-    fn completed_file_changes_refresh_only_affected_locations_and_wait_for_usn_confirmation() {
+    fn completed_file_changes_refresh_only_affected_untracked_locations() {
         let root =
             std::env::temp_dir().join(format!("diskweave-file-refresh-{}", std::process::id()));
         fs::create_dir_all(root.join("a")).unwrap();
@@ -308,17 +414,6 @@ mod tests {
             5
         );
         assert_eq!(locations.get(b).unwrap().generation, generation);
-        let generation = locations.get(a).unwrap().generation;
-        refresh
-            .begin(&locations, &[root.join("a/new")], Some(a))
-            .unwrap();
-        assert!(refresh.busy());
-        refresh.poll(
-            &mut locations,
-            Some((a, Some(std::time::SystemTime::now()), true)),
-        );
-        assert!(!refresh.busy());
-        assert_eq!(locations.get(a).unwrap().generation, generation);
         fs::remove_dir_all(root).unwrap();
     }
 }

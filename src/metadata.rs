@@ -15,24 +15,6 @@ const FILE_STANDARD_INFO: i32 = 1;
 const FILE_COMPRESSION_INFO: i32 = 8;
 const FILE_ID_INFO: i32 = 18;
 
-#[derive(Clone, Copy)]
-pub struct ScanSettings {
-    pub parallelism: crate::scanner::Parallelism,
-    pub method: crate::engine::Method,
-    pub detailed: bool,
-    pub fast_mode: crate::engine::FastMode,
-}
-impl Default for ScanSettings {
-    fn default() -> Self {
-        Self {
-            parallelism: Default::default(),
-            detailed: true,
-            method: Default::default(),
-            fast_mode: Default::default(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Missing {
     NotCollected,

@@ -240,6 +240,18 @@ impl ColumnWidths {
             self.values[1] = (base - self.values[0] - self.values[2]).max(180.0);
             return;
         }
+        if path {
+            self.values[3] = 156.0;
+            let extra = if modified { self.get(3) } else { 0.0 }
+                + if allocated { self.get(7) } else { 0.0 };
+            let space = (available - extra).max(700.0);
+            self.values[1] = (space * 0.30).max(180.0);
+            let base = space - self.values[1];
+            for (column, fraction) in [(0, 0.38), (2, 0.22), (4, 0.16), (5, 0.12), (6, 0.12)] {
+                self.values[column] = (base * fraction).max(if column == 0 { 140.0 } else { 60.0 });
+            }
+            return;
+        }
         let extras = if path { self.get(1) } else { 0.0 }
             + if modified { self.get(3) } else { 0.0 }
             + if allocated { self.get(7) } else { 0.0 };
@@ -318,27 +330,148 @@ pub fn detail(scan: &ScanResult, item: Item) -> Detail {
         ),
     };
     let bytes = crate::search::item_bytes(scan, item);
+    let access = match item {
+        Item::Folder(id) => scan.folders[id].access,
+        Item::File(_) => crate::scanner::FolderAccess::Complete,
+    };
+    let mut size = SizeDisplay::new(bytes);
+    let mut shown_allocation = allocation_display(allocated);
+    if access.unreadable() {
+        size = SizeDisplay {
+            text: "확인 불가".into(),
+            exact: access.label().into(),
+        };
+        shown_allocation = SizeDisplay {
+            text: size.text.clone(),
+            exact: size.exact.clone(),
+        };
+    } else if access == crate::scanner::FolderAccess::Partial {
+        size.text.push_str(" (일부)");
+        size.exact.push_str(" · 일부 누락 · 확인된 항목의 합계");
+        shown_allocation.text.push_str(" (일부)");
+    }
     Detail {
-        allocated: allocation_display(allocated),
+        allocated: shown_allocation,
         created: crate::local_date::display(created),
         attributes: attributes_display(attributes),
         identity,
         links,
         path: crate::search::item_path(scan, item),
-        kind,
-        size: SizeDisplay::new(bytes),
+        kind: if access == crate::scanner::FolderAccess::Complete {
+            kind
+        } else {
+            access.label()
+        },
+        size,
         modified: crate::local_date::display(crate::search::item_modified(scan, item)),
-        files,
-        folders,
-        parent_percentage: parent
-            .map(|p| percentage(bytes, scan.folders[p].logical_bytes))
-            .unwrap_or_else(|| "—".into()),
+        files: if access.unreadable() { None } else { files },
+        folders: if access.unreadable() { None } else { folders },
+        parent_percentage: if access.unreadable() {
+            "—".into()
+        } else {
+            parent
+                .map(|p| percentage(bytes, scan.folders[p].logical_bytes))
+                .unwrap_or_else(|| "—".into())
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn denied_directory_is_visible_as_unknown_but_excluded_from_search() {
+        use crate::scanner::{scan_unified, Parallelism};
+        use std::{
+            fs,
+            path::{Path, PathBuf},
+            time::SystemTime,
+        };
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("diskweave-access-{}-{stamp}", std::process::id()));
+        let blocked = root.join("blocked");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(root.join("visible.bin"), [1, 2, 3]).unwrap();
+        fs::write(blocked.join("hidden.bin"), [4, 5]).unwrap();
+        let user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        struct Cleanup(PathBuf, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .arg(self.0.join("blocked"))
+                    .args(["/remove:d", &self.1])
+                    .output();
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone(), user.clone());
+        let denied = std::process::Command::new("icacls")
+            .arg(&blocked)
+            .arg("/deny")
+            .arg(format!("{user}:(RD)"))
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{:?}", denied);
+        for workers in [Parallelism::Sequential, Parallelism::Two] {
+            let result = scan_unified(&root, workers, || false, |_| {}, None).unwrap();
+            let id = result.folder_index(Path::new("blocked")).unwrap();
+            assert_eq!(result.folders[0].logical_bytes, 3);
+            assert_eq!(
+                crate::presentation::detail(&result, crate::explorer::Item::Folder(id))
+                    .size
+                    .text,
+                "확인 불가"
+            );
+            let input = crate::search::SearchInput {
+                text: "blocked".into(),
+                ..Default::default()
+            };
+            assert!(
+                crate::search::search(&result, &input.compile(0).unwrap(), || false)
+                    .unwrap()
+                    .items
+                    .is_empty()
+            );
+            assert!(
+                crate::presentation::detail(&result, crate::explorer::Item::Folder(0))
+                    .size
+                    .exact
+                    .contains("일부 누락")
+            );
+            assert_eq!(result.error_count, 1);
+            assert!(crate::search::search(
+                &result,
+                &crate::search::SearchInput::default().compile(0).unwrap(),
+                || false
+            )
+            .unwrap()
+            .items
+            .contains(&crate::explorer::Item::Folder(id)));
+            let saved = crate::snapshot::SavedScan::new(
+                std::sync::Arc::new(result),
+                SystemTime::now(),
+                SystemTime::now(),
+                std::time::Duration::ZERO,
+            );
+            let mut encoded = Vec::new();
+            crate::snapshot::write_to(&saved, &mut encoded, || false).unwrap();
+            let restored = crate::snapshot::read_from(encoded.as_slice(), || false).unwrap();
+            assert_eq!(
+                crate::presentation::detail(&restored.scan, crate::explorer::Item::Folder(id))
+                    .size
+                    .text,
+                "확인 불가"
+            );
+        }
+    }
     #[test]
     fn allocation_display_distinguishes_zero_uncollected_unsupported_and_partial_totals() {
         use crate::metadata::{Allocation, Field, Missing};

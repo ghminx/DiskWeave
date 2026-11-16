@@ -8,6 +8,7 @@ use crate::locations_ui::LocationsView;
 use crate::map_job::{MapController, Target};
 use crate::presentation::{detail, SizeDisplay};
 use crate::scan_job::ScanStatus;
+use crate::scanner::ScanResult;
 use crate::search::{item_name, SearchInput};
 use crate::search_view::{SearchScope, SearchView};
 use crate::target_selection::TargetSelection;
@@ -19,9 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Default)]
-struct DiskWeaveApp {
+pub struct DiskWeaveApp {
     link_details: crate::link_details::Controller,
-    startup: crate::startup::Controller,
     preview_view: crate::scanner::preview::View,
     preview_location: Option<u64>,
     file_close_requested: bool,
@@ -29,9 +29,6 @@ struct DiskWeaveApp {
     file_ui: crate::file_ui::FileUi,
     file_refresh: crate::file_refresh::Controller,
     tracking: crate::tracking::Controller,
-    index: crate::index_job::IndexController,
-    closing: crate::index_job::CloseState,
-    clear_index: bool,
     results: crate::results_ui::ResultsUi,
     saved_viewer: Option<Box<DiskWeaveApp>>,
     archive_record: Option<Arc<crate::snapshot::SavedScan>>,
@@ -62,6 +59,7 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DiskWeave")
+            .with_decorations(false)
             .with_inner_size([1380.0, 880.0])
             .with_min_inner_size([760.0, 500.0])
             .with_drag_and_drop(true)
@@ -109,12 +107,22 @@ fn type_chart(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
     if other > 0 {
         groups.push(("기타", other, egui::Color32::from_rgb(70, 93, 114)));
     }
+    let stacked = ui.available_width() < 270.0;
+    let height = if stacked {
+        118.0 + groups.len() as f32 * 21.0
+    } else {
+        108.0
+    };
     let (area, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 108.0),
+        egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
     );
     let diameter = 108.0;
-    let center = area.left_center() + egui::vec2(diameter / 2.0, 0.0);
+    let center = if stacked {
+        area.center_top() + egui::vec2(0.0, 54.0)
+    } else {
+        area.left_center() + egui::vec2(diameter / 2.0, 0.0)
+    };
     let radius = 43.0;
     ui.painter().circle_stroke(
         center,
@@ -144,7 +152,15 @@ fn type_chart(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
         egui::FontId::proportional(14.0),
         crate::ui_style::TEXT,
     );
-    let legend = egui::Rect::from_min_max(area.min + egui::vec2(122.0, 0.0), area.max);
+    let legend = egui::Rect::from_min_max(
+        area.min
+            + if stacked {
+                egui::vec2(0.0, 118.0)
+            } else {
+                egui::vec2(122.0, 0.0)
+            },
+        area.max,
+    );
     for (i, (name, bytes, color)) in groups.into_iter().enumerate() {
         let row = egui::Rect::from_min_size(
             legend.min + egui::vec2(0.0, i as f32 * 21.0),
@@ -208,15 +224,15 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     let mut action = None;
     match item {
         Item::Folder(_) => {
-            if ui.button("탐색기에서 열기").clicked() {
+            if crate::ui_style::menu_action(ui, "탐색기에서 열기", true).clicked() {
                 action = Some(OpenAction::OpenFolder);
             }
         }
         Item::File(_) => {
-            if ui.button("기본 앱으로 열기").clicked() {
+            if crate::ui_style::menu_action(ui, "기본 앱으로 열기", true).clicked() {
                 action = Some(OpenAction::OpenFile);
             }
-            if ui.button("파일 위치 열기").clicked() {
+            if crate::ui_style::menu_action(ui, "파일 위치 열기", true).clicked() {
                 action = Some(OpenAction::RevealFile);
             }
         }
@@ -227,107 +243,12 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     action
 }
 impl DiskWeaveApp {
-    fn startup_tick(&mut self, ctx: &egui::Context) {
-        if self.archive_record.is_some() {
-            return;
-        }
-        self.startup.poll();
-        if self.startup.needs_relaunch() {
-            self.input_error = self
-                .startup
-                .request(true, crate::startup::relaunch)
-                .err()
-                .map(|e| e.to_string());
-        }
-        if self.startup.exit_requested {
-            self.closing = crate::index_job::CloseState::Discarded;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if matches!(self.startup.status, crate::startup::Status::Failed(_)) {
-            crate::ntfs_helper::skip_permission_prompt();
-        }
-        if self.startup.busy() {
-            ctx.request_repaint_after(Duration::from_millis(30));
-        }
-        if let crate::startup::Status::Failed(error) = &self.startup.status {
-            let error = error.clone();
-            egui::Modal::new(egui::Id::unique("startup_denied")).show(ctx, |ui| {
-                ui.set_max_width(400.0);
-                ui.heading("기본 스캔으로 사용할 수 있습니다");
-                ui.add(egui::Label::new(&error).wrap());
-                ui.small("설정에서 고속 스캔 권한을 다시 요청할 수 있습니다.");
-                if ui.button("확인").clicked() {
-                    self.startup.skip();
-                }
-            });
-        }
-        if matches!(
-            self.startup.status,
-            crate::startup::Status::Prompt | crate::startup::Status::Authorizing
-        ) {
-            egui::Modal::new(egui::Id::unique("startup_permission")).show(ctx,|ui| {
-                ui.set_max_width(400.0);
-                ui.heading("고속 스캔을 사용할까요?");
-                ui.label("NTFS 드라이브 전체를 빠르게 분석하려면 Windows 관리자 승인이 필요합니다.");
-                ui.small("폴더 분석 등 지원하지 않는 대상은 기본 방식으로 스캔합니다. 스캔은 대상 선택 후 직접 시작합니다.");
-                if self.startup.busy() { ui.horizontal(|ui| { ui.spinner(); ui.label("Windows 권한 승인을 기다리고 있습니다"); }); }
-                else { ui.horizontal_wrapped(|ui| {
-                    if ui.button("고속 스캔 사용").clicked() { self.input_error=self.startup.request(false,crate::ntfs_helper::prepare).err().map(|e|e.to_string()); }
-                    if ui.button("이번에는 건너뛰기").clicked() { self.startup.skip(); crate::ntfs_helper::skip_permission_prompt(); }
-                }); }
-            });
-        }
+    /// 현재 실행의 분석 위치. 이전 자동 저장소 접근 없이 제공.
+    pub fn active_locations(&self) -> &Locations {
+        &self.scan
     }
-    fn startup_settings(&mut self, ui: &mut egui::Ui) {
-        if self.archive_record.is_some() {
-            return;
-        }
-        ui.separator();
-        ui.strong("시작·권한");
-        let mut preferences = self.startup.preferences;
-        if ui
-            .add_enabled(
-                !self.startup.busy(),
-                egui::Checkbox::new(&mut preferences.always_admin, "항상 관리자 권한으로 시작"),
-            )
-            .changed()
-        {
-            match crate::startup::preference_path().and_then(|p| preferences.save(&p)) {
-                Ok(()) => {
-                    self.startup.preferences = preferences;
-                    self.startup.suppress_relaunch();
-                }
-                Err(e) => self.input_error = Some(format!("시작 설정을 저장하지 못했습니다: {e}")),
-            }
-        }
-        ui.small("다음 실행부터 적용 · 켜면 프로그램 전체가 관리자 권한으로 실행됩니다.");
-        match &self.startup.status {
-            crate::startup::Status::Failed(error) => {
-                ui.add(egui::Label::new(error).wrap());
-            }
-            crate::startup::Status::Ready => {
-                ui.small(if self.startup.elevated {
-                    "현재 관리자 권한으로 실행 중"
-                } else {
-                    "고속 스캔 도우미 준비 완료"
-                });
-            }
-            crate::startup::Status::Basic => {
-                ui.small("이번 실행에서는 기본 스캔 사용");
-            }
-            _ => {}
-        }
-        if !self.startup.elevated
-            && !self.startup.busy()
-            && !self.scan.is_running()
-            && ui.button("고속 스캔 권한 요청").clicked()
-        {
-            self.input_error = self
-                .startup
-                .request(false, crate::ntfs_helper::prepare)
-                .err()
-                .map(|e| e.to_string());
-        }
+    pub fn selected_path(&self) -> Option<&std::path::Path> {
+        self.target.path()
     }
     fn show_preview(&self) -> bool {
         self.archive_record.is_none()
@@ -411,14 +332,7 @@ impl DiskWeaveApp {
                         );
                     }
                     if !folder.children.is_empty() {
-                        crate::ui_style::text(
-                            ui,
-                            arrow,
-                            if view.expanded(id) { "▾" } else { "▸" },
-                            false,
-                            crate::ui_style::SOFT,
-                            12.0,
-                        );
+                        crate::ui_style::chevron(ui, arrow, view.expanded(id));
                         if ui
                             .interact(
                                 arrow,
@@ -683,8 +597,7 @@ impl DiskWeaveApp {
             for path in &paths {
                 for entry in &self.scan.entries {
                     if crate::file_ops::contains_path(&entry.path, path).unwrap_or(true) {
-                        writable &=
-                            !entry.stale && !entry.restored && entry.scan.completed().is_some();
+                        writable &= !entry.stale && entry.scan.completed().is_some();
                     }
                 }
             }
@@ -697,7 +610,7 @@ impl DiskWeaveApp {
                         writable = false;
                         return None;
                     };
-                    if entry.generation != *generation || entry.stale || entry.restored {
+                    if entry.generation != *generation || entry.stale {
                         writable = false;
                         return None;
                     }
@@ -717,7 +630,7 @@ impl DiskWeaveApp {
                 .map(|(s, e)| s.scan.folders[e.folder()].path.clone())
         };
         if let Some(entry) = self.scan.selected_id().and_then(|id| self.scan.get(id)) {
-            writable &= !entry.stale && !entry.restored && entry.scan.completed().is_some();
+            writable &= !entry.stale && entry.scan.completed().is_some();
         } else {
             writable = false;
         }
@@ -759,31 +672,17 @@ impl DiskWeaveApp {
         let tracking = self
             .tracking
             .location
-            .map(|id| (id, self.tracking.checked, self.tracking.running()));
+            .map(|id| (id, self.tracking.confirmed_after, self.tracking.running()));
         for update in self.file_refresh.poll(&mut self.scan, tracking) {
             if self.scan.selected_id() == Some(update.id) {
-                let explorer = match (&self.explorer, &update.old) {
-                    (Some(e), Some(old)) => e.rebase(old, &update.new),
-                    _ => Explorer::new(&update.new),
-                };
-                if let Some(old) = update.old {
-                    self.search.rebase(&old, &update.new, explorer.folder());
-                } else {
-                    self.search.invalidate();
-                }
-                self.explorer = Some(explorer);
-                self.detail_target = None;
-                self.detail_context = None;
+                self.replace_live_result(update.old.as_deref(), &update.new);
             }
         }
     }
-    fn stop_tracking(&mut self) {
-        if self.tracking.running() {
-            if let Some(id) = self.tracking.location {
-                self.scan.flush_tracking_checkpoint(id);
-            }
-        }
-        self.tracking.stop();
+    fn replace_live_result(&mut self, old: Option<&ScanResult>, new: &Arc<ScanResult>) {
+        self.explorer = Some(self.search.replace_result(self.explorer.as_ref(), old, new));
+        self.detail_target = None;
+        self.detail_context = None;
     }
 
     fn sync_tracking(&mut self) {
@@ -791,7 +690,7 @@ impl DiskWeaveApp {
             return;
         };
         if self.scan.get(id).is_none() || self.scan.is_running() {
-            self.stop_tracking();
+            self.tracking.stop();
             return;
         }
         let was_running = self.tracking.running();
@@ -804,22 +703,11 @@ impl DiskWeaveApp {
             self.locations_view.preserve_live_selection();
             match self.scan.accept_tracking(id, &record) {
                 Ok(true) if self.scan.selected_id() == Some(id) => {
-                    let explorer = match (&self.explorer, &old) {
-                        (Some(view), Some(old)) => view.rebase(old, &record.scan),
-                        _ => Explorer::new(&record.scan),
-                    };
-                    if let Some(old) = old {
-                        self.search.rebase(&old, &record.scan, explorer.folder());
-                    } else {
-                        self.search.invalidate();
-                    }
-                    self.explorer = Some(explorer);
-                    self.detail_target = None;
-                    self.detail_context = None;
+                    self.replace_live_result(old.as_deref(), &record.scan);
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    self.stop_tracking();
+                    self.tracking.stop();
                     self.input_error = Some(error.to_string());
                     self.scan.tracking_failed(id);
                 }
@@ -860,9 +748,7 @@ impl DiskWeaveApp {
                 .and_then(|e| e.scan.completed())
                 .filter(|c| !fresh && c.tracking.is_some() && c.result.detailed)
                 .map(|c| Arc::new(c.saved_result()));
-            let detailed = resume
-                .as_ref()
-                .map_or(self.scan.details_requested(), |r| r.scan.detailed);
+            let detailed = resume.as_ref().is_none_or(|r| r.scan.detailed);
             self.tracking.start(id, path, detailed, resume)
         })();
         self.input_error = action.err().map(|e| e.to_string());
@@ -882,7 +768,7 @@ impl DiskWeaveApp {
                         .and_then(|id| self.scan.get(id))
                         .map(|e| e.path.as_path())
                 } else {
-                    self.target.path()
+                    self.selected_path()
                 })
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
@@ -905,7 +791,7 @@ impl DiskWeaveApp {
                 });
             }
             if ui.button("실시간 갱신 중지").clicked() {
-                self.stop_tracking();
+                self.tracking.stop();
             }
         } else {
             let resumable = self
@@ -940,8 +826,76 @@ impl DiskWeaveApp {
             }
         }
         if let crate::tracking::Status::Failed(error) = &self.tracking.status {
-            ui.colored_label(egui::Color32::YELLOW, "갱신 필요");
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "실시간 갱신을 시작하거나 계속할 수 없습니다",
+            );
             ui.add(egui::Label::new(error).wrap());
+            ui.small("마지막 스캔 결과는 유지되지만 이후 변경 사항은 반영되지 않습니다.");
+            if error.contains("os error 32") {
+                ui.small("Windows가 사용 중인 파일·시스템 영역과의 공유 충돌입니다. 일반 작업 폴더로 범위를 줄여 시도할 수 있습니다.");
+            }
+        }
+        if let Some((root, state)) = self
+            .tracking
+            .location
+            .and_then(|id| self.scan.get(id))
+            .and_then(|entry| {
+                entry
+                    .scan
+                    .completed()
+                    .and_then(|c| c.tracking.as_ref().map(|s| (&entry.path, s)))
+            })
+        {
+            if !state.unavailable.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 194, 120),
+                    format!(
+                        "확인 불가 {}개 · 검색과 용량 합계에서 제외",
+                        state.unavailable.len()
+                    ),
+                );
+                ui.small("제외된 폴더 내부는 미확인입니다. 항목별 최소 30초 간격으로 최대 64개씩 다시 확인합니다.");
+                egui::CollapsingHeader::new("제외된 항목 · 이유 · 마지막 확인")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(220.0).show_rows(
+                            ui,
+                            64.0,
+                            state.unavailable.len(),
+                            |ui, rows| {
+                                for row in rows {
+                                    let e = &state.unavailable[row];
+                                    let path = root.join(e.relative());
+                                    ui.add(egui::Label::new(path.display().to_string()).truncate())
+                                        .on_hover_text(path.display().to_string());
+                                    let error = e.reason.error().to_string();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} · {}",
+                                                if e.listing {
+                                                    "하위 목록 미확인"
+                                                } else {
+                                                    "항목 정보 미확인"
+                                                },
+                                                e.reason.label()
+                                            ))
+                                            .small(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(error);
+                                    ui.small(format!(
+                                        "확인 {}",
+                                        crate::local_date::display(Some(e.checked))
+                                    ));
+                                    ui.separator();
+                                }
+                            },
+                        );
+                    });
+            }
         }
         if let Some(checked) = self.tracking.checked {
             ui.small(format!(
@@ -951,179 +905,35 @@ impl DiskWeaveApp {
         }
         ui.small("처음에는 기준 스캔을 수행하며 Windows 권한 승인이 필요합니다.");
         ui.small("큰 폴더나 쓰기 중인 파일은 반영이 늦어질 수 있습니다.");
-        if self.index.saving_paused {
-            ui.small("저장 폴더가 추적 범위에 있어 중지·종료할 때 새 결과를 저장합니다.");
-        } else if !self.index.enabled || !self.index.writable {
-            ui.small("이 창의 새 결과와 재시작 기준점은 자동 저장되지 않습니다.");
-        }
+        ui.small("앱을 닫으면 자동 추적은 종료됩니다. 다음 실행에서는 다시 시작하세요.");
     }
-    fn new() -> Self {
-        let mut app = Self {
-            index: crate::index_job::IndexController::start_default(),
-            ..Self::default()
-        };
-        let _ = app.scan.configure_method(crate::engine::Method::Ntfs);
-        let preferences =
-            crate::startup::preference_path().and_then(|p| crate::startup::Preferences::load(&p));
-        let elevated = crate::startup::is_elevated();
-        app.startup = crate::startup::Controller::new(
-            elevated.as_ref().copied().unwrap_or(false),
-            preferences.as_ref().copied().unwrap_or_default(),
-        );
-        if std::env::args_os().any(|a| a == "--gui-elevated") {
-            app.startup.suppress_relaunch();
-        }
-        app.input_error = preferences
-            .err()
-            .or_else(|| elevated.err())
-            .map(|e| format!("시작 설정·권한 확인 실패: {e}"));
-        app
+    pub fn new() -> Self {
+        Self::default()
     }
-    fn index_tick(&mut self) {
-        self.index.saving_paused = self.tracking.running()
-            && self
-                .tracking
-                .location
-                .and_then(|id| self.scan.get(id))
-                .is_some_and(|entry| {
-                    crate::locations::contains_path(&entry.path, &self.index.root).unwrap_or(true)
-                });
-        if self.index.tick(&mut self.scan) {
-            self.explorer = self.scan.completed().map(|c| Explorer::new(&c.result));
-            self.search.invalidate();
-            self.detail_target = None;
-        }
-        if let Some(location) = self.scan.selected_id().and_then(|id| self.scan.get(id)) {
-            self.target.restore_default(location.path.clone());
-        }
-    }
-    fn index_settings(&mut self, ui: &mut egui::Ui) {
-        if self.archive_record.is_some() {
-            return;
-        }
-        ui.separator();
-        ui.strong("분석 목록");
-        let mut enabled = self.index.enabled;
-        if ui
-            .add_enabled(
-                self.index.writable && !self.index.busy(),
-                egui::Checkbox::new(&mut enabled, "분석 목록 자동 저장·복원"),
-            )
-            .changed()
-        {
-            self.index.configure(enabled);
-        }
-        ui.label(self.index.label());
-        if self.index.busy() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.small(self.index.stage());
-            });
-        }
-        ui.small("저장된 결과는 다시 스캔하기 전까지 실제 파일과 다를 수 있습니다.");
-        if let Some(notice) = &self.index.notice {
-            ui.colored_label(egui::Color32::YELLOW, notice);
-        }
-        ui.small("저장 위치");
-        ui.add(egui::Label::new(self.index.root.display().to_string()).wrap());
-        if matches!(self.index.status, crate::index_job::Status::ReadOnly) {
-            ui.small(
-                "다른 창에서 목록을 관리하고 있습니다. 이 창의 새 분석은 자동 저장되지 않습니다.",
-            );
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!self.index.busy(), egui::Button::new("다시 시도"))
-                .clicked()
-            {
-                self.index.retry(&self.scan);
-            }
-            if ui
-                .add_enabled(
-                    self.index.writable && !self.index.busy(),
-                    egui::Button::new("저장된 목록 비우기…"),
-                )
-                .clicked()
-            {
-                self.clear_index = true;
-                ui.close();
-            }
-        });
-    }
-    fn index_windows(&mut self, ctx: &egui::Context) {
-        use crate::index_job::CloseState;
+    fn close_windows(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested()) || self.file_close_requested;
-        if requested && self.file_job.working() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.file_job.cancel();
-            self.file_ui.visible = true;
-            self.file_close_requested = true;
+        if !requested {
             return;
         }
-        if requested && !matches!(self.closing, CloseState::Saved | CloseState::Discarded) {
+        self.file_close_requested = true;
+        self.file_job.cancel();
+        self.file_ui.dialog = None;
+        self.file_refresh.cancel(&mut self.scan);
+        self.scan.cancel();
+        self.tracking.stop();
+        if self.results.busy() {
+            self.results.job.cancel();
+        }
+        if self.file_job.working()
+            || self.scan.is_running()
+            || self.file_refresh.busy()
+            || self.results.busy()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.file_close_requested = false;
-            self.file_job.cancel();
-            self.file_ui.dialog = None;
-            if self.file_refresh.busy() {
-                self.file_refresh.cancel(&mut self.scan);
-            }
-            self.closing.request();
-            self.stop_tracking();
-            self.scan.cancel();
-        }
-        if self.closing.poll(&self.index, &self.scan) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if self.closing == CloseState::Waiting {
-            egui::Modal::new(egui::Id::unique("index_close")).show(ctx, |ui| {
-                ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 430.0));
-                ui.heading("분석 목록을 저장하고 종료합니다");
-                ui.add_space(10.0);
-                ui.label(self.index.label());
-                if self.index.busy() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(self.index.stage());
-                    });
-                }
-                ui.label("저장 없이 종료하면 마지막으로 저장된 목록을 다음에 불러옵니다.");
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("돌아가기").clicked() {
-                        self.closing.resume();
-                    }
-                    if ui
-                        .add_enabled(!self.index.busy(), egui::Button::new("다시 시도"))
-                        .clicked()
-                    {
-                        self.index.retry(&self.scan);
-                    }
-                    if ui.button("저장 없이 종료").clicked() {
-                        self.closing.discard();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            });
             ctx.request_repaint_after(Duration::from_millis(30));
-        } else if self.clear_index {
-            egui::Modal::new(egui::Id::unique("index_clear")).show(ctx, |ui| {
-                ui.set_width((ctx.content_rect().width() - 64.0).clamp(240.0, 400.0));
-                ui.heading("저장된 분석 목록을 비울까요?");
-                ui.add_space(10.0);
-                ui.label("원본 파일과 현재 화면의 분석 결과는 그대로 유지됩니다.");
-                ui.label("자동 저장이 켜져 있으면 새 스캔이나 목록 변경 시 다시 저장합니다.");
-                ui.horizontal(|ui| {
-                    if ui.button("취소").clicked() {
-                        self.clear_index = false;
-                    }
-                    if ui.button("저장된 목록 비우기").clicked() {
-                        self.index.clear();
-                        self.clear_index = false;
-                    }
-                });
-            });
+        } else {
+            self.file_close_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
     fn selection_target(&self) -> Option<Target> {
@@ -1148,49 +958,27 @@ impl DiskWeaveApp {
         })
     }
     fn source(&self) -> Option<Snapshot> {
-        let entry = self.scan.get(self.scan.selected_id()?)?;
+        let locations = self.active_locations();
+        let entry = locations.get(locations.selected_id()?)?;
         Some(Snapshot {
             id: entry.id,
             generation: entry.generation,
             scan: Arc::clone(&entry.scan.completed()?.result),
         })
     }
-    fn export_source(&self, source: Snapshot) -> crate::export::ExportSource {
-        let completed = self
-            .scan
-            .get(source.id)
-            .and_then(|location| location.scan.completed());
-        crate::export::ExportSource {
-            source,
-            started: completed.map(|c| c.started),
-            finished: completed.map(|c| c.finished),
-        }
-    }
     fn export_context(&self) -> crate::results_ui::ExportContext {
-        let sources: Vec<_> = self
-            .scan
-            .snapshots()
-            .into_iter()
-            .map(|s| self.export_source(s))
-            .collect();
+        let sources = self.scan.snapshots();
         let selected = sources
             .iter()
-            .position(|s| Some(s.source.id) == self.scan.selected_id());
+            .position(|s| Some(s.id) == self.scan.selected_id());
         let matches = if self.locations_view.global_mode {
-            self.locations_view.results().map(|r| {
-                (
-                    r.sources
-                        .iter()
-                        .cloned()
-                        .map(|s| self.export_source(s))
-                        .collect(),
-                    r.hits.clone(),
-                )
-            })
+            self.locations_view
+                .results()
+                .map(|r| (r.sources.clone(), r.hits.clone()))
         } else {
             self.source().zip(self.search.job.results()).map(|(s, r)| {
                 (
-                    vec![self.export_source(s)],
+                    vec![s],
                     r.items
                         .iter()
                         .map(|&item| Hit { source: 0, item })
@@ -1247,7 +1035,7 @@ impl DiskWeaveApp {
             self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 스캔하세요".into());
             return;
         }
-        self.stop_tracking();
+        self.tracking.stop();
         let Some(path) = self.target.path().map(PathBuf::from) else {
             self.input_error = Some("분석할 폴더를 선택하세요".into());
             return;
@@ -1461,17 +1249,6 @@ impl DiskWeaveApp {
                 crate::local_date::display(self.tracking.checked)
             );
         }
-        if !self.scan.is_running() {
-            if let Some(entry) = self
-                .scan
-                .selected_id()
-                .and_then(|id| self.scan.get(id))
-                .filter(|e| e.restored)
-            {
-                let when = crate::local_date::display(entry.scan.completed().map(|c| c.finished));
-                return format!("저장된 결과 · 마지막 스캔 {when} · 갱신 필요");
-            }
-        }
         match self.scan.status() {
             ScanStatus::Idle => "대기 중".into(),
             ScanStatus::Running | ScanStatus::Cancelling => {
@@ -1536,14 +1313,14 @@ impl DiskWeaveApp {
         }
         ui.horizontal(|ui| {
             let texture = self.logo.as_ref().unwrap();
-            ui.add(egui::Image::new((texture.id(), egui::vec2(32.0, 32.0))).uv(
+            ui.add(egui::Image::new((texture.id(), egui::vec2(24.0, 24.0))).uv(
                 egui::Rect::from_min_max(
                     egui::pos2(39.0 / 960.0, 37.0 / 240.0),
                     egui::pos2(205.0 / 960.0, 203.0 / 240.0),
                 ),
             ));
             ui.add(
-                egui::Image::new((texture.id(), egui::vec2(119.0, 28.0))).uv(
+                egui::Image::new((texture.id(), egui::vec2(113.0, 25.0))).uv(
                     egui::Rect::from_min_max(
                         egui::pos2(270.0 / 960.0, 92.0 / 240.0),
                         egui::pos2(575.0 / 960.0, 157.0 / 240.0),
@@ -1551,98 +1328,166 @@ impl DiskWeaveApp {
                 ),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.archive_record.is_some(){ui.small("조회 전용");}
-                let context=self.file_context(None);
-                ui.menu_button("작업",|ui|{self.file_ui.menu(ui,context.writable,None,context.paths.len(),context.current.is_some());if ui.button("파일 작업 보기").clicked(){self.file_ui.visible=true;ui.close();}});
-                let record = self.scan.completed().filter(|_|!self.locations_view.global_mode).map(|c| Arc::new(c.saved_result()));
-                let available = !self.scan.snapshots().is_empty();
-                self.results.menu(ui, self.scan.is_running() || self.file_blocked(), record, available, self.archive_record.is_some());
-                ui.menu_button("설정", |ui| {
-                    ui.set_max_width(340.0);
-                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height()-80.0).max(120.0)).show(ui,|ui|{
-                    let mut method=self.scan.method();
-                    ui.add_enabled_ui(!self.scan.is_running() && self.archive_record.is_none(),|ui|{
-                        ui.radio_value(&mut method,crate::engine::Method::Basic,"기본 스캔");
-                        ui.radio_value(&mut method,crate::engine::Method::Ntfs,"NTFS 고속 스캔 (시험 기능)");
-                    });
-                    if method!=self.scan.method(){self.input_error=self.scan.configure_method(method).err().map(|e|e.to_string());}
-                    ui.add_enabled_ui(!self.scan.is_running() && self.archive_record.is_none(),|ui|{
-                        ui.collapsing("고속 수집 방식 비교",|ui|{
-                            let mut mode=self.scan.fast_mode();
-                            for choice in [crate::engine::FastMode::Auto,crate::engine::FastMode::Legacy,crate::engine::FastMode::Mft] {ui.radio_value(&mut mode,choice,choice.label());}
-                            if mode!=self.scan.fast_mode(){self.input_error=self.scan.configure_fast_mode(mode).err().map(|e|e.to_string());}
-                            ui.small("자동: 드라이브는 기존 NTFS 방식, 폴더는 기본 탐색");
-                            ui.small("MFT 방식은 폴더를 선택해도 볼륨 전체 정보를 먼저 읽습니다. 작은 폴더에서는 더 느릴 수 있습니다.");
-                        });
-                    });
-                    ui.small("필요하면 Windows 권한 승인을 요청합니다.");
-                    ui.separator();
-                    ui.small("용량·디스크 할당 크기·파일 ID를 함께 확인합니다.");
-                    ui.separator();
-                    let mut parallelism=self.scan.parallelism();
-                    ui.add_enabled_ui(!self.scan.is_running() && !self.file_blocked() && self.archive_record.is_none(),|ui|{
-                        egui::ComboBox::from_id_salt("scan_parallelism").selected_text(format!("동시 작업: {}",parallelism.label())).show_ui(ui,|ui|{
-                            for choice in [crate::scanner::Parallelism::Auto,crate::scanner::Parallelism::Sequential,crate::scanner::Parallelism::Two,crate::scanner::Parallelism::Four,crate::scanner::Parallelism::Eight] {ui.selectable_value(&mut parallelism,choice,choice.label());}
-                        });
-                    });
-                    if parallelism!=self.scan.parallelism(){self.input_error=self.scan.configure_parallelism(parallelism).err().map(|e|e.to_string());}
-                    ui.small("기본 스캔에 적용 · 자동 모드는 최대 8개");
-                    ui.small("작업 수가 많을수록 디스크 부하가 커질 수 있습니다.");
-                    self.index_settings(ui);
-                    self.startup_settings(ui);
-                    });
-                });
-                if ui.available_width() < 700.0 && ui.button("상세 정보").clicked() {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if crate::ui_style::title_control(ui, "닫기").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                if crate::ui_style::title_control(ui, if maximized { "복원" } else { "최대화" })
+                    .clicked()
+                {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if crate::ui_style::title_control(ui, "최소화").clicked() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                if self.archive_record.is_some() {
+                    ui.small("조회 전용");
+                }
+                if ui.ctx().content_rect().width() < 1050.0 && ui.button("선택 항목").clicked()
+                {
                     self.details_open = !self.details_open;
+                }
+                let rect = ui.available_rect_before_wrap();
+                let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                if response.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if response.double_clicked() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
             });
         });
     }
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let (label_rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
-        crate::ui_style::text(
-            ui,
-            label_rect,
-            "분석 대상",
-            false,
-            crate::ui_style::TEXT,
-            13.0,
-        );
-        let hint = egui::Rect::from_min_max(label_rect.min + egui::vec2(75.0, 0.0), label_rect.max);
-        crate::ui_style::text(
-            ui,
-            hint,
-            "드라이브나 폴더를 선택하세요",
-            false,
-            crate::ui_style::SOFT,
-            12.0,
-        );
-        ui.add_space(9.0);
         let editable = !self.scan.is_running() && !self.file_blocked();
         let available = ui.available_width();
-        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            ui.spacing_mut().interact_size.y = 32.0;
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
             crate::ui_style::slot(
                 ui,
-                egui::vec2(64.0, 38.0),
+                egui::vec2(80.0, 32.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    if let Some(path) =
-                        self.locations_view
-                            .drive_control(ui, !editable, self.target.text())
-                    {
-                        self.input_error = self.target.choose_folder(path).err();
-                    }
+                    let label = self.target.text().chars().take(2).collect::<String>();
+                    ui.menu_button(format!("{label}  ▼"), |ui| {
+                        if let Some(path) =
+                            self.locations_view
+                                .drive_control(ui, !editable, self.target.text())
+                        {
+                            self.input_error = self.target.choose_folder(path).err();
+                        }
+                        ui.separator();
+                        ui.menu_button("분석 위치 관리", |ui| {
+                            ui.set_max_width(420.0);
+                            ui.add_enabled_ui(editable, |ui| {
+                                if let Some(path) = self.locations_view.controls(
+                                    ui,
+                                    &mut self.scan,
+                                    self.target.path(),
+                                ) {
+                                    if self.scan.entries.iter().any(|e| e.path == path) {
+                                        self.target.choose_registered(path);
+                                        self.input_error = None;
+                                    } else {
+                                        self.input_error = self.target.choose_folder(path).err();
+                                    }
+                                }
+                            });
+                        });
+                        ui.menu_button("실시간 갱신", |ui| {
+                            ui.set_max_width(380.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            self.tracking_controls(ui);
+                        });
+                        ui.separator();
+                        ui.menu_button("결과 · 파일 작업", |ui| {
+                            if ui.button("파일 작업 보기").clicked() {
+                                self.file_ui.visible = true;
+                                ui.close();
+                            }
+                            ui.separator();
+                            let record = self
+                                .scan
+                                .completed()
+                                .filter(|_| !self.locations_view.global_mode)
+                                .map(|c| Arc::new(c.saved_result()));
+                            let available = !self.scan.snapshots().is_empty();
+                            self.results.menu(
+                                ui,
+                                self.scan.is_running() || self.file_blocked(),
+                                record,
+                                available,
+                                self.archive_record.is_some(),
+                            );
+                        });
+                        ui.menu_button("스캔 옵션 · 앱 정보", |ui| {
+                            ui.set_max_width(340.0);
+                            egui::ScrollArea::vertical()
+                                .max_height((ui.ctx().content_rect().height() - 80.0).max(120.0))
+                                .show(ui, |ui| {
+                                    ui.collapsing("글꼴 라이선스 · Pretendard", |ui| {
+                                        ui.label(include_str!("../assets/fonts/OFL.txt"));
+                                    });
+                                    ui.label("일반 스캔");
+                                    ui.small("용량·디스크 할당 크기·파일 ID를 함께 확인합니다.");
+                                    ui.separator();
+                                    let mut parallelism = self.scan.parallelism();
+                                    ui.add_enabled_ui(
+                                        !self.scan.is_running()
+                                            && !self.file_blocked()
+                                            && self.archive_record.is_none(),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt("scan_parallelism")
+                                                .selected_text(format!(
+                                                    "동시 작업: {}",
+                                                    parallelism.label()
+                                                ))
+                                                .show_ui(ui, |ui| {
+                                                    for choice in [
+                                                        crate::scanner::Parallelism::Auto,
+                                                        crate::scanner::Parallelism::Sequential,
+                                                        crate::scanner::Parallelism::Two,
+                                                        crate::scanner::Parallelism::Four,
+                                                        crate::scanner::Parallelism::Eight,
+                                                    ] {
+                                                        ui.selectable_value(
+                                                            &mut parallelism,
+                                                            choice,
+                                                            choice.label(),
+                                                        );
+                                                    }
+                                                });
+                                        },
+                                    );
+                                    if parallelism != self.scan.parallelism() {
+                                        self.input_error = self
+                                            .scan
+                                            .configure_parallelism(parallelism)
+                                            .err()
+                                            .map(|e| e.to_string());
+                                    }
+                                    ui.small("기본 스캔에 적용 · 자동 모드는 최대 8개");
+                                    ui.small("작업 수가 많을수록 디스크 부하가 커질 수 있습니다.");
+                                });
+                        });
+                    });
                 },
             );
-            let path_width = (available - 438.0).max(80.0);
+            let path_width = (available - 298.0).max(80.0);
             let mut path = self.target.text().to_owned();
             if ui
                 .add_enabled(
                     editable,
                     egui::TextEdit::singleline(&mut path)
                         .desired_width((path_width - 24.0).max(40.0))
-                        .margin(egui::vec2(12.0, 10.0))
+                        .margin(egui::vec2(10.0, 6.0))
+                        .min_size(egui::vec2(40.0, 32.0))
+                        .align(egui::Align2::LEFT_CENTER)
                         .hint_text("분석할 폴더 경로"),
                 )
                 .changed()
@@ -1653,7 +1498,7 @@ impl DiskWeaveApp {
             if ui
                 .add_enabled(
                     editable,
-                    egui::Button::new("폴더 선택").min_size(egui::vec2(84.0, 38.0)),
+                    egui::Button::new("폴더 선택").min_size(egui::vec2(84.0, 32.0)),
                 )
                 .clicked()
             {
@@ -1661,74 +1506,33 @@ impl DiskWeaveApp {
                     self.input_error = self.target.choose_folder(path).err();
                 }
             }
-            crate::ui_style::slot(
-                ui,
-                egui::vec2(80.0, 38.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.add_enabled_ui(editable, |ui| {
-                        ui.menu_button("위치 관리", |ui| {
-                            ui.set_width(
-                                (ui.ctx().content_rect().width() - 48.0).clamp(240.0, 400.0),
-                            );
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                            ui.spacing_mut().item_spacing.y = 6.0;
-                            egui::ScrollArea::vertical()
-                                .max_height(360.0)
-                                .show(ui, |ui| {
-                                    if let Some(path) = self.locations_view.controls(
-                                        ui,
-                                        &mut self.scan,
-                                        self.target.path(),
-                                    ) {
-                                        if self.scan.entries.iter().any(|e| e.path == path) {
-                                            self.target.choose_registered(path);
-                                            self.input_error = None;
-                                        } else {
-                                            self.input_error =
-                                                self.target.choose_folder(path).err();
-                                        }
-                                    }
-                                    self.tracking_controls(ui);
-                                });
-                        });
-                    });
-                },
-            );
             if ui
                 .add_enabled(
-                    matches!(self.scan.status(), ScanStatus::Running),
-                    egui::Button::new("취소").min_size(egui::vec2(56.0, 38.0)),
-                )
-                .clicked()
-            {
-                self.scan.cancel();
-            }
-            if ui
-                .add_enabled(
-                    editable,
+                    editable || matches!(self.scan.status(), ScanStatus::Running),
                     egui::Button::new(
-                        egui::RichText::new("▷  스캔 시작")
-                            .color(egui::Color32::from_rgb(6, 17, 27))
-                            .strong(),
+                        egui::RichText::new(if self.scan.is_running() {
+                            "스캔 취소"
+                        } else {
+                            "스캔 시작"
+                        })
+                        .color(egui::Color32::from_rgb(6, 17, 27))
+                        .strong(),
                     )
                     .fill(egui::Color32::from_rgb(56, 154, 236))
                     .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgb(75, 166, 237),
                     ))
-                    .min_size(egui::vec2(114.0, 38.0)),
+                    .min_size(egui::vec2(114.0, 32.0)),
                 )
                 .clicked()
             {
-                self.begin_scan();
+                if self.scan.is_running() {
+                    self.scan.cancel();
+                } else {
+                    self.begin_scan();
+                }
             }
-        });
-        ui.add_space(7.0);
-        ui.small(if self.tracking.running() {
-            "스캔을 시작하면 실시간 갱신을 중지합니다."
-        } else {
-            "폴더를 끌어다 놓은 뒤 ‘스캔 시작’을 누르세요."
         });
     }
     fn summary(&self, ui: &mut egui::Ui) {
@@ -1771,9 +1575,6 @@ impl DiskWeaveApp {
         let stale = sources
             .iter()
             .any(|s| self.scan.get(s.id).is_some_and(|e| e.stale));
-        let restored = sources
-            .iter()
-            .any(|s| self.scan.get(s.id).is_some_and(|e| e.restored));
         let size = if !has_results {
             SizeDisplay {
                 text: "—".into(),
@@ -1787,119 +1588,54 @@ impl DiskWeaveApp {
                 exact: format!("{bytes} B"),
             }
         };
-        let card_height = ui.available_height().max(50.0);
-        ui.horizontal(|ui| {
-            let unit = (ui.available_width() - 30.0) / 4.4;
-            ui.spacing_mut().item_spacing.x = 10.0;
-            for (index, (label, value)) in [
-                (
-                    if preview.is_some() {
-                        "확인한 파일 용량"
-                    } else {
-                        "파일 크기 합계"
-                    },
-                    size.text,
-                ),
-                (
-                    if preview.is_some() {
-                        "발견한 파일"
-                    } else {
-                        "파일"
-                    },
-                    if has_results {
-                        crate::ui_style::count(files)
-                    } else {
-                        "—".into()
-                    },
-                ),
-                (
-                    if preview.is_some() {
-                        "발견한 하위 폴더"
-                    } else {
-                        "하위 폴더"
-                    },
-                    if has_results {
-                        crate::ui_style::count(folders)
-                    } else {
-                        "—".into()
-                    },
-                ),
-                (
-                    "분석 상태",
-                    if let Some(folder) = preview {
-                        folder.state().label().into()
-                    } else if !has_results && !self.scan.is_running() {
-                        "스캔 대기".into()
-                    } else if restored && !self.scan.is_running() {
-                        "저장된 결과 · 갱신 필요".into()
-                    } else {
-                        format!(
-                            "{} · {elapsed:.2}초 · 오류 {errors}",
-                            if self.scan.is_running() {
-                                "스캔 중"
-                            } else {
-                                "완료"
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 22.0;
+            ui.spacing_mut().interact_size.y = 22.0;
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+            let state = if self.scan.is_running() {
+                "스캔 중"
+            } else if stale {
+                "갱신 필요"
+            } else if live && self.tracking.excluded > 0 {
+                "갱신 중 · 일부 제외"
+            } else if live {
+                "실시간 갱신 중"
+
+            } else if has_results {
+                "분석 완료"
+            } else {
+                "스캔 대기"
+            };
+            ui.small(state);
+            ui.label(
+                egui::RichText::new(if preview.is_some() {
+                    format!("{} · 계산 중", size.text)
+                } else if errors > 0 {
+                    format!("{} · 일부", size.text)
+                } else {
+                    size.text
+                })
+                .size(12.0),
+            )
+            .on_hover_text(size.exact);
+            ui.small(format!("파일 {}개", crate::ui_style::count(files)));
+            ui.small(format!("폴더 {}개", crate::ui_style::count(folders)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.small(format!("{elapsed:.2}초"));
+                if errors > 0 {
+                    ui.menu_button(egui::RichText::new(format!("수집 누락 {errors}건 · 상세")).color(egui::Color32::from_rgb(235,194,120)), |ui| {
+                        ui.set_max_width(560.0);
+                        ui.label("읽을 수 없는 항목은 검색에서 제외됩니다. 일부 누락된 폴더는 확인된 용량만 표시합니다.");
+                        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                            for issue in sources.iter().flat_map(|s| &s.scan.issues).take(20) {
+                                ui.label(format!("{}\n{}", issue.path.display(), issue.error));
+                                ui.separator();
                             }
-                        )
-                    },
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let width = unit * if index == 0 { 1.4 } else { 1.0 };
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(width, card_height - 1.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(rect, 8.0, crate::ui_style::SURFACE);
-                ui.painter().rect_stroke(
-                    rect,
-                    8.0,
-                    egui::Stroke::new(1.0, crate::ui_style::LINE),
-                    egui::StrokeKind::Inside,
-                );
-                let inner = rect.shrink2(egui::vec2(
-                    15.0,
-                    if card_height < 65.0 { 6.0 } else { 10.0 },
-                ));
-                let title = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), 15.0));
-                crate::ui_style::text(ui, title, label, false, crate::ui_style::MUTED, 12.0);
-                let number = egui::Rect::from_min_max(inner.min + egui::vec2(0.0, 20.0), inner.max);
-                let shown = if index == 3 && has_results && preview.is_none() {
-                    if self.scan.is_running() {
-                        "스캔 중"
-                    } else if live {
-                        "실시간 갱신 중"
-                    } else if stale {
-                        "갱신 필요"
-                    } else if restored {
-                        "저장된 결과"
-                    } else {
-                        "스캔 완료"
-                    }
-                } else {
-                    &value
-                };
-                crate::ui_style::text(
-                    ui,
-                    number,
-                    shown,
-                    false,
-                    if index == 0 {
-                        egui::Color32::from_rgb(155, 212, 255)
-                    } else {
-                        crate::ui_style::TEXT
-                    },
-                    if card_height < 65.0 { 20.0 } else { 23.0 },
-                );
-                response.on_hover_text(if index == 0 {
-                    size.exact.clone()
-                } else {
-                    value
-                });
-            }
+                        });
+                        ui.small("상세는 최대 20건을 표시합니다. 폴더 내부에서 읽지 못한 항목 수는 알 수 없습니다.");
+                    });
+                }
+            });
         });
     }
     fn tree(&mut self, ui: &mut egui::Ui) {
@@ -1912,66 +1648,6 @@ impl DiskWeaveApp {
                 "크기순"
             },
         );
-        let mut chosen = None;
-        egui::Frame::new().inner_margin(8).show(ui, |ui| {
-            let current = self.scan.selected_id().and_then(|id| self.scan.get(id));
-            let label = if self.locations_view.global_mode {
-                "모든 분석 위치".into()
-            } else {
-                current
-                    .map(|e| {
-                        e.path
-                            .file_name()
-                            .unwrap_or(e.path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                    .unwrap_or_else(|| "분석 위치".into())
-            };
-            ui.menu_button(format!("●  {label}  ▾"), |ui| {
-                if ui
-                    .selectable_label(self.locations_view.global_mode, "모든 분석 위치 검색")
-                    .clicked()
-                {
-                    self.locations_view
-                        .choose_scope(&mut self.search, SearchScope::Registered);
-                    ui.close();
-                }
-                for entry in &self.scan.entries {
-                    if ui
-                        .selectable_label(
-                            self.scan.selected_id() == Some(entry.id)
-                                && !self.locations_view.global_mode,
-                            entry.path.display().to_string(),
-                        )
-                        .on_hover_text(if entry.stale {
-                            "오래된 결과 · 전체 검색에서 제외"
-                        } else if entry.restored {
-                            "저장된 목록 · 갱신 필요 · 다시 스캔하기 전까지 실제 파일과 다를 수 있습니다"
-                        } else {
-                            "마지막 완료 스캔 기준"
-                        })
-                        .clicked()
-                    {
-                        chosen = Some(entry.id);
-                        ui.close();
-                    }
-                }
-            });
-        });
-        if let Some(id) = chosen {
-            self.scan.choose(id);
-            if let Some(entry) = self.scan.get(id) {
-                self.target.choose_registered(entry.path.clone());
-            }
-            let scope = if self.search.whole_scan {
-                SearchScope::Location
-            } else {
-                SearchScope::Folder
-            };
-            self.locations_view.choose_scope(&mut self.search, scope);
-            self.sync_scan();
-        }
         if self.show_preview() {
             self.preview_tree(ui);
             return;
@@ -2058,18 +1734,7 @@ impl DiskWeaveApp {
                         );
                     }
                     if !source.scan.children[folder].is_empty() {
-                        crate::ui_style::text(
-                            ui,
-                            arrow,
-                            if explorer.is_expanded(folder) {
-                                "▾"
-                            } else {
-                                "▸"
-                            },
-                            false,
-                            crate::ui_style::SOFT,
-                            12.0,
-                        );
+                        crate::ui_style::chevron(ui, arrow, explorer.is_expanded(folder));
                         if ui
                             .interact(
                                 arrow,
@@ -2089,9 +1754,21 @@ impl DiskWeaveApp {
                     crate::ui_style::text(
                         ui,
                         name,
-                        &item_name(&source.scan, Item::Folder(folder)).to_string_lossy(),
+                        &format!(
+                            "{}{}",
+                            item_name(&source.scan, Item::Folder(folder)).to_string_lossy(),
+                            if source.scan.folders[folder].access
+                                == crate::scanner::FolderAccess::Complete
+                            {
+                                String::new()
+                            } else {
+                                format!(" · {}", source.scan.folders[folder].access.label())
+                            }
+                        ),
                         false,
-                        if selected {
+                        if source.scan.folders[folder].access.unreadable() {
+                            crate::ui_style::SOFT
+                        } else if selected {
                             crate::ui_style::TEXT
                         } else {
                             crate::ui_style::MUTED
@@ -2105,7 +1782,11 @@ impl DiskWeaveApp {
                     crate::ui_style::text(
                         ui,
                         size,
-                        &SizeDisplay::new(source.scan.folders[folder].logical_bytes).text,
+                        &if source.scan.folders[folder].access.unreadable() {
+                            "확인 불가".into()
+                        } else {
+                            SizeDisplay::new(source.scan.folders[folder].logical_bytes).text
+                        },
                         true,
                         crate::ui_style::SOFT,
                         11.0,
@@ -2115,9 +1796,15 @@ impl DiskWeaveApp {
                         destination = Some(folder);
                     }
                     response
-                        .on_hover_text(source.scan.folders[folder].path.display().to_string())
+                        .on_hover_text(format!(
+                            "{}\n{}",
+                            source.scan.folders[folder].path.display(),
+                            source.scan.folders[folder].access.label()
+                        ))
                         .context_menu(|ui| {
-                            if ui.button("이 폴더에서 검색").clicked() {
+                            crate::ui_style::menu_spacing(ui);
+                            if crate::ui_style::menu_action(ui, "이 폴더에서 검색", true).clicked()
+                            {
                                 destination = Some(folder);
                                 ui.close();
                             }
@@ -2183,35 +1870,36 @@ impl DiskWeaveApp {
                     if let (Some(source), Some(explorer)) = (&crumb_source, crumb_explorer) {
                         let folder = if whole { 0 } else { explorer.folder() };
                         if !global {
-                            if ui
-                                .add_enabled(folder != 0, egui::Button::new("↑").frame(false))
-                                .on_hover_text("상위 폴더")
-                                .clicked()
-                            {
+                            if crate::ui_style::back_button(ui, folder != 0).clicked() {
                                 destination = source.scan.folders[folder].parent;
                             }
-                            ui.menu_button(
-                                item_name(&source.scan, Item::Folder(folder)).to_string_lossy(),
-                                |ui| {
-                                    ui.label(
-                                        source.scan.folders[folder].path.display().to_string(),
-                                    );
-                                    for parent in explorer.breadcrumbs(&source.scan) {
-                                        if ui
-                                            .button(
-                                                item_name(&source.scan, Item::Folder(parent))
-                                                    .to_string_lossy(),
-                                            )
-                                            .clicked()
-                                        {
-                                            destination = Some(parent);
-                                            ui.close();
-                                        }
+                            let path = source.scan.folders[folder].path.display().to_string();
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 30.0),
+                                egui::Sense::click(),
+                            );
+                            crate::ui_style::text(
+                                ui,
+                                rect,
+                                &path,
+                                false,
+                                crate::ui_style::TEXT,
+                                13.0,
+                            );
+                            response.on_hover_text(&path).context_menu(|ui| {
+                                crate::ui_style::menu_spacing(ui);
+                                for parent in explorer.breadcrumbs(&source.scan) {
+                                    if ui
+                                        .button(
+                                            source.scan.folders[parent].path.display().to_string(),
+                                        )
+                                        .clicked()
+                                    {
+                                        destination = Some(parent);
+                                        ui.close();
                                     }
-                                },
-                            )
-                            .response
-                            .on_hover_text(source.scan.folders[folder].path.display().to_string());
+                                }
+                            });
                         } else {
                             ui.strong("모든 분석 위치");
                         }
@@ -2222,7 +1910,7 @@ impl DiskWeaveApp {
                 if layout.stacked {
                     crate::ui_style::slot(
                         ui,
-                        egui::vec2(crumb_width, 26.0),
+                        egui::vec2(crumb_width, 32.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         draw_crumb,
                     );
@@ -2231,8 +1919,11 @@ impl DiskWeaveApp {
                         egui::vec2(available - 24.0, 36.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            chosen_scope =
-                                self.search.controls(ui, self.locations_view.global_mode);
+                            chosen_scope = self.search.controls(
+                                ui,
+                                self.locations_view.global_mode,
+                                self.scan.snapshots().len() > 1,
+                            );
                         },
                     );
                 } else {
@@ -2252,8 +1943,11 @@ impl DiskWeaveApp {
                                 egui::vec2(control_width, 40.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    chosen_scope =
-                                        self.search.controls(ui, self.locations_view.global_mode);
+                                    chosen_scope = self.search.controls(
+                                        ui,
+                                        self.locations_view.global_mode,
+                                        self.scan.snapshots().len() > 1,
+                                    );
                                 },
                             );
                         },
@@ -2264,8 +1958,7 @@ impl DiskWeaveApp {
             self.locations_view.choose_scope(&mut self.search, scope);
             self.detail_target = None;
         }
-        if !compact
-            || self.search.input.is_active()
+        if self.search.input.is_active()
             || self.search.input.mode != crate::search::SearchMode::Name
             || !self.search.input.recursive
         {
@@ -2304,7 +1997,7 @@ impl DiskWeaveApp {
                             for (tab, label) in [
                                 (0, "폴더·파일"),
                                 (3, "검색 결과"),
-                                (1, "큰 파일"),
+                                (1, "대용량 파일"),
                                 (2, "확장자"),
                             ] {
                                 if tab == 3 && !self.search.input.is_active() {
@@ -2349,8 +2042,6 @@ impl DiskWeaveApp {
                                 } else {
                                     ui.checkbox(&mut self.statistics.matched, "검색된 파일만");
                                 }
-                            } else {
-                                self.search.column_controls(ui);
                             }
                         });
                     });
@@ -2408,7 +2099,12 @@ impl DiskWeaveApp {
         if let Some(results) = self.search.job.results() {
             if results.items.is_empty() {
                 ui.weak(if self.search.input.is_active() {
-                    "검색 결과가 없습니다. 검색어나 필터를 바꿔 보세요."
+                    "검색 결과가 없습니다. 검색어나 범위를 바꿔 보세요."
+                } else if source.scan.folders[self.explorer.as_ref().map_or(0, |e| e.folder())]
+                    .access
+                    .unreadable()
+                {
+                    "이 폴더의 목록을 읽을 수 없습니다. 접근 권한 또는 경로 상태를 확인하세요."
                 } else {
                     "이 폴더는 비어 있습니다."
                 });
@@ -2443,7 +2139,21 @@ impl DiskWeaveApp {
                                 crate::ui_style::name_cell(
                                     ui,
                                     self.search.widths.get(0),
-                                    &item_name(&source.scan, item).to_string_lossy(),
+                                    &match item {
+                                        Item::Folder(id)
+                                            if source.scan.folders[id].access
+                                                != crate::scanner::FolderAccess::Complete =>
+                                        {
+                                            format!(
+                                                "{} · {}",
+                                                item_name(&source.scan, item).to_string_lossy(),
+                                                source.scan.folders[id].access.label()
+                                            )
+                                        }
+                                        _ => item_name(&source.scan, item)
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    },
                                     matches!(item, Item::Folder(_)),
                                 );
                                 self.search.widths.cells(
@@ -2510,6 +2220,7 @@ impl DiskWeaveApp {
                             }
                         }
                         response.context_menu(|ui| {
+                            crate::ui_style::menu_spacing(ui);
                             self.file_ui.menu(
                                 ui,
                                 !self.file_job.busy()
@@ -2521,12 +2232,16 @@ impl DiskWeaveApp {
                             );
                             ui.separator();
                             ui.add_enabled_ui(self.search.selection.count() <= 1, |ui| {
-                                if ui.button("용량 분석으로 이동").clicked() {
+                                if crate::ui_style::menu_action(ui, "용량 분석으로 이동", true)
+                                    .clicked()
+                                {
                                     analyze = true;
                                     ui.close();
                                 }
                                 if let Item::Folder(id) = item {
-                                    if ui.button("이 폴더에서 검색").clicked() {
+                                    if crate::ui_style::menu_action(ui, "이 폴더에서 검색", true)
+                                        .clicked()
+                                    {
                                         destination = Some(id);
                                         ui.close();
                                     }
@@ -2613,24 +2328,6 @@ impl DiskWeaveApp {
             return;
         }
 
-        ui.small(if self.statistics.matched {
-            "파일 종류별 용량 · 검색된 파일"
-        } else {
-            "파일 종류별 용량 · 분석 폴더 전체"
-        });
-        ui.add_space(8.0);
-        if let Some(output) = &self.statistics.output {
-            type_chart(ui, &output.stats);
-        } else {
-            ui.weak(if self.statistics.running {
-                "집계 중…"
-            } else {
-                "아직 분석한 결과가 없습니다"
-            });
-        }
-        ui.add_space(8.0);
-        ui.separator();
-        ui.strong("선택 항목");
         let target = self.selection_target();
         let Some((id, generation, item)) = target else {
             ui.weak("파일이나 폴더를 선택하면 상세 정보가 표시됩니다.");
@@ -2732,36 +2429,15 @@ impl DiskWeaveApp {
                 }
             }
         });
-        let mut action = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button(if matches!(item, Item::Folder(_)) {
-                    "탐색기에서 열기"
-                } else {
-                    "파일 위치 열기"
-                })
-                .clicked()
-            {
-                action = Some(if matches!(item, Item::Folder(_)) {
-                    OpenAction::OpenFolder
-                } else {
-                    OpenAction::RevealFile
-                });
-            }
-            if matches!(item, Item::File(_)) && ui.button("파일 열기").clicked() {
-                action = Some(OpenAction::OpenFile);
-            }
-            if ui.button("용량 분석으로 이동").clicked() {
-                self.analyze_at(id, generation, item);
-            }
-        });
-        if let Some(action) = action {
-            self.start_open(OpenRequest::for_item(&scan, item, action));
-        }
-        if let Some(output) = &self.statistics.output {
-            allocation_summary(ui, &output.stats);
-        }
-        ui.small("크기 필터와 공간 지도는 파일 크기를 기준으로 표시합니다.");
+        egui::CollapsingHeader::new("용량 통계")
+            .default_open(true)
+            .show(ui, |ui| {
+                if let Some(output) = &self.statistics.output {
+                    type_chart(ui, &output.stats);
+                    allocation_summary(ui, &output.stats);
+                }
+                ui.small("크기 필터와 공간 지도는 파일 크기를 기준으로 표시합니다.");
+            });
     }
     fn map_panel(&mut self, ui: &mut egui::Ui) {
         if self.show_preview() {
@@ -2770,6 +2446,19 @@ impl DiskWeaveApp {
                 ui.small("스캔을 마치면 확인할 수 있습니다.");
             });
             return;
+        }
+        if !self.map_collapsed {
+            let (grip, response) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 5.0), egui::Sense::drag());
+            ui.painter().hline(
+                (grip.center().x - 16.0)..=(grip.center().x + 16.0),
+                grip.center().y,
+                egui::Stroke::new(2.0, crate::ui_style::SOFT),
+            );
+            if response.dragged() {
+                self.map_height = (self.map_height - response.drag_delta().y).clamp(96.0, 360.0);
+            }
+            response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
         }
         ui.spacing_mut().interact_size.y = 24.0;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
@@ -2801,19 +2490,6 @@ impl DiskWeaveApp {
                     {
                         self.map_collapsed = !self.map_collapsed;
                     }
-                    ui.menu_button("지도 옵션", |ui| {
-                        ui.add(egui::Slider::new(&mut self.map_height, 96.0..=360.0).text("높이"));
-                    });
-                    ui.selectable_value(&mut self.map_matched, true, "검색된 파일");
-                    ui.selectable_value(
-                        &mut self.map_matched,
-                        false,
-                        if self.locations_view.global_mode {
-                            "모든 분석 위치"
-                        } else {
-                            "폴더 전체"
-                        },
-                    );
                 });
             },
         );
@@ -2841,10 +2517,7 @@ impl DiskWeaveApp {
 
 impl eframe::App for DiskWeaveApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        crate::ntfs_helper::shutdown();
-        if self.closing == crate::index_job::CloseState::Saved {
-            self.index.shutdown();
-        }
+        self.tracking.stop();
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let key = self
@@ -2873,10 +2546,9 @@ impl eframe::App for DiskWeaveApp {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
 
-        self.startup_tick(ui.ctx());
         if self.archive_record.is_none() {
             if self.scan.is_running() {
-                self.stop_tracking();
+                self.tracking.stop();
                 self.tracking.location = None;
             }
             self.sync_scan();
@@ -2889,10 +2561,8 @@ impl eframe::App for DiskWeaveApp {
             }
             self.sync_tracking();
             self.file_tick();
-            self.index_tick();
-            self.index_windows(ui.ctx());
-            if self.index.busy()
-                || self.scan.is_running()
+            self.close_windows(ui.ctx());
+            if self.scan.is_running()
                 || self.tracking.running()
                 || self.file_job.working()
                 || self.file_refresh.busy()
@@ -2951,7 +2621,10 @@ impl eframe::App for DiskWeaveApp {
             self.saved_viewer = None;
         }
         if self.map_height == 0.0 {
-            self.map_height = 245.0;
+            self.map_height = 192.0;
+            if ui.ctx().content_rect().height() < 650.0 {
+                self.map_collapsed = true;
+            }
         }
         self.file_open.poll();
         if self.archive_record.is_some() {
@@ -2992,7 +2665,7 @@ impl eframe::App for DiskWeaveApp {
             .frame(
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(16, 23, 32))
-                    .inner_margin(egui::Margin::symmetric(24, 14)),
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ui, |ui| self.header(ui));
         egui::Panel::top("target")
@@ -3000,10 +2673,7 @@ impl eframe::App for DiskWeaveApp {
             .frame(
                 egui::Frame::new()
                     .fill(crate::ui_style::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(
-                        24,
-                        if size.y < 650.0 { 6 } else { 12 },
-                    )),
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(ui, |ui| {
                 if let Some(record) = &self.archive_record {
@@ -3030,10 +2700,7 @@ impl eframe::App for DiskWeaveApp {
             .frame(
                 egui::Frame::new()
                     .fill(bg())
-                    .inner_margin(egui::Margin::symmetric(
-                        24,
-                        if size.y < 650.0 { 6 } else { 12 },
-                    )),
+                    .inner_margin(egui::Margin::symmetric(14, 4)),
             )
             .show(ui, |ui| self.summary(ui));
         egui::Panel::bottom("status")
@@ -3058,42 +2725,6 @@ impl eframe::App for DiskWeaveApp {
                             .map(|p| p.display().to_string())
                             .unwrap_or_default()
                     ));
-                    if self.archive_record.is_none()
-                        && !matches!(self.index.status, crate::index_job::Status::Dormant)
-                    {
-                        let label = match self.index.status {
-                            crate::index_job::Status::Failed(_) => "목록 저장·복원 오류",
-                            crate::index_job::Status::ReadOnly => "목록 조회 전용",
-                            crate::index_job::Status::Loading => "목록 불러오는 중…",
-                            crate::index_job::Status::Saving => "목록 저장 중…",
-                            crate::index_job::Status::Disabled => "자동 저장 꺼짐",
-                            _ if self.index.saving_paused => "추적 중 저장 대기",
-                            _ => "목록 자동 저장",
-                        };
-                        let response = ui.small(label);
-                        response.on_hover_text(format!(
-                            "{}\n{}\n{}",
-                            self.index.label(),
-                            self.index.root.display(),
-                            self.index.notice.as_deref().unwrap_or(
-                                "복원한 결과는 다시 스캔하기 전까지 실제 파일과 다를 수 있습니다."
-                            )
-                        ));
-                    }
-                    if self.locations_view.global_mode {
-                        let restored = self
-                            .scan
-                            .entries
-                            .iter()
-                            .filter(|e| e.restored && !e.stale && e.enabled)
-                            .count();
-                        if restored > 0 {
-                            ui.colored_label(
-                                egui::Color32::YELLOW,
-                                format!("저장된 위치 {restored}개 포함 · 갱신 필요"),
-                            );
-                        }
-                    }
                     if let Some(report) = self
                         .scan
                         .completed()
@@ -3113,7 +2744,7 @@ impl eframe::App for DiskWeaveApp {
                     };
                     let errors: u64 = sources.iter().map(|s| s.scan.error_count).sum();
                     let skipped: u64 = sources.iter().map(|s| s.scan.skipped_reparse_points).sum();
-                    ui.small(format!("오류 {errors} · 특수 경로 제외 {skipped}"));
+                    ui.small(format!("수집 누락 {errors}건 · 특수 경로 제외 {skipped}"));
                     if !sources.is_empty() {
                         let detailed = sources.iter().filter(|s| s.scan.detailed).count();
                         ui.small(if detailed == sources.len() {
@@ -3226,13 +2857,23 @@ impl eframe::App for DiskWeaveApp {
             .resizable(false)
             .frame(egui::Frame::new().fill(surface()))
             .show(ui, |ui| self.tree(ui));
+        if size.x < 1050.0 && self.details_open {
+            let mut open = self.details_open;
+            egui::Window::new("선택 항목")
+                .open(&mut open)
+                .default_width(240.0)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.details(ui));
+                });
+            self.details_open = open;
+        }
         if panels.right > 0.0 {
             egui::Panel::right("details")
                 .exact_size(panels.right)
                 .resizable(false)
                 .frame(egui::Frame::new().fill(surface()))
                 .show(ui, |ui| {
-                    crate::ui_style::panel_title(ui, "용량 분석", "분석·상세");
+                    crate::ui_style::panel_title(ui, "선택 항목", "");
                     egui::ScrollArea::vertical()
                         .id_salt("detail_scroll")
                         .show(ui, |ui| {
@@ -3289,8 +2930,7 @@ impl eframe::App for DiskWeaveApp {
             let mut context = self.file_context(Some(paths.clone()));
             for entry in &self.scan.entries {
                 if crate::file_ops::contains_path(&entry.path, &destination).unwrap_or(true) {
-                    context.writable &=
-                        !entry.stale && !entry.restored && entry.scan.completed().is_some();
+                    context.writable &= !entry.stale && entry.scan.completed().is_some();
                 }
             }
             self.input_error = self
@@ -3348,11 +2988,26 @@ impl eframe::App for DiskWeaveApp {
             )
             || matches!(self.file_open.status(), OpenStatus::Running)
             || self.results.busy()
-            || self.index.busy()
             || self.file_job.working()
             || self.file_refresh.busy()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    #[test]
+    fn a_new_app_starts_an_empty_general_session_and_does_not_restore_previous_results() {
+        let app = DiskWeaveApp::new();
+        assert!(app.active_locations().entries.is_empty());
+        assert!(app.active_locations().snapshots().is_empty());
+        assert!(!app.active_locations().is_running());
+        assert_eq!(app.selected_path(), Some(std::path::Path::new("C:\\")));
+        drop(app);
+        let reopened = DiskWeaveApp::new();
+        assert!(reopened.active_locations().entries.is_empty());
     }
 }

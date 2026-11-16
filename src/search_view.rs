@@ -23,9 +23,9 @@ pub enum SearchScope {
 impl SearchScope {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Folder => "이 폴더",
-            Self::Location => "분석 대상 전체",
-            Self::Registered => "모든 분석 위치",
+            Self::Folder => "현재 폴더 안에서",
+            Self::Location => "스캔한 위치 전체",
+            Self::Registered => "모든 스캔 위치",
         }
     }
 }
@@ -38,7 +38,6 @@ type LiveSelection = (
     std::collections::HashSet<std::path::PathBuf>,
 );
 
-#[derive(Default)]
 pub struct SearchView {
     live_selection: Option<LiveSelection>,
     pub show_source: bool,
@@ -58,8 +57,49 @@ pub struct SearchView {
     last_request: Option<(SearchInput, usize, bool)>,
 }
 
+impl Default for SearchView {
+    fn default() -> Self {
+        Self {
+            live_selection: Default::default(),
+            show_source: Default::default(),
+            presentation: Default::default(),
+            show_allocated: Default::default(),
+            show_path: true,
+            show_modified: true,
+            widths: Default::default(),
+            horizontal_offset: Default::default(),
+            input: Default::default(),
+            whole_scan: Default::default(),
+            selection: Default::default(),
+            job: Default::default(),
+            editing: Default::default(),
+            reveal_row: Default::default(),
+            focus_after_analysis: Default::default(),
+            last_request: Default::default(),
+        }
+    }
+}
+
 impl SearchView {
-    pub fn rebase(&mut self, old: &ScanResult, new: &Arc<ScanResult>, folder: usize) {
+    /// 완료 결과 교체 시 탐색 위치와 검색 선택을 같은 세대로 재연결.
+    pub fn replace_result(
+        &mut self,
+        previous: Option<&crate::explorer::Explorer>,
+        old: Option<&ScanResult>,
+        new: &Arc<ScanResult>,
+    ) -> crate::explorer::Explorer {
+        let explorer = match (previous, old) {
+            (Some(view), Some(old)) => view.rebase(old, new),
+            _ => crate::explorer::Explorer::new(new),
+        };
+        if let Some(old) = old {
+            self.rebase(old, new, explorer.folder());
+        } else {
+            self.invalidate();
+        }
+        explorer
+    }
+    fn rebase(&mut self, old: &ScanResult, new: &Arc<ScanResult>, folder: usize) {
         let paths = if let Some(pending) = self.live_selection.take() {
             pending.4
         } else {
@@ -278,7 +318,12 @@ impl SearchView {
         }
     }
 
-    pub fn controls(&mut self, ui: &mut egui::Ui, global: bool) -> Option<SearchScope> {
+    pub fn controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        global: bool,
+        multiple: bool,
+    ) -> Option<SearchScope> {
         self.editing = false;
         let current = self.scope(global);
         let mut chosen = None;
@@ -289,12 +334,20 @@ impl SearchView {
             egui::vec2(width.scope, 32.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.menu_button(format!("{} ▾", current.label()), |ui| {
+                let response = crate::ui_style::scope_button(ui, current.label(), width.scope);
+                egui::Popup::menu(&response).show(|ui| {
+                    crate::ui_style::menu_spacing(ui);
                     for scope in [
                         SearchScope::Folder,
                         SearchScope::Location,
                         SearchScope::Registered,
                     ] {
+                        if scope == SearchScope::Registered
+                            && !multiple
+                            && current != SearchScope::Registered
+                        {
+                            continue;
+                        }
                         if ui
                             .selectable_label(current == scope, scope.label())
                             .clicked()
@@ -303,7 +356,11 @@ impl SearchView {
                             ui.close();
                         }
                     }
-                    ui.small("스캔이 끝난 위치에서만 검색합니다.");
+                    ui.small("현재 폴더: 선택한 폴더와 하위 항목");
+                    ui.small("스캔한 위치 전체: 현재 위치의 스캔 시작점부터");
+                    if multiple {
+                        ui.small("모든 스캔 위치: 수집이 완료된 여러 위치를 함께 검색");
+                    }
                 });
             },
         );
@@ -311,25 +368,11 @@ impl SearchView {
             .add(
                 egui::TextEdit::singleline(&mut self.input.text)
                     .id(egui::Id::unique("search_query"))
-                    .hint_text("파일이나 폴더 검색")
-                    .desired_width((ui.available_width() - width.filter - 26.0).max(48.0))
+                    .hint_text("선택한 범위에서 이름 검색")
+                    .desired_width((ui.available_width() - 8.0).max(48.0))
                     .margin(egui::vec2(8.0, 6.0)),
             )
             .has_focus();
-        ui.menu_button(
-            if self.input.is_active() {
-                "필터 •"
-            } else {
-                "필터"
-            },
-            |ui| {
-                ui.set_min_width(300.0);
-                ui.spacing_mut().item_spacing.y = 7.0;
-                self.options(ui);
-                ui.separator();
-                self.filter_fields(ui);
-            },
-        );
         chosen
     }
     pub fn filter_chips(&mut self, ui: &mut egui::Ui) {
@@ -377,70 +420,6 @@ impl SearchView {
                 });
             });
     }
-    fn options(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.input.mode, SearchMode::Name, "이름");
-            ui.selectable_value(&mut self.input.mode, SearchMode::Path, "전체 경로");
-            ui.checkbox(&mut self.input.recursive, "하위 폴더 포함");
-            if ui.button("검색 초기화").clicked() {
-                self.clear_conditions();
-            }
-        });
-    }
-    fn filter_fields(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.input.kind, EntryKind::All, "전체");
-            ui.selectable_value(&mut self.input.kind, EntryKind::Files, "파일");
-            ui.selectable_value(&mut self.input.kind, EntryKind::Folders, "폴더");
-            ui.label("확장자");
-            self.editing |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.input.extensions)
-                        .desired_width(150.0)
-                        .hint_text("npy;nii.gz"),
-                )
-                .has_focus();
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("최소 크기 (B)");
-            self.editing |= ui
-                .add(egui::TextEdit::singleline(&mut self.input.min_size).desired_width(100.0))
-                .has_focus();
-            ui.label("최대 크기 (B)");
-            self.editing |= ui
-                .add(egui::TextEdit::singleline(&mut self.input.max_size).desired_width(100.0))
-                .has_focus();
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("수정 날짜 · 시작일과 종료일 포함");
-            self.editing |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.input.from_date)
-                        .desired_width(110.0)
-                        .hint_text("YYYY-MM-DD"),
-                )
-                .has_focus();
-            ui.label("~");
-            self.editing |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.input.to_date)
-                        .desired_width(110.0)
-                        .hint_text("YYYY-MM-DD"),
-                )
-                .has_focus();
-        });
-    }
-
-    pub fn column_controls(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("열 표시", |ui| {
-            ui.checkbox(&mut self.show_allocated, "할당 크기");
-            ui.checkbox(&mut self.show_path, "전체 경로");
-            ui.add_enabled_ui(self.show_path, |ui| {
-                ui.checkbox(&mut self.show_source, "분석 위치 표시");
-            });
-            ui.checkbox(&mut self.show_modified, "수정 날짜");
-        });
-    }
     pub fn headers(&mut self, ui: &mut egui::Ui) {
         self.widths.fit(
             ui.available_width(),
@@ -463,7 +442,7 @@ impl SearchView {
                         (0, Some(SortField::Name), "이름"),
                         (2, Some(SortField::Size), "크기"),
                         (7, None, "할당 크기"),
-                        (4, None, "상위 폴더 대비"),
+                        (4, None, "부모 대비"),
                         (5, None, "파일"),
                         (6, None, "폴더"),
                         (
@@ -591,6 +570,60 @@ impl SearchView {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn default_list_includes_path_and_modified_date() {
+        let view = SearchView::default();
+        assert!(view.show_path && view.show_modified);
+        let mut widths = view.widths;
+        widths.fit(916.0, true, true, false);
+        assert!(widths.total(true, true, false) <= 916.1);
+    }
+    #[test]
+    fn result_replacement_rebases_navigation_and_resets_only_without_a_previous_result() {
+        use crate::explorer::Explorer;
+        let root =
+            std::env::temp_dir().join(format!("diskweave-result-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/deep")).unwrap();
+        std::fs::create_dir_all(root.join("b/child")).unwrap();
+        std::fs::write(root.join("a/deep/kept.bin"), b"123").unwrap();
+        let old = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let mut explorer = Explorer::new(&old);
+        explorer.toggle_folder(&old, old.folder_index(std::path::Path::new("b")).unwrap());
+        explorer.open_folder(
+            &old,
+            old.folder_index(std::path::Path::new("a/deep")).unwrap(),
+        );
+        explorer.select(Item::File(0));
+        let mut view = SearchView::default();
+        view.input.text = "bin".into();
+        view.refresh(&old, explorer.folder());
+        wait(&mut view);
+        view.selection.click(0, false, false);
+        std::fs::write(root.join("new"), b"1234567").unwrap();
+        let new = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let explorer = view.replace_result(Some(&explorer), Some(&old), &new);
+        wait(&mut view);
+        assert_eq!(new.folders[explorer.folder()].path, root.join("a/deep"));
+        assert_eq!(
+            crate::search::item_path(&new, explorer.selected()),
+            root.join("a/deep/kept.bin")
+        );
+        assert!(explorer.is_expanded(new.folder_index(std::path::Path::new("b")).unwrap()));
+        assert_eq!(view.input.text, "bin");
+        assert_eq!(view.selection.count(), 1);
+        std::fs::remove_file(root.join("a/deep/kept.bin")).unwrap();
+        std::fs::remove_dir(root.join("a/deep")).unwrap();
+        let next = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let explorer = view.replace_result(Some(&explorer), Some(&new), &next);
+        wait(&mut view);
+        assert_eq!(next.folders[explorer.folder()].path, root.join("a"));
+        assert_eq!(view.selection.count(), 0);
+        let initial = view.replace_result(None, None, &next);
+        assert_eq!(initial.folder(), 0);
+        assert!(view.job.results().is_none());
+        assert_eq!(view.input.text, "bin");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn live_search_keeps_conditions_and_surviving_selection_after_resorting() {
         let root =
             std::env::temp_dir().join(format!("diskweave-search-live-{}", std::process::id()));
@@ -656,7 +689,7 @@ mod tests {
         view.clear_conditions();
         assert!(view.sync_presentation(&mut map));
         assert!(!map);
-        assert!(!view.show_path && !view.show_source);
+        assert!(view.show_path && !view.show_source);
         map = true;
         view.input.kind = EntryKind::Files;
         view.sync_presentation(&mut map);
