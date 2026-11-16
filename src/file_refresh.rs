@@ -282,16 +282,20 @@ mod tests {
                 move |_, _, _, cancel, publish| {
                     while !cancel() {
                         if let Ok(record) = receive.recv_timeout(Duration::from_millis(5)) {
-                            publish(record);
+                            publish(record)?;
                         }
                     }
                     Ok(())
                 },
             )
             .unwrap();
-        send.send(make_record(old, cycle_before_operation)).unwrap();
+        send.send(crate::usn::WatchUpdate::Record(Box::new(make_record(
+            old,
+            cycle_before_operation,
+        ))))
+        .unwrap();
         loop {
-            if let Some(record) = tracking.poll() {
+            if let Some(crate::tracking::Update::Record(record)) = tracking.poll() {
                 locations.accept_tracking(id, &record).unwrap();
                 break;
             }
@@ -312,10 +316,34 @@ mod tests {
             crate::scanner::scan_unified(&root, Default::default(), || false, |_| {}, None)
                 .unwrap(),
         );
-        send.send(make_record(updated, since)).unwrap();
+        send.send(crate::usn::WatchUpdate::Record(Box::new(make_record(
+            updated,
+            cycle_before_operation,
+        ))))
+        .unwrap();
         loop {
-            if let Some(record) = tracking.poll() {
+            if let Some(crate::tracking::Update::Record(record)) = tracking.poll() {
                 locations.accept_tracking(id, &record).unwrap();
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        refresh.poll(
+            &mut locations,
+            Some((id, tracking.confirmed_after, tracking.running())),
+        );
+        assert!(refresh.busy());
+        send.send(crate::usn::WatchUpdate::Cursor(crate::usn::Advance {
+            next: 108,
+            pending: vec![],
+            confirmed_after: Some(since),
+            finished: SystemTime::now(),
+        }))
+        .unwrap();
+        loop {
+            if let Some(crate::tracking::Update::Cursor(cursor)) = tracking.poll() {
+                locations.accept_cursor(id, cursor).unwrap();
                 break;
             }
             assert!(Instant::now() < until);

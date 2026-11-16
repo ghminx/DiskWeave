@@ -288,7 +288,12 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
             true,
             Some(Arc::new(loaded)),
             &|| worker_stop.load(Ordering::Relaxed),
-            |record| *worker_output.lock().unwrap() = Some(record),
+            |update| {
+                if let crate::usn::WatchUpdate::Record(record) = update {
+                    *worker_output.lock().unwrap() = Some(*record);
+                }
+                Ok(())
+            },
             |_| {
                 worker_progress.fetch_add(1, Ordering::Relaxed);
             },

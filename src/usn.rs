@@ -228,6 +228,18 @@ impl Node {
         self.attributes & 0x400 != 0
     }
 }
+/// 변경 없는 주기의 성공 확인. 전체 파일 목록과 분리한 전송 값.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Advance {
+    pub next: i64,
+    pub pending: Vec<u64>,
+    pub confirmed_after: Option<SystemTime>,
+    pub finished: SystemTime,
+}
+pub enum WatchUpdate {
+    Record(Box<SavedScan>),
+    Cursor(Advance),
+}
 pub struct Index {
     root: PathBuf,
     detailed: bool,
@@ -943,7 +955,12 @@ impl Index {
             if directories.is_empty() {
                 break;
             }
-            directories.sort_by_key(|p| p.components().count());
+            directories.sort_by(|a, b| {
+                a.components()
+                    .count()
+                    .cmp(&b.components().count())
+                    .then_with(|| a.cmp(b))
+            });
             directories.dedup();
         }
         let final_root = Node::from_info(source.inspect(&self.root, false)?)?;
@@ -1133,6 +1150,8 @@ mod tests {
         replace_after: Option<(PathBuf, usize)>,
         not_found_once: Option<PathBuf>,
         advance_on_journal: Option<Duration>,
+        replace_on_read: Vec<(PathBuf, u64, u64)>,
+        list_budget: HashMap<PathBuf, usize>,
     }
     impl Source for Fixture {
         fn journal(&mut self) -> io::Result<Journal> {
@@ -1142,12 +1161,23 @@ mod tests {
             Ok(self.journal.clone())
         }
         fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<Event>> {
-            Ok(self
+            let events = self
                 .events
                 .iter()
                 .filter(|e| e.usn >= start && e.usn < end)
                 .cloned()
-                .collect())
+                .collect();
+            for (i, (path, old, parent)) in std::mem::take(&mut self.replace_on_read)
+                .into_iter()
+                .enumerate()
+            {
+                fs::rename(&path, self.root.join(format!("previous-{i}")))?;
+                fs::write(&path, b"12345")?;
+                let new = self.id(&path);
+                self.event(old, parent, 0x80000200);
+                self.event(new, parent, 0x80000100);
+            }
+            Ok(events)
         }
         fn now(&self) -> SystemTime {
             self.clock
@@ -1183,6 +1213,12 @@ mod tests {
             crate::ntfs_native::inspect_file(path, detailed, &self.journal.volume)
         }
         fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            if let Some(remaining) = self.list_budget.get_mut(path) {
+                if *remaining == 0 {
+                    return Err(io::Error::other("시험용 폴더 조회 예산 초과"));
+                }
+                *remaining -= 1;
+            }
             if let Some(code) = self.list_failures.get(path) {
                 return Err(io::Error::from_raw_os_error(*code));
             }
@@ -1223,6 +1259,8 @@ mod tests {
                 replace_after: None,
                 not_found_once: None,
                 advance_on_journal: None,
+                replace_on_read: vec![],
+                list_budget: HashMap::new(),
             }
         }
         fn id(&mut self, path: &Path) -> u64 {
@@ -1244,6 +1282,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    #[test]
+    fn replacements_in_two_parents_finish_with_one_listing_per_parent_and_exact_metadata() {
+        let mut source = Fixture::new();
+        let scope = source.root.join("scope");
+        for name in ["a", "b"] {
+            fs::create_dir(scope.join(name)).unwrap();
+        }
+        let mut paths = vec![];
+        for i in 0..64 {
+            let parent = scope.join(if i % 2 == 0 { "a" } else { "b" });
+            let path = parent.join(format!("file-{i}"));
+            fs::write(&path, b"123").unwrap();
+            paths.push((path.clone(), source.id(&path), source.id(&parent)));
+        }
+        let mut index = Index::begin(&scope, true, &mut source, &|| false).unwrap();
+        for (_, id, parent) in &paths {
+            source.event(*id, *parent, 0x80000001);
+        }
+        source.replace_on_read = paths;
+        for name in ["a", "b"] {
+            source.list_budget.insert(scope.join(name), 1);
+        }
+        assert!(index.refresh(&mut source, &|| false).unwrap());
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 320);
+        assert_eq!(record.scan.files.len(), 64);
+        let expected = crate::scanner::scan_with_options(&scope, true, || false, |_| {}).unwrap();
+        let rows = |scan: &ScanResult| -> BTreeMap<_, _> {
+            scan.files
+                .iter()
+                .map(|f| {
+                    (
+                        scan.folders[f.parent].path.join(&f.name),
+                        (
+                            f.logical_bytes,
+                            f.created,
+                            f.modified,
+                            f.attributes,
+                            f.extra,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(rows(&record.scan), rows(&expected));
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
     }
     #[test]
     fn deletion_between_enumeration_and_inspection_is_confirmed_before_ignoring() {

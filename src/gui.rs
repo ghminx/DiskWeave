@@ -694,23 +694,27 @@ impl DiskWeaveApp {
             return;
         }
         let was_running = self.tracking.running();
-        if let Some(record) = self.tracking.poll() {
-            let old = self
-                .scan
-                .get(id)
-                .and_then(|e| e.scan.completed())
-                .map(|c| Arc::clone(&c.result));
+        if let Some(update) = self.tracking.poll() {
             self.locations_view.preserve_live_selection();
-            match self.scan.accept_tracking(id, &record) {
-                Ok(true) if self.scan.selected_id() == Some(id) => {
-                    self.replace_live_result(old.as_deref(), &record.scan);
+            let accepted = match update {
+                crate::tracking::Update::Record(record) => {
+                    let old = self
+                        .scan
+                        .get(id)
+                        .and_then(|e| e.scan.completed())
+                        .map(|c| Arc::clone(&c.result));
+                    self.scan.accept_tracking(id, &record).map(|changed| {
+                        if changed && self.scan.selected_id() == Some(id) {
+                            self.replace_live_result(old.as_deref(), &record.scan);
+                        }
+                    })
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    self.tracking.stop();
-                    self.input_error = Some(error.to_string());
-                    self.scan.tracking_failed(id);
-                }
+                crate::tracking::Update::Cursor(cursor) => self.scan.accept_cursor(id, cursor),
+            };
+            if let Err(error) = accepted {
+                self.tracking.stop();
+                self.input_error = Some(error.to_string());
+                self.scan.tracking_failed(id);
             }
         }
         if was_running && matches!(self.tracking.status, crate::tracking::Status::Failed(_)) {
@@ -1854,7 +1858,7 @@ impl DiskWeaveApp {
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(12, 0))
             .show(ui, |ui| {
-                let control_width = layout.scope + layout.input + layout.filter + 16.0;
+                let control_width = layout.scope + layout.input + 16.0;
                 let crumb_width = if layout.stacked {
                     available - 24.0
                 } else {
@@ -2653,7 +2657,6 @@ impl eframe::App for DiskWeaveApp {
             size.x,
             size.y,
             self.map_height,
-            self.details_open,
             self.map_collapsed || self.show_preview(),
         );
         if self.archive_record.is_some() {

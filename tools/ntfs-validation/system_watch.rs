@@ -34,12 +34,15 @@ pub fn run(output: &Path) -> io::Result<()> {
         true,
         None,
         &|| stop.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(900),
-        |record| {
+        |update| {
+            let crate::usn::WatchUpdate::Record(record) = update else {
+                return Ok(());
+            };
             let validation = record.tracking.as_ref().unwrap().validate(&record.scan);
             if let Err(e) = validation {
                 failure = Some(e);
                 stop.store(true, Ordering::Relaxed);
-                return;
+                return Ok(());
             }
             let found = record
                 .scan
@@ -53,7 +56,7 @@ pub fn run(output: &Path) -> io::Result<()> {
                 _ => None,
             };
             if bytes != expected {
-                return;
+                return Ok(());
             }
             let unavailable = &record.tracking.as_ref().unwrap().unavailable;
             eprintln!(
@@ -80,6 +83,7 @@ pub fn run(output: &Path) -> io::Result<()> {
                 stop.store(true, Ordering::Relaxed);
             }
             stage += 1;
+            Ok(())
         },
         |event| {
             if progress.elapsed() >= Duration::from_secs(10) {

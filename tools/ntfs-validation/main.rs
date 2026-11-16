@@ -37,6 +37,8 @@ mod search;
 #[path = "../../src/snapshot.rs"]
 mod snapshot;
 mod system_watch;
+#[path = "../../src/tracking.rs"]
+mod tracking;
 #[path = "../../src/usn.rs"]
 mod usn;
 mod usn_cases;

@@ -221,6 +221,13 @@ impl ScanController {
         self.active.as_ref().map(|active| active.started.elapsed())
     }
 
+    pub fn accept_cursor(&mut self, cursor: crate::tracking::Confirmation) -> std::io::Result<()> {
+        let complete = self
+            .completed
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("확인할 완료 결과가 없습니다"))?;
+        cursor.apply(complete)
+    }
     pub fn completed(&self) -> Option<&CompletedScan> {
         self.completed.as_ref()
     }

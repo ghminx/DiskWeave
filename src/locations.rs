@@ -150,6 +150,27 @@ impl Locations {
         }
         Ok(changed)
     }
+    /// 같은 결과의 기준점만 갱신하고 화면 세대 유지.
+    pub fn accept_cursor(
+        &mut self,
+        id: u64,
+        cursor: crate::tracking::Confirmation,
+    ) -> io::Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| io::Error::other("추적 위치가 목록에서 제거되었습니다"))?;
+        if entry.scan.is_running() {
+            return Err(io::Error::other("현재 스캔 중인 위치입니다"));
+        }
+        entry.scan.accept_cursor(cursor)?;
+        if entry.stale {
+            entry.stale = false;
+            self.epoch += 1;
+        }
+        Ok(())
+    }
     pub fn tracking_failed(&mut self, id: u64) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
             if !entry.stale {

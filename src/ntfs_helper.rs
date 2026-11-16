@@ -354,20 +354,14 @@ impl Pipe<'_> {
         read_record_from(self)
     }
 }
-#[derive(Serialize, Deserialize)]
-struct Advance {
-    next: i64,
-    pending: Vec<u64>,
-    confirmed_after: Option<SystemTime>,
-    finished: SystemTime,
-}
+use crate::usn::{Advance, WatchUpdate};
 /// 명시적으로 선택한 NTFS 위치의 변경 추적을 제한된 읽기 전용 도우미에서 실행.
 pub fn watch(
     root: &Path,
     detailed: bool,
     resume: Option<Arc<SavedScan>>,
     cancelled: &dyn Fn() -> bool,
-    mut publish: impl FnMut(SavedScan),
+    mut publish: impl FnMut(WatchUpdate) -> io::Result<()>,
     mut progress: impl FnMut(Progress),
 ) -> io::Result<()> {
     let target = crate::usn_native::target(root)?;
@@ -385,10 +379,9 @@ pub fn watch(
     if let Some(record) = &resume {
         pipe.record(record)?;
     }
-    let mut previous: Option<SavedScan> = None;
     loop {
         crate::output::check(&cancelled)?;
-        let record = match pipe.receive()? {
+        let update = match pipe.receive()? {
             Message::Preview(_) => return Err(invalid("실시간 추적에 잘못된 미리보기 응답")),
             Message::Ready => {
                 let record = pipe.read_record()?;
@@ -401,7 +394,7 @@ pub fn watch(
                 {
                     return Err(invalid("변경 추적 응답의 대상·옵션 불일치"));
                 }
-                record
+                WatchUpdate::Record(Box::new(record))
             }
             Message::Cursor => {
                 let value: Advance = serde_json::from_reader(Chunks {
@@ -411,25 +404,7 @@ pub fn watch(
                     ended: false,
                 })
                 .map_err(crate::output::json_error)?;
-                let old = previous
-                    .as_ref()
-                    .ok_or_else(|| invalid("기준 결과 없는 변경 위치 응답"))?;
-                let mut next = SavedScan::new(
-                    Arc::clone(&old.scan),
-                    old.started,
-                    value.finished,
-                    old.elapsed,
-                );
-                next.tracking = old.tracking.clone();
-                let state = next.tracking.as_mut().unwrap();
-                if value.next < state.next || value.pending.len() > state.files.len() {
-                    return Err(invalid("올바르지 않은 변경 추적 위치"));
-                }
-                state.next = value.next;
-                state.pending = value.pending;
-                state.confirmed_after = value.confirmed_after;
-                state.validate(&next.scan)?;
-                next
+                WatchUpdate::Cursor(value)
             }
             Message::Checking => {
                 progress(Progress {
@@ -457,16 +432,7 @@ pub fn watch(
         if crate::usn_native::target(root)?.volume != target.volume {
             return Err(invalid("응답 중 추적 드라이브가 바뀌었습니다"));
         }
-        let mut delivered = SavedScan::new(
-            Arc::clone(&record.scan),
-            record.started,
-            record.finished,
-            record.elapsed,
-        );
-        delivered.tracking = record.tracking.clone();
-        delivered.engine = record.engine.clone();
-        previous = Some(record);
-        publish(delivered);
+        publish(update)?;
     }
 }
 fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
