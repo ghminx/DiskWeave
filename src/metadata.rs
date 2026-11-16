@@ -15,10 +15,12 @@ const FILE_STANDARD_INFO: i32 = 1;
 const FILE_COMPRESSION_INFO: i32 = 8;
 const FILE_ID_INFO: i32 = 18;
 
+#[derive(Clone, Copy)]
 pub struct ScanSettings {
     pub parallelism: crate::scanner::Parallelism,
     pub method: crate::engine::Method,
     pub detailed: bool,
+    pub fast_mode: crate::engine::FastMode,
 }
 impl Default for ScanSettings {
     fn default() -> Self {
@@ -26,6 +28,7 @@ impl Default for ScanSettings {
             parallelism: Default::default(),
             detailed: true,
             method: Default::default(),
+            fast_mode: Default::default(),
         }
     }
 }
@@ -250,13 +253,13 @@ pub fn read_file(file: &File) -> Report {
 #[repr(C)]
 #[derive(Default)]
 pub struct Stat {
-    file_id: i64,
-    created: i64,
+    pub file_id: i64,
+    pub created: i64,
     accessed: i64,
-    modified: i64,
+    pub modified: i64,
     changed: i64,
     pub allocation: i64,
-    eof: i64,
+    pub eof: i64,
     pub attributes: u32,
     reparse: u32,
     pub links: u32,
@@ -732,6 +735,20 @@ mod tests {
             crate::scanner::directory::Strategy::LargeFetch,
             crate::scanner::directory::Strategy::Bulk,
             crate::scanner::directory::Strategy::Combined,
+            crate::scanner::directory::Strategy::Experimental(
+                crate::scanner::directory::Experiment {
+                    shared_handle: true,
+                    reuse_buffer: true,
+                    ..Default::default()
+                },
+            ),
+            crate::scanner::directory::Strategy::Experimental(
+                crate::scanner::directory::Experiment {
+                    shared_handle: true,
+                    reuse_buffer: true,
+                    buffer_bytes: 4194304,
+                },
+            ),
         ] {
             let scan = crate::scanner::scan_with_strategy(
                 &root,

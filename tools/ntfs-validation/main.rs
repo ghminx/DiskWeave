@@ -1,4 +1,8 @@
 #![allow(dead_code)]
+#[path = "../../src/ntfs_mft.rs"]
+mod ntfs_mft;
+#[path = "../../src/ntfs_tree.rs"]
+mod ntfs_tree;
 #[global_allocator]
 static PROFILE_ALLOCATOR: scanner::profile::Allocator = scanner::profile::Allocator;
 mod file_cases;
@@ -10,9 +14,13 @@ mod file_ops;
 #[cfg(test)]
 #[path = "../../src/global_search.rs"]
 mod global_search;
+mod layout;
 #[cfg(test)]
 #[path = "../../src/local_date.rs"]
 mod local_date;
+mod mft;
+mod name_query;
+mod product;
 #[path = "../../src/recycle.rs"]
 mod recycle;
 mod scan_profile;
@@ -129,6 +137,27 @@ fn run() -> io::Result<()> {
     if args.first().is_some_and(|a| a == "--profile-scan") {
         return scan_profile::run(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--profile-product") {
+        return product::profile(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "--profile-mft") {
+        return mft::profile(&args[1..], false, false);
+    }
+    if args.first().is_some_and(|a| a == "--check-mft") {
+        return mft::profile(&args[1..], true, false);
+    }
+    if args.first().is_some_and(|a| a == "--profile-mft-bulk") {
+        return mft::profile(&args[1..], false, true);
+    }
+    if args.first().is_some_and(|a| a == "--check-mft-bulk") {
+        return mft::profile(&args[1..], true, true);
+    }
+    if args.first().is_some_and(|a| a == "--profile-query") {
+        return name_query::profile(&args[1..], false);
+    }
+    if args.first().is_some_and(|a| a == "--check-query") {
+        return name_query::profile(&args[1..], true);
+    }
     if args.first().is_some_and(|a| a == "--ntfs-worker") {
         return ntfs_helper::worker(&args[1..]);
     }
@@ -173,19 +202,36 @@ fn run() -> io::Result<()> {
     if request["usn"].as_bool() == Some(true) {
         return usn_cases::run(root, &target);
     }
+    if request["layout"].as_bool() == Some(true) {
+        return layout::validate(root, &target);
+    }
+    if request["product_mft"].as_bool() == Some(true) {
+        return product::validate(root);
+    }
+    if request["mft"].as_bool() == Some(true) {
+        return mft::validate(root, &target);
+    }
     let mut timings = Vec::new();
+    ntfs_helper::prepare()?;
     for round in 0..3 {
         let t = Instant::now();
         let basic = scanner::scan_with_options(root, true, || false, |_| {})?;
         let basic_ms = t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
-        let outcome = engine::scan_with(
+        let mut preview = scanner::preview::Model::new(root.to_owned());
+        let mut preview_batches = 0u64;
+        let outcome = engine::scan_observed(
             root,
             engine::Method::Ntfs,
             true,
+            scanner::Parallelism::Auto,
             || false,
             |p| eprintln!("{:?}: {}", p.stage, p.counts.files_scanned),
-            ntfs_helper::scan,
+            Some(&mut |batch| {
+                preview_batches += 1;
+                preview.apply(batch)
+            }),
+            ntfs_helper::scan_preview,
         )?;
         let fast_ms = t.elapsed().as_secs_f64() * 1000.0;
         if outcome.report.actual != engine::Method::Ntfs {
@@ -193,6 +239,26 @@ fn run() -> io::Result<()> {
                 "고속 경로 미실행: {}",
                 outcome.report.label()
             )));
+        }
+        if preview_batches < 2 || preview.folders.len() != outcome.result.folders.len() {
+            return Err(io::Error::other("관리자 도우미의 중간 폴더 전달 누락"));
+        }
+        for folder in &preview.folders {
+            let final_folder = outcome
+                .result
+                .folders
+                .iter()
+                .find(|f| f.path == folder.path)
+                .ok_or_else(|| io::Error::other("미리보기 경로 누락"))?;
+            if (folder.bytes, folder.files, folder.folders)
+                != (
+                    final_folder.logical_bytes,
+                    final_folder.file_count,
+                    final_folder.folder_count,
+                )
+            {
+                return Err(io::Error::other("관리자 미리보기/완료 집계 불일치"));
+            }
         }
         let expected = rows(&basic);
         let observed = rows(&outcome.result);
@@ -408,6 +474,53 @@ mod result_transfer_profile_tests {
                 .unwrap()
                 <= 64,
             "결과 보관 시 파일명마다 새 버퍼를 만들지 않음"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bulk_buffer_profile_tests {
+    #[test]
+    fn reusing_directory_pages_avoids_a_new_page_allocation_for_each_folder() {
+        use crate::scanner::{
+            directory::{self, Experiment, Strategy},
+            profile::{self, Stage, Trace},
+        };
+        profile::enable_allocations();
+        let root =
+            std::env::temp_dir().join(format!("diskweave-bulk-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bytes = vec![];
+        for reuse_buffer in [false, true] {
+            let trace = Trace::default();
+            for _ in 0..16 {
+                directory::collect_folder(
+                    &root,
+                    Strategy::Experimental(Experiment {
+                        shared_handle: true,
+                        reuse_buffer,
+                        ..Default::default()
+                    }),
+                    &|| false,
+                    &mut |items| {
+                        assert!(items.is_empty());
+                        Ok(())
+                    },
+                    &mut |_| {},
+                    Some(&trace),
+                )
+                .unwrap();
+            }
+            bytes.push(
+                trace.snapshot().stages[Stage::Enumerate as usize]
+                    .allocated_bytes
+                    .unwrap(),
+            );
+        }
+        assert!(
+            bytes[0].saturating_sub(bytes[1]) >= 800_000,
+            "폴더마다 64 KiB 페이지를 다시 할당하지 않음"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

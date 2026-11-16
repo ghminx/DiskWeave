@@ -4,6 +4,40 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
+pub fn parse_strategy(value: &str) -> std::io::Result<crate::scanner::directory::Strategy> {
+    use crate::scanner::directory::{Experiment, Strategy};
+    match value {
+        "reference" | "timings" => Ok(Strategy::Reference),
+        "large" => Ok(Strategy::LargeFetch),
+        "bulk" => Ok(Strategy::Bulk),
+        "combined" => Ok(Strategy::Combined),
+        _ if value.starts_with("bulk+") => {
+            let mut experiment = Experiment::default();
+            let mut buffer_selected = false;
+            for flag in value[5..].split('+') {
+                match flag {
+                    "handle" if !experiment.shared_handle => experiment.shared_handle = true,
+                    "reuse" if !experiment.reuse_buffer => experiment.reuse_buffer = true,
+                    "64k" | "1m" | "4m" if !buffer_selected => {
+                        experiment.buffer_bytes = match flag {
+                            "64k" => 65536,
+                            "1m" => 1048576,
+                            _ => 4194304,
+                        };
+                        buffer_selected = true;
+                    }
+                    _ => return Err(std::io::Error::other(
+                        "실험 옵션은 handle/reuse와 64k/1m/4m 중 하나를 중복 없이 지정해야 합니다",
+                    )),
+                }
+            }
+            Ok(Strategy::Experimental(experiment))
+        }
+        _ => Err(std::io::Error::other(
+            "수집 경로는 reference/large/bulk/combined 또는 bulk+옵션 형식이어야 합니다",
+        )),
+    }
+}
 /// 파일 내용을 읽거나 변경하지 않는 기본 수집의 시간·추가 조회 비용 측정.
 ///
 /// Args:
@@ -14,7 +48,7 @@ use std::{
 pub fn run(args: &[std::ffi::OsString]) -> std::io::Result<()> {
     if !(2..=6).contains(&args.len()) {
         return Err(std::io::Error::other(
-            "--profile-scan <폴더> <basic|detailed> [제한 초] [auto|1|2|4|8|12|16] [reference|large|bulk|combined] [timings] 형식 필요",
+            "--profile-scan <폴더> <basic|detailed> [제한 초] [auto|1|2|4|8|12|16] [reference|large|bulk|combined|bulk+옵션] [timings] 형식 필요",
         ));
     }
     let path = Path::new(&args[0]);
@@ -67,11 +101,7 @@ pub fn run(args: &[std::ffi::OsString]) -> std::io::Result<()> {
             std::io::Error::other("수집 경로는 reference/large/bulk/combined 필요")
         })?,
     };
-    if !["reference", "timings", "large", "bulk", "combined"].contains(&strategy) {
-        return Err(std::io::Error::other(
-            "reference/large/bulk/combined 방식 필요",
-        ));
-    }
+    let selected_strategy = parse_strategy(strategy)?;
     let update = |p: crate::scanner::ScanProgress| {
         *counts.borrow_mut() = p;
         let elapsed = started.elapsed().as_secs_f64();
@@ -88,11 +118,7 @@ pub fn run(args: &[std::ffi::OsString]) -> std::io::Result<()> {
             path,
             detailed,
             parallelism,
-            match strategy {
-                "large" => crate::scanner::directory::Strategy::LargeFetch,
-                "bulk" => crate::scanner::directory::Strategy::Bulk,
-                _ => crate::scanner::directory::Strategy::Combined,
-            },
+            selected_strategy,
             || started.elapsed().as_secs_f64() > limit,
             update,
             timed.then_some(&metrics),
@@ -196,4 +222,73 @@ pub fn run(args: &[std::ffi::OsString]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    #[test]
+    fn buffer_sizes_are_explicit_and_do_not_enable_other_experiments() {
+        use crate::scanner::directory::{Experiment, Strategy};
+        for (name, buffer_bytes) in [
+            ("bulk+64k", 65536),
+            ("bulk+1m", 1048576),
+            ("bulk+4m", 4194304),
+        ] {
+            assert_eq!(
+                super::parse_strategy(name).unwrap(),
+                Strategy::Experimental(Experiment {
+                    buffer_bytes,
+                    ..Default::default()
+                })
+            );
+        }
+        assert_eq!(
+            super::parse_strategy("bulk+handle+reuse+1m").unwrap(),
+            Strategy::Experimental(Experiment {
+                shared_handle: true,
+                reuse_buffer: true,
+                buffer_bytes: 1048576
+            })
+        );
+        for name in ["bulk+128k", "bulk+1m+4m", "bulk+handle+handle", "bulk+"] {
+            assert!(super::parse_strategy(name).is_err());
+        }
+    }
+    #[test]
+    fn page_reuse_is_independent_of_the_shared_handle_switch() {
+        use crate::scanner::directory::{Experiment, Strategy};
+        assert_eq!(
+            super::parse_strategy("bulk+reuse").unwrap(),
+            Strategy::Experimental(Experiment {
+                reuse_buffer: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            super::parse_strategy("bulk+handle+reuse").unwrap(),
+            Strategy::Experimental(Experiment {
+                reuse_buffer: true,
+                shared_handle: true,
+                ..Default::default()
+            })
+        );
+        assert!(super::parse_strategy("bulk+reuse+typo").is_err());
+    }
+    #[test]
+    fn explicit_shared_handle_candidate_preserves_baseline_and_rejects_unknown_modes() {
+        use crate::scanner::directory::{Experiment, Strategy};
+        assert_eq!(
+            super::parse_strategy("combined").unwrap(),
+            Strategy::Combined
+        );
+        assert_eq!(super::parse_strategy("bulk").unwrap(), Strategy::Bulk);
+        assert_eq!(
+            super::parse_strategy("bulk+handle").unwrap(),
+            Strategy::Experimental(Experiment {
+                shared_handle: true,
+                ..Default::default()
+            })
+        );
+        assert!(super::parse_strategy("bulk+typo").is_err());
+    }
 }

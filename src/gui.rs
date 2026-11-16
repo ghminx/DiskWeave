@@ -20,6 +20,9 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct DiskWeaveApp {
+    startup: crate::startup::Controller,
+    preview_view: crate::scanner::preview::View,
+    preview_location: Option<u64>,
     file_close_requested: bool,
     file_job: crate::file_job::Controller,
     file_ui: crate::file_ui::FileUi,
@@ -223,6 +226,385 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
     action
 }
 impl DiskWeaveApp {
+    fn startup_tick(&mut self, ctx: &egui::Context) {
+        if self.archive_record.is_some() {
+            return;
+        }
+        self.startup.poll();
+        if self.startup.needs_relaunch() {
+            self.input_error = self
+                .startup
+                .request(true, crate::startup::relaunch)
+                .err()
+                .map(|e| e.to_string());
+        }
+        if self.startup.exit_requested {
+            self.closing = crate::index_job::CloseState::Discarded;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if matches!(self.startup.status, crate::startup::Status::Failed(_)) {
+            crate::ntfs_helper::skip_permission_prompt();
+        }
+        if self.startup.busy() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        if let crate::startup::Status::Failed(error) = &self.startup.status {
+            let error = error.clone();
+            egui::Modal::new(egui::Id::unique("startup_denied")).show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.heading("기본 스캔으로 사용할 수 있습니다");
+                ui.add(egui::Label::new(&error).wrap());
+                ui.small("설정에서 고속 스캔 권한을 다시 요청할 수 있습니다.");
+                if ui.button("확인").clicked() {
+                    self.startup.skip();
+                }
+            });
+        }
+        if matches!(
+            self.startup.status,
+            crate::startup::Status::Prompt | crate::startup::Status::Authorizing
+        ) {
+            egui::Modal::new(egui::Id::unique("startup_permission")).show(ctx,|ui| {
+                ui.set_max_width(400.0);
+                ui.heading("고속 스캔을 사용할까요?");
+                ui.label("NTFS 드라이브 전체를 빠르게 분석하려면 Windows 관리자 승인이 필요합니다.");
+                ui.small("폴더 분석 등 지원하지 않는 대상은 기본 방식으로 스캔합니다. 스캔은 대상 선택 후 직접 시작합니다.");
+                if self.startup.busy() { ui.horizontal(|ui| { ui.spinner(); ui.label("Windows 권한 승인을 기다리고 있습니다"); }); }
+                else { ui.horizontal_wrapped(|ui| {
+                    if ui.button("고속 스캔 사용").clicked() { self.input_error=self.startup.request(false,crate::ntfs_helper::prepare).err().map(|e|e.to_string()); }
+                    if ui.button("이번에는 건너뛰기").clicked() { self.startup.skip(); crate::ntfs_helper::skip_permission_prompt(); }
+                }); }
+            });
+        }
+    }
+    fn startup_settings(&mut self, ui: &mut egui::Ui) {
+        if self.archive_record.is_some() {
+            return;
+        }
+        ui.separator();
+        ui.strong("시작·권한");
+        let mut preferences = self.startup.preferences;
+        if ui
+            .add_enabled(
+                !self.startup.busy(),
+                egui::Checkbox::new(&mut preferences.always_admin, "항상 관리자 권한으로 시작"),
+            )
+            .changed()
+        {
+            match crate::startup::preference_path().and_then(|p| preferences.save(&p)) {
+                Ok(()) => {
+                    self.startup.preferences = preferences;
+                    self.startup.suppress_relaunch();
+                }
+                Err(e) => self.input_error = Some(format!("시작 설정을 저장하지 못했습니다: {e}")),
+            }
+        }
+        ui.small("다음 실행부터 적용 · 켜면 프로그램 전체가 관리자 권한으로 실행됩니다.");
+        match &self.startup.status {
+            crate::startup::Status::Failed(error) => {
+                ui.add(egui::Label::new(error).wrap());
+            }
+            crate::startup::Status::Ready => {
+                ui.small(if self.startup.elevated {
+                    "현재 관리자 권한으로 실행 중"
+                } else {
+                    "고속 스캔 도우미 준비 완료"
+                });
+            }
+            crate::startup::Status::Basic => {
+                ui.small("이번 실행에서는 기본 스캔 사용");
+            }
+            _ => {}
+        }
+        if !self.startup.elevated
+            && !self.startup.busy()
+            && !self.scan.is_running()
+            && ui.button("고속 스캔 권한 요청").clicked()
+        {
+            self.input_error = self
+                .startup
+                .request(false, crate::ntfs_helper::prepare)
+                .err()
+                .map(|e| e.to_string());
+        }
+    }
+    fn show_preview(&self) -> bool {
+        self.archive_record.is_none()
+            && !self.locations_view.global_mode
+            && !self.preview_view.previous
+            && self.scan.preview().is_some()
+    }
+    fn preview_banner(&mut self, ui: &mut egui::Ui) {
+        if self.archive_record.is_some()
+            || self.locations_view.global_mode
+            || self.scan.preview().is_none()
+        {
+            return;
+        }
+        let width = ui.available_width();
+        egui::Frame::new()
+            .fill(crate::ui_style::RAISED)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.set_min_width((width - 20.0).max(0.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.strong(if self.preview_view.previous {
+                        "이전 분석 결과"
+                    } else {
+                        "폴더를 찾고 있습니다"
+                    });
+                    if self.scan.completed().is_some()
+                        && ui
+                            .small_button(if self.preview_view.previous {
+                                "진행 상황 보기"
+                            } else {
+                                "이전 결과 보기"
+                            })
+                            .clicked()
+                    {
+                        self.preview_view.previous = !self.preview_view.previous;
+                    }
+                });
+                ui.small("현재까지 확인한 용량입니다. 스캔이 끝나면 크기순으로 정렬됩니다.");
+            });
+    }
+    fn preview_tree(&mut self, ui: &mut egui::Ui) {
+        let model = self.scan.preview().expect("선택 위치의 진행 모델");
+        let view = &mut self.preview_view;
+        view.sync(model);
+        let mut open = None;
+        let mut toggle = None;
+        egui::ScrollArea::both().id_salt("preview_tree").show_rows(
+            ui,
+            33.0,
+            view.visible().len(),
+            |ui, rows| {
+                for row in rows {
+                    let (id, depth) = view.visible()[row];
+                    let folder = &model.folders[id];
+                    let width = ui.available_width().max(depth as f32 * 14.0 + 180.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 33.0), egui::Sense::hover());
+                    let rect = rect.shrink2(egui::vec2(8.0, 0.5));
+                    let arrow = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(depth as f32 * 14.0, 0.0),
+                        egui::vec2(21.0, rect.height()),
+                    );
+                    let pick =
+                        egui::Rect::from_min_max(egui::pos2(arrow.right(), rect.top()), rect.max);
+                    let response = ui.interact(
+                        pick,
+                        ui.scope_id().with(("preview_folder", id)),
+                        egui::Sense::click(),
+                    );
+                    if view.selected == id || response.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            if view.selected == id {
+                                egui::Color32::from_rgb(34, 53, 72)
+                            } else {
+                                crate::ui_style::RAISED
+                            },
+                        );
+                    }
+                    if !folder.children.is_empty() {
+                        crate::ui_style::text(
+                            ui,
+                            arrow,
+                            if view.expanded(id) { "▾" } else { "▸" },
+                            false,
+                            crate::ui_style::SOFT,
+                            12.0,
+                        );
+                        if ui
+                            .interact(
+                                arrow,
+                                ui.scope_id().with(("preview_toggle", id)),
+                                egui::Sense::click(),
+                            )
+                            .clicked()
+                        {
+                            toggle = Some(id);
+                        }
+                    }
+                    crate::ui_style::icon(ui, pick.shrink2(egui::vec2(3.0, 0.0)), true);
+                    let name = folder
+                        .path
+                        .file_name()
+                        .unwrap_or(folder.path.as_os_str())
+                        .to_string_lossy();
+                    crate::ui_style::text(
+                        ui,
+                        egui::Rect::from_min_max(
+                            pick.min + egui::vec2(25.0, 0.0),
+                            pick.max - egui::vec2(70.0, 0.0),
+                        ),
+                        &name,
+                        false,
+                        crate::ui_style::TEXT,
+                        13.0,
+                    );
+                    crate::ui_style::text(
+                        ui,
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - 68.0, rect.top()),
+                            rect.max,
+                        ),
+                        &SizeDisplay::new(folder.bytes).text,
+                        true,
+                        crate::ui_style::SOFT,
+                        11.0,
+                    );
+                    if response.clicked() {
+                        open = Some(id);
+                    }
+                    response.on_hover_text(format!(
+                        "{}\n{} · {} Byte",
+                        folder.path.display(),
+                        folder.state().label(),
+                        folder.bytes
+                    ));
+                }
+            },
+        );
+        if let Some(id) = toggle {
+            view.toggle(id);
+        }
+        if let Some(id) = open {
+            view.open(model, id);
+        }
+    }
+    fn preview_table(&mut self, ui: &mut egui::Ui) {
+        let model = self.scan.preview().expect("선택 위치의 진행 모델");
+        let view = &mut self.preview_view;
+        view.sync(model);
+        if model.folders.is_empty() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("폴더 구조를 확인하고 있습니다");
+            });
+            return;
+        }
+        let folder = &model.folders[view.folder];
+        let mut open = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(folder.parent.is_some(), egui::Button::new("↑ 상위 폴더"))
+                .clicked()
+            {
+                open = folder.parent;
+            }
+            ui.add(egui::Label::new(folder.path.display().to_string()).truncate())
+                .on_hover_text(folder.path.display().to_string());
+        });
+        ui.add_space(8.0);
+        let width = ui.available_width();
+        ui.horizontal(|ui| {
+            ui.strong("하위 폴더");
+            ui.weak(format!("{}개 발견 · 발견순", folder.children.len()));
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("preview_list", view.folder))
+            .show_rows(ui, 42.0, folder.children.len(), |ui, rows| {
+                for row in rows {
+                    let id = folder.children[row];
+                    let item = &model.folders[id];
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(width, 42.0), egui::Sense::click());
+                    if view.selected == id || response.hovered() {
+                        ui.painter()
+                            .rect_filled(rect, 0.0, egui::Color32::from_rgb(26, 47, 63));
+                    }
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.bottom(),
+                        egui::Stroke::new(1.0, crate::ui_style::LINE),
+                    );
+                    crate::ui_style::icon(ui, rect.shrink2(egui::vec2(12.0, 0.0)), true);
+                    let name = item
+                        .path
+                        .file_name()
+                        .unwrap_or(item.path.as_os_str())
+                        .to_string_lossy();
+                    crate::ui_style::text(
+                        ui,
+                        egui::Rect::from_min_max(
+                            rect.min + egui::vec2(38.0, 0.0),
+                            egui::pos2(rect.left() + width * 0.52, rect.bottom()),
+                        ),
+                        &name,
+                        false,
+                        crate::ui_style::TEXT,
+                        13.0,
+                    );
+                    crate::ui_style::text(
+                        ui,
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + width * 0.52, rect.top()),
+                            egui::pos2(rect.right() - 105.0, rect.bottom()),
+                        ),
+                        &SizeDisplay::new(item.bytes).text,
+                        true,
+                        crate::ui_style::TEXT,
+                        12.0,
+                    );
+                    crate::ui_style::text(
+                        ui,
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - 94.0, rect.top()),
+                            rect.max - egui::vec2(8.0, 0.0),
+                        ),
+                        item.state().label(),
+                        true,
+                        crate::ui_style::SOFT,
+                        11.0,
+                    );
+                    if response.clicked() {
+                        view.selected = id;
+                    }
+                    if response.double_clicked() {
+                        open = Some(id);
+                    }
+                    response.on_hover_text(format!(
+                        "{}\n{} Byte · 파일 {}개 · 하위 폴더 {}개",
+                        item.path.display(),
+                        item.bytes,
+                        item.files,
+                        item.folders
+                    ));
+                }
+            });
+        if folder.children.is_empty() {
+            ui.add_space(14.0);
+            ui.weak("아직 발견한 하위 폴더가 없습니다.");
+        }
+        if let Some(id) = open {
+            view.open(model, id);
+        }
+    }
+    fn preview_details(&self, ui: &mut egui::Ui) {
+        ui.strong("진행 중인 폴더");
+        if let Some(folder) = self
+            .scan
+            .preview()
+            .and_then(|m| m.folders.get(self.preview_view.selected))
+        {
+            ui.add(egui::Label::new(folder.path.display().to_string()).wrap());
+            ui.separator();
+            crate::ui_style::property(ui, "상태", folder.state().label());
+            let size = SizeDisplay::new(folder.bytes);
+            ui.label(size.text).on_hover_text(size.exact);
+            crate::ui_style::property(ui, "확인한 파일", &format!("{}개", folder.files));
+            crate::ui_style::property(ui, "확인한 하위 폴더", &format!("{}개", folder.folders));
+        }
+        ui.add_space(12.0);
+        ui.small("일부 누락에는 접근할 수 없거나 상세 정보를 읽지 못한 항목이 포함됩니다.");
+        ui.small("파일 목록·통계·할당 크기·공간 지도는 스캔 완료 후 확인할 수 있습니다.");
+    }
     fn file_blocked(&self) -> bool {
         self.file_ui.blocked(&self.file_job) || self.file_refresh.busy()
     }
@@ -537,10 +919,26 @@ impl DiskWeaveApp {
         }
     }
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             index: crate::index_job::IndexController::start_default(),
             ..Self::default()
+        };
+        let _ = app.scan.configure_method(crate::engine::Method::Ntfs);
+        let preferences =
+            crate::startup::preference_path().and_then(|p| crate::startup::Preferences::load(&p));
+        let elevated = crate::startup::is_elevated();
+        app.startup = crate::startup::Controller::new(
+            elevated.as_ref().copied().unwrap_or(false),
+            preferences.as_ref().copied().unwrap_or_default(),
+        );
+        if std::env::args_os().any(|a| a == "--gui-elevated") {
+            app.startup.suppress_relaunch();
         }
+        app.input_error = preferences
+            .err()
+            .or_else(|| elevated.err())
+            .map(|e| format!("시작 설정·권한 확인 실패: {e}"));
+        app
     }
     fn index_tick(&mut self) {
         self.index.saving_paused = self.tracking.running()
@@ -782,8 +1180,27 @@ impl DiskWeaveApp {
             } else {
                 self.search.reset();
             }
-            self.explorer = self.scan.completed().map(|c| Explorer::new(&c.result));
+            let preview = self.scan.take_finished_preview();
+            let handoff = !self.locations_view.global_mode
+                && self.preview_location == self.scan.selected_id()
+                && !self.preview_view.previous
+                && preview.is_some();
+            self.explorer = self.scan.completed().map(|c| {
+                if handoff {
+                    if let Some(model) = &preview {
+                        return self.preview_view.complete(model, &c.result);
+                    }
+                }
+                Explorer::new(&c.result)
+            });
             self.detail_target = None;
+            if handoff {
+                if let (Some(source), Some(view)) = (self.source(), self.explorer.as_ref()) {
+                    self.search.refresh(&source.scan, view.folder());
+                    self.search.focus_item(view.selected());
+                    self.detail_target = Some((source.id, source.generation, view.selected()));
+                }
+            }
         }
     }
     fn begin_scan(&mut self) {
@@ -1103,13 +1520,22 @@ impl DiskWeaveApp {
                 self.results.menu(ui, self.scan.is_running() || self.file_blocked(), record, available, self.archive_record.is_some());
                 ui.menu_button("설정", |ui| {
                     ui.set_max_width(340.0);
+                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height()-80.0).max(120.0)).show(ui,|ui|{
                     let mut method=self.scan.method();
                     ui.add_enabled_ui(!self.scan.is_running() && self.archive_record.is_none(),|ui|{
                         ui.radio_value(&mut method,crate::engine::Method::Basic,"기본 스캔");
                         ui.radio_value(&mut method,crate::engine::Method::Ntfs,"NTFS 고속 스캔 (시험 기능)");
                     });
                     if method!=self.scan.method(){self.input_error=self.scan.configure_method(method).err().map(|e|e.to_string());}
-                    ui.small("고속 스캔은 NTFS 드라이브 전체에서 사용합니다.");
+                    ui.add_enabled_ui(!self.scan.is_running() && self.archive_record.is_none(),|ui|{
+                        ui.collapsing("고속 수집 방식 비교",|ui|{
+                            let mut mode=self.scan.fast_mode();
+                            for choice in [crate::engine::FastMode::Auto,crate::engine::FastMode::Legacy,crate::engine::FastMode::Mft] {ui.radio_value(&mut mode,choice,choice.label());}
+                            if mode!=self.scan.fast_mode(){self.input_error=self.scan.configure_fast_mode(mode).err().map(|e|e.to_string());}
+                            ui.small("자동: 드라이브는 기존 NTFS 방식, 폴더는 기본 탐색");
+                            ui.small("MFT 방식은 폴더를 선택해도 볼륨 전체 정보를 먼저 읽습니다. 작은 폴더에서는 더 느릴 수 있습니다.");
+                        });
+                    });
                     ui.small("필요하면 Windows 권한 승인을 요청합니다.");
                     ui.separator();
                     let mut detailed = self.scan.details_requested();
@@ -1131,6 +1557,8 @@ impl DiskWeaveApp {
                     ui.small("기본 스캔에 적용 · 자동 모드는 최대 8개");
                     ui.small("작업 수가 많을수록 디스크 부하가 커질 수 있습니다.");
                     self.index_settings(ui);
+                    self.startup_settings(ui);
+                    });
                 });
                 if ui.available_width() < 700.0 && ui.button("상세 정보").clicked() {
                     self.details_open = !self.details_open;
@@ -1272,23 +1700,40 @@ impl DiskWeaveApp {
         });
     }
     fn summary(&self, ui: &mut egui::Ui) {
-        let sources = if self.locations_view.global_mode {
+        let sources = if self.show_preview() {
+            Vec::new()
+        } else if self.locations_view.global_mode {
             self.scan.snapshots()
         } else {
             self.source().into_iter().collect()
         };
-        let bytes: u128 = sources
+        let mut bytes: u128 = sources
             .iter()
             .map(|s| s.scan.folders[0].logical_bytes as u128)
             .sum();
-        let files: u64 = sources.iter().map(|s| s.scan.folders[0].file_count).sum();
-        let folders: u64 = sources.iter().map(|s| s.scan.folders[0].folder_count).sum();
+        let mut files: u64 = sources.iter().map(|s| s.scan.folders[0].file_count).sum();
+        let mut folders: u64 = sources.iter().map(|s| s.scan.folders[0].folder_count).sum();
         let errors: u64 = sources.iter().map(|s| s.scan.error_count).sum();
         let elapsed = self
             .scan
-            .completed()
-            .map_or(0.0, |c| c.elapsed.as_secs_f64());
-        let has_results = !sources.is_empty();
+            .elapsed()
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_else(|| {
+                self.scan
+                    .completed()
+                    .map_or(0.0, |c| c.elapsed.as_secs_f64())
+            });
+        let preview = self
+            .show_preview()
+            .then(|| self.scan.preview())
+            .flatten()
+            .and_then(|m| m.folders.first());
+        if let Some(folder) = preview {
+            bytes = folder.bytes as u128;
+            files = folder.files;
+            folders = folder.folders;
+        }
+        let has_results = !sources.is_empty() || preview.is_some();
         let live =
             self.tracking.running() && sources.iter().any(|s| Some(s.id) == self.tracking.location);
         let stale = sources
@@ -1315,9 +1760,20 @@ impl DiskWeaveApp {
             let unit = (ui.available_width() - 30.0) / 4.4;
             ui.spacing_mut().item_spacing.x = 10.0;
             for (index, (label, value)) in [
-                ("파일 크기 합계", size.text),
                 (
-                    "파일",
+                    if preview.is_some() {
+                        "확인한 파일 용량"
+                    } else {
+                        "파일 크기 합계"
+                    },
+                    size.text,
+                ),
+                (
+                    if preview.is_some() {
+                        "발견한 파일"
+                    } else {
+                        "파일"
+                    },
                     if has_results {
                         crate::ui_style::count(files)
                     } else {
@@ -1325,7 +1781,11 @@ impl DiskWeaveApp {
                     },
                 ),
                 (
-                    "하위 폴더",
+                    if preview.is_some() {
+                        "발견한 하위 폴더"
+                    } else {
+                        "하위 폴더"
+                    },
                     if has_results {
                         crate::ui_style::count(folders)
                     } else {
@@ -1334,7 +1794,9 @@ impl DiskWeaveApp {
                 ),
                 (
                     "분석 상태",
-                    if !has_results && !self.scan.is_running() {
+                    if let Some(folder) = preview {
+                        folder.state().label().into()
+                    } else if !has_results && !self.scan.is_running() {
                         "스캔 대기".into()
                     } else if restored && !self.scan.is_running() {
                         "저장된 결과 · 갱신 필요".into()
@@ -1373,7 +1835,7 @@ impl DiskWeaveApp {
                 let title = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), 15.0));
                 crate::ui_style::text(ui, title, label, false, crate::ui_style::MUTED, 12.0);
                 let number = egui::Rect::from_min_max(inner.min + egui::vec2(0.0, 20.0), inner.max);
-                let shown = if index == 3 && has_results {
+                let shown = if index == 3 && has_results && preview.is_none() {
                     if self.scan.is_running() {
                         "스캔 중"
                     } else if live {
@@ -1409,7 +1871,15 @@ impl DiskWeaveApp {
         });
     }
     fn tree(&mut self, ui: &mut egui::Ui) {
-        crate::ui_style::panel_title(ui, "폴더 탐색", "크기순");
+        crate::ui_style::panel_title(
+            ui,
+            "폴더 탐색",
+            if self.show_preview() {
+                "발견순"
+            } else {
+                "크기순"
+            },
+        );
         let mut chosen = None;
         egui::Frame::new().inner_margin(8).show(ui, |ui| {
             let current = self.scan.selected_id().and_then(|id| self.scan.get(id));
@@ -1469,6 +1939,10 @@ impl DiskWeaveApp {
             };
             self.locations_view.choose_scope(&mut self.search, scope);
             self.sync_scan();
+        }
+        if self.show_preview() {
+            self.preview_tree(ui);
+            return;
         }
         let Some(source) = self.source() else {
             ui.add_space(15.0);
@@ -1648,6 +2122,11 @@ impl DiskWeaveApp {
         }
     }
     fn center(&mut self, ui: &mut egui::Ui) {
+        self.preview_banner(ui);
+        if self.show_preview() {
+            self.preview_table(ui);
+            return;
+        }
         let mut destination = None;
         let compact = ui.available_height() < 300.0;
         let available = ui.available_width();
@@ -2085,6 +2564,10 @@ impl DiskWeaveApp {
         }
     }
     fn details(&mut self, ui: &mut egui::Ui) {
+        if self.show_preview() {
+            self.preview_details(ui);
+            return;
+        }
         let summary = if self.locations_view.global_mode {
             self.locations_view.selection_summary()
         } else {
@@ -2226,6 +2709,13 @@ impl DiskWeaveApp {
         ui.small("크기 필터와 공간 지도는 파일 크기를 기준으로 표시합니다.");
     }
     fn map_panel(&mut self, ui: &mut egui::Ui) {
+        if self.show_preview() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("공간 지도");
+                ui.small("스캔을 마치면 확인할 수 있습니다.");
+            });
+            return;
+        }
         ui.spacing_mut().interact_size.y = 24.0;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
         let width = ui.available_width();
@@ -2296,17 +2786,26 @@ impl DiskWeaveApp {
 
 impl eframe::App for DiskWeaveApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::ntfs_helper::shutdown();
         if self.closing == crate::index_job::CloseState::Saved {
             self.index.shutdown();
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.startup_tick(ui.ctx());
         if self.archive_record.is_none() {
             if self.scan.is_running() {
                 self.stop_tracking();
                 self.tracking.location = None;
             }
             self.sync_scan();
+            if let Some(model) = self.scan.preview() {
+                if self.preview_location != self.scan.selected_id() {
+                    self.preview_view = Default::default();
+                    self.preview_location = self.scan.selected_id();
+                }
+                self.preview_view.sync(model);
+            }
             self.sync_tracking();
             self.file_tick();
             self.index_tick();
@@ -2401,7 +2900,7 @@ impl eframe::App for DiskWeaveApp {
             size.y,
             self.map_height,
             self.details_open,
-            self.map_collapsed,
+            self.map_collapsed || self.show_preview(),
         );
         if self.archive_record.is_some() {
             panels.body += panels.target - 48.0;
@@ -2633,11 +3132,13 @@ impl eframe::App for DiskWeaveApp {
             });
         egui::Panel::bottom("map")
             .exact_size(panels.map)
-            .frame(
-                egui::Frame::new()
-                    .fill(surface())
-                    .inner_margin(if self.map_collapsed { 4 } else { 8 }),
-            )
+            .frame(egui::Frame::new().fill(surface()).inner_margin(
+                if self.map_collapsed || self.show_preview() {
+                    4
+                } else {
+                    8
+                },
+            ))
             .show(ui, |ui| self.map_panel(ui));
         egui::Panel::left("tree")
             .exact_size(panels.left)

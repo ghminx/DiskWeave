@@ -1,5 +1,5 @@
 use crate::{
-    engine::{Method, Progress, Report, Stage},
+    engine::{Collector, FastMode, Method, Outcome, Progress, Report, Stage},
     ntfs_native::{self, Target},
     scanner::{ScanProgress, ScanResult},
     snapshot::SavedScan,
@@ -29,6 +29,50 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 struct Handle(HANDLE);
+// 독점 소유한 Windows 커널 핸들은 스레드 간 이전 가능. 복제 소유 없이 Mutex로 순차 사용.
+unsafe impl Send for Handle {}
+struct Prepared {
+    handle: Handle,
+    worker: Worker,
+}
+static PREPARED: std::sync::Mutex<Option<Prepared>> = std::sync::Mutex::new(None);
+static SKIP_PROMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn skip_permission_prompt() {
+    SKIP_PROMPT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn shutdown() {
+    *PREPARED.lock().unwrap() = None;
+}
+pub fn prepare() -> io::Result<()> {
+    let (pipe, worker) = launch(&|| false)?;
+    *PREPARED.lock().unwrap() = Some(Prepared {
+        handle: pipe.handle,
+        worker,
+    });
+    SKIP_PROMPT.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+fn prepared<'a>(cancelled: &'a dyn Fn() -> bool) -> io::Result<(Pipe<'a>, Worker)> {
+    if let Some(prepared) = PREPARED.lock().unwrap().take() {
+        if unsafe { WaitForSingleObject(prepared.worker.0 .0, 0) } == WAIT_TIMEOUT {
+            return Ok((
+                Pipe {
+                    handle: prepared.handle,
+                    cancelled,
+                    idle: false,
+                },
+                prepared.worker,
+            ));
+        }
+    }
+    if SKIP_PROMPT.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "이번 실행에서는 고속 스캔 권한 요청을 건너뛰었습니다",
+        ));
+    }
+    launch(cancelled)
+}
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
@@ -73,15 +117,22 @@ pub fn validate_response(record: SavedScan, root: &Path, detailed: bool) -> io::
 #[serde(deny_unknown_fields)]
 struct Request {
     version: u32,
+    #[serde(default)]
+    session: bool,
     target: Target,
     detailed: bool,
     #[serde(default)]
     watch: Option<Vec<u16>>,
     #[serde(default)]
     resume: bool,
+    #[serde(default)]
+    fast_mode: FastMode,
+    #[serde(default)]
+    scope: Option<Vec<u16>>,
 }
 #[derive(Serialize, Deserialize)]
 enum Message {
+    Preview(crate::scanner::preview::Batch),
     Progress {
         stage: Stage,
         files: u64,
@@ -94,6 +145,7 @@ enum Message {
 }
 
 pub(crate) struct Pipe<'a> {
+    idle: bool,
     handle: Handle,
     cancelled: &'a dyn Fn() -> bool,
 }
@@ -106,7 +158,7 @@ impl Pipe<'_> {
                 "스캔 취소",
             ));
         }
-        if start.elapsed() > Duration::from_secs(300) {
+        if !self.idle && start.elapsed() > Duration::from_secs(300) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "스캔 도우미 응답 시간 초과",
@@ -248,13 +300,13 @@ impl Write for Pipe<'_> {
         Ok(())
     }
 }
-struct Chunks<'a, 'b> {
-    pipe: &'a mut Pipe<'b>,
+struct Chunks<R> {
+    pipe: R,
     remaining: usize,
     total: u64,
     ended: bool,
 }
-impl Read for Chunks<'_, '_> {
+impl<R: Read> Read for Chunks<R> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         if b.is_empty() || self.ended {
             return Ok(0);
@@ -281,11 +333,11 @@ impl Read for Chunks<'_, '_> {
         Ok(len)
     }
 }
-struct ChunkWriter<'a, 'b> {
-    pipe: &'a mut Pipe<'b>,
+struct ChunkWriter<W> {
+    pipe: W,
     total: u64,
 }
-impl Write for ChunkWriter<'_, '_> {
+impl<W: Write> Write for ChunkWriter<W> {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         if b.is_empty() {
             return Ok(0);
@@ -303,28 +355,39 @@ impl Write for ChunkWriter<'_, '_> {
         Ok(())
     }
 }
+/// 결과 끝 표시를 포함한 유한 응답 전송. 연결 유지 상태에서도 수신 종료 보장.
+pub fn write_completed(mut writer: impl Write, record: &SavedScan) -> io::Result<()> {
+    let chunks = ChunkWriter {
+        pipe: &mut writer,
+        total: 0,
+    };
+    let mut buffer = io::BufWriter::with_capacity(65536, chunks);
+    crate::snapshot::write_to(record, &mut buffer, || false)?;
+    buffer.flush()?;
+    drop(buffer);
+    writer.write_all(&0u32.to_le_bytes())
+}
+fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
+    crate::snapshot::read_from(
+        Chunks {
+            pipe: reader,
+            remaining: 0,
+            total: 0,
+            ended: false,
+        },
+        || false,
+    )
+}
+#[allow(dead_code, reason = "기존 전송·도구 공개 API의 회귀 대조")]
+pub fn read_completed(reader: impl Read, root: &Path, detailed: bool) -> io::Result<ScanResult> {
+    validate_response(read_record_from(reader)?, root, detailed)
+}
 impl Pipe<'_> {
     fn record(&mut self, record: &SavedScan) -> io::Result<()> {
-        let chunks = ChunkWriter {
-            pipe: self,
-            total: 0,
-        };
-        let mut writer = io::BufWriter::with_capacity(65536, chunks);
-        crate::snapshot::write_to(record, &mut writer, || false)?;
-        writer.flush()?;
-        drop(writer);
-        self.write_all(&0u32.to_le_bytes())
+        write_completed(self, record)
     }
     fn read_record(&mut self) -> io::Result<SavedScan> {
-        crate::snapshot::read_from(
-            Chunks {
-                pipe: self,
-                remaining: 0,
-                total: 0,
-                ended: false,
-            },
-            || false,
-        )
+        read_record_from(self)
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -345,10 +408,13 @@ pub fn watch(
     let (mut pipe, _worker) = launch(cancelled)?;
     pipe.send(&Request {
         version: 1,
+        session: false,
         target: target.clone(),
         detailed,
         watch: Some(root.as_os_str().encode_wide().collect()),
         resume: resume.is_some(),
+        fast_mode: FastMode::Auto,
+        scope: None,
     })?;
     if let Some(record) = &resume {
         pipe.record(record)?;
@@ -357,6 +423,7 @@ pub fn watch(
     loop {
         crate::output::check(&cancelled)?;
         let record = match pipe.receive()? {
+            Message::Preview(_) => return Err(invalid("실시간 추적에 잘못된 미리보기 응답")),
             Message::Ready => {
                 let record = pipe.read_record()?;
                 if record.scan.folders[0].path != root
@@ -484,8 +551,13 @@ fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
                     next: index.checkpoint.next,
                     pending: index.checkpoint.pending.clone(),
                 };
-                let mut writer =
-                    io::BufWriter::with_capacity(65536, ChunkWriter { pipe, total: 0 });
+                let mut writer = io::BufWriter::with_capacity(
+                    65536,
+                    ChunkWriter {
+                        pipe: &mut *pipe,
+                        total: 0,
+                    },
+                );
                 serde_json::to_writer(&mut writer, &value).map_err(crate::output::json_error)?;
                 writer.flush()?;
                 drop(writer);
@@ -676,6 +748,7 @@ pub(crate) fn launch(cancelled: &dyn Fn() -> bool) -> io::Result<(Pipe<'_>, Work
         return Err(io::Error::last_os_error());
     }
     let pipe = Pipe {
+        idle: false,
         handle: Handle(h),
         cancelled,
     };
@@ -694,27 +767,55 @@ pub(crate) fn launch(cancelled: &dyn Fn() -> bool) -> io::Result<(Pipe<'_>, Work
     }
     Ok((pipe, worker))
 }
+#[allow(dead_code, reason = "기존 CLI·개발 도구의 비미리보기 호출 경계 유지")]
 pub fn scan(
     root: &Path,
     detailed: bool,
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(Progress),
 ) -> io::Result<ScanResult> {
-    let target = ntfs_native::target(root)?;
+    scan_preview(root, detailed, cancelled, progress, &mut |_| Ok(()))
+}
+pub fn scan_preview(
+    root: &Path,
+    detailed: bool,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(Progress),
+    preview: &mut crate::scanner::preview::Observer<'_>,
+) -> io::Result<ScanResult> {
+    Ok(scan_selected(root, detailed, FastMode::Auto, cancelled, progress, preview)?.result)
+}
+pub fn scan_selected(
+    root: &Path,
+    detailed: bool,
+    mode: FastMode,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(Progress),
+    preview: &mut crate::scanner::preview::Observer<'_>,
+) -> io::Result<Outcome> {
+    let target = selected_target(root, mode)?;
     progress(Progress {
         stage: Stage::Authorizing,
         counts: Default::default(),
     });
-    let (mut pipe, _worker) = launch(cancelled)?;
+    let (mut pipe, worker) = prepared(cancelled)?;
     pipe.send(&Request {
         version: 1,
+        session: true,
         target: target.clone(),
         detailed,
         watch: None,
         resume: false,
+        fast_mode: mode,
+        scope: (mode == FastMode::Mft).then(|| root.as_os_str().encode_wide().collect()),
     })?;
+    let mut validation = crate::scanner::preview::ValidatedStream::new(root.to_owned());
     loop {
         match pipe.receive()? {
+            Message::Preview(batch) => {
+                validation.accept(batch.clone())?;
+                preview(batch)?;
+            }
             Message::Progress {
                 stage,
                 files,
@@ -735,11 +836,129 @@ pub fn scan(
         stage: Stage::Transferring,
         counts: Default::default(),
     });
-    let record = crate::snapshot::read_from(&mut pipe, cancelled)?;
-    if ntfs_native::target(root)?.volume != target.volume {
+    let result = validate_selected_response(read_record_from(&mut pipe)?, root, detailed, mode)?;
+    if selected_target(root, mode)?.volume != target.volume {
         return Err(invalid("결과 수신 중 드라이브가 변경됐습니다"));
     }
-    validate_response(record, Path::new(&target.root), detailed)
+    crate::output::check(&|| cancelled())?;
+    *PREPARED.lock().unwrap() = Some(Prepared {
+        handle: pipe.handle,
+        worker,
+    });
+    Ok(result)
+}
+pub fn selected_target(root: &Path, mode: FastMode) -> io::Result<Target> {
+    if mode == FastMode::Mft {
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || root.as_os_str().encode_wide().any(|u| u == 0)
+        {
+            return Err(invalid("MFT 분석 폴더의 절대 경로가 올바르지 않습니다"));
+        }
+        crate::usn_native::target(root)
+    } else {
+        ntfs_native::target(root)
+    }
+}
+pub fn validate_selected_response(
+    record: SavedScan,
+    root: &Path,
+    detailed: bool,
+    mode: FastMode,
+) -> io::Result<Outcome> {
+    let report = record
+        .engine
+        .clone()
+        .ok_or_else(|| invalid("실제 수집 방식이 없는 응답"))?;
+    if report.fast_mode != Some(mode)
+        || match mode {
+            FastMode::Mft => report.collector != Some(Collector::MftMixed),
+            _ => report.collector != Some(Collector::NtfsRecords),
+        }
+    {
+        return Err(invalid("요청한 고속 수집 방식과 응답이 일치하지 않습니다"));
+    }
+    Ok(Outcome {
+        result: validate_response(record, root, detailed)?,
+        report,
+    })
+}
+fn send_preview(pipe: &mut Pipe<'_>, batch: crate::scanner::preview::Batch) -> io::Result<()> {
+    use crate::scanner::preview::{Batch, Update};
+    let mut packet = Batch {
+        reset: batch.reset,
+        updates: Vec::new(),
+    };
+    let mut estimated = 64;
+    for update in batch.updates {
+        let bytes = match &update {
+            Update::Folder { name, .. } => 128 + name.len() * 6,
+            Update::Values { .. } => 200,
+            Update::Finished => 32,
+        };
+        if !packet.updates.is_empty()
+            && (estimated + bytes > 192 * 1024 || packet.updates.len() == 128)
+        {
+            pipe.send(&Message::Preview(std::mem::take(&mut packet)))?;
+            estimated = 64;
+        }
+        estimated += bytes;
+        packet.updates.push(update);
+    }
+    if packet.reset || !packet.updates.is_empty() {
+        pipe.send(&Message::Preview(packet))?;
+    }
+    Ok(())
+}
+fn request_scope(request: &Request) -> io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let root = if request.fast_mode == FastMode::Mft {
+        let units = request
+            .scope
+            .as_ref()
+            .filter(|u| !u.is_empty() && u.len() <= 32768)
+            .ok_or_else(|| invalid("MFT 범위 누락"))?;
+        std::path::PathBuf::from(OsString::from_wide(units))
+    } else {
+        if request.scope.is_some() {
+            return Err(invalid("기존 NTFS 방식에 폴더 범위 지정 불가"));
+        }
+        std::path::PathBuf::from(&request.target.root)
+    };
+    let actual = selected_target(&root, request.fast_mode)?;
+    if actual.root != request.target.root || actual.volume != request.target.volume {
+        return Err(invalid("분석 범위와 볼륨이 일치하지 않습니다"));
+    }
+    Ok(root)
+}
+fn collect_mft<'a>(
+    root: &Path,
+    target: &Target,
+    detailed: bool,
+    cancelled: impl Fn() -> bool,
+    progress: &mut dyn FnMut(ScanProgress),
+    preview: &'a mut crate::scanner::preview::Observer<'a>,
+) -> io::Result<ScanResult> {
+    let mut source = crate::ntfs_mft::Native::open(target)?;
+    // 측정 후보는 별도 선택하며 제품 기본 정책은 검증 후에만 변경.
+    let catalog = crate::ntfs_mft::collect_tuned(
+        &mut source,
+        Default::default(),
+        &cancelled,
+        &mut *progress,
+    )?;
+    crate::output::check(&cancelled)?;
+    Ok(crate::ntfs_mft::scan_bulk_observed(
+        root,
+        &catalog,
+        detailed,
+        cancelled,
+        progress,
+        Some(preview),
+    )?
+    .0)
 }
 pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     if arguments.len() != 2 {
@@ -770,6 +989,7 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     }
     let never = || false;
     let mut pipe = Pipe {
+        idle: false,
         handle: Handle(h),
         cancelled: &never,
     };
@@ -777,61 +997,106 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     if unsafe { GetNamedPipeServerProcessId(pipe.handle.0, &mut server) } == 0 || server != parent {
         return Err(invalid("부모 프로세스가 일치하지 않습니다"));
     }
-    let request: Request = pipe.receive()?;
-    if request.version != 1 {
-        return Err(invalid("지원하지 않는 도우미 버전"));
-    }
-    if request.watch.is_some() {
-        return watch_worker(&mut pipe, &request);
-    }
-    let root = Path::new(&request.target.root);
-    let begin = SystemTime::now();
-    let clock = Instant::now();
-    let disconnected = std::cell::Cell::new(false);
-    let mut last = Instant::now() - Duration::from_secs(1);
-    let result = ntfs_native::Native::open(&request.target).and_then(|mut source| {
-        crate::ntfs::collect(
-            root,
-            request.detailed,
-            &mut source,
-            || disconnected.get(),
-            |counts| {
-                if last.elapsed() >= Duration::from_millis(100) {
-                    let stage = if counts.folders_scanned == 0 {
-                        Stage::Enumerating
-                    } else {
-                        Stage::Metadata
-                    };
-                    if pipe
-                        .send(&Message::Progress {
-                            stage,
-                            files: counts.files_scanned,
-                            folders: counts.folders_scanned,
-                        })
-                        .is_err()
-                    {
-                        disconnected.set(true);
-                    }
-                    last = Instant::now();
-                }
-            },
-        )
-    });
-    match result {
-        Ok(result) => {
-            let mut record =
-                SavedScan::new(Arc::new(result), begin, SystemTime::now(), clock.elapsed());
-            record.engine = Some(Report {
-                requested: Method::Ntfs,
-                actual: Method::Ntfs,
-                fallback: None,
-            });
-            pipe.send(&Message::Ready)?;
-            let mut writer = io::BufWriter::with_capacity(256 * 1024, &mut pipe);
-            crate::snapshot::write_to(&record, &mut writer, || disconnected.get())?;
-            writer.flush()?;
+    loop {
+        pipe.idle = true;
+        let request: Request = pipe.receive()?;
+        pipe.idle = false;
+        if request.version != 1 {
+            return Err(invalid("지원하지 않는 도우미 버전"));
         }
-        Err(e) => pipe.send(&Message::Failed(e.to_string()))?,
+        if request.watch.is_some() {
+            if request.fast_mode != FastMode::Auto || request.scope.is_some() {
+                return Err(invalid("변경 추적 요청에 잘못된 수집 옵션"));
+            }
+            return watch_worker(&mut pipe, &request);
+        }
+        let scope = request_scope(&request)?;
+        let root = scope.as_path();
+        let begin = SystemTime::now();
+        let clock = Instant::now();
+        let disconnected = std::cell::Cell::new(false);
+        let mut last = Instant::now() - Duration::from_secs(1);
+        let mut last_stage = Stage::Authorizing;
+        let shared = std::cell::RefCell::new(&mut pipe);
+        let mut update = |counts: ScanProgress| {
+            let stage = if counts.folders_scanned == 0 {
+                Stage::Enumerating
+            } else {
+                Stage::Metadata
+            };
+            if last_stage != stage || last.elapsed() >= Duration::from_millis(100) {
+                last_stage = stage;
+                if shared
+                    .borrow_mut()
+                    .send(&Message::Progress {
+                        stage,
+                        files: counts.files_scanned,
+                        folders: counts.folders_scanned,
+                    })
+                    .is_err()
+                {
+                    disconnected.set(true);
+                }
+                last = Instant::now();
+            }
+        };
+        let mut observer = |batch| {
+            let result = send_preview(&mut shared.borrow_mut(), batch);
+            if result.is_err() {
+                disconnected.set(true);
+            }
+            result
+        };
+        let result = if request.fast_mode == FastMode::Mft {
+            collect_mft(
+                root,
+                &request.target,
+                request.detailed,
+                || disconnected.get(),
+                &mut update,
+                &mut observer,
+            )
+        } else {
+            ntfs_native::Native::open(&request.target).and_then(|mut source| {
+                crate::ntfs::collect_with_preview(
+                    root,
+                    request.detailed,
+                    &mut source,
+                    || disconnected.get(),
+                    &mut update,
+                    &mut observer,
+                )
+            })
+        };
+        match result {
+            Ok(result) => {
+                let mut record =
+                    SavedScan::new(Arc::new(result), begin, SystemTime::now(), clock.elapsed());
+                record.engine = Some(Report {
+                    requested: Method::Ntfs,
+                    actual: Method::Ntfs,
+                    fallback: None,
+                    fast_mode: Some(request.fast_mode),
+                    collector: Some(if request.fast_mode == FastMode::Mft {
+                        Collector::MftMixed
+                    } else {
+                        Collector::NtfsRecords
+                    }),
+                });
+                pipe.send(&Message::Ready)?;
+                if request.session {
+                    pipe.record(&record)?;
+                } else {
+                    let mut writer = io::BufWriter::with_capacity(256 * 1024, &mut pipe);
+                    crate::snapshot::write_to(&record, &mut writer, || disconnected.get())?;
+                    writer.flush()?;
+                }
+            }
+            Err(e) => pipe.send(&Message::Failed(e.to_string()))?,
+        }
+        if !request.session {
+            break;
+        }
     }
     Ok(())
 }
@@ -839,6 +1104,77 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_response_requires_exact_mode_collector_scope_and_metadata_option() {
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-selected-response-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let make = || {
+            let now = SystemTime::now();
+            let mut record = SavedScan::new(
+                Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+                now,
+                now,
+                Duration::ZERO,
+            );
+            record.engine = Some(Report {
+                requested: Method::Ntfs,
+                actual: Method::Ntfs,
+                fast_mode: Some(FastMode::Mft),
+                collector: Some(Collector::MftMixed),
+                ..Default::default()
+            });
+            record
+        };
+        assert!(validate_selected_response(make(), &root, false, FastMode::Mft).is_ok());
+        assert!(validate_selected_response(make(), &root, false, FastMode::Legacy).is_err());
+        assert!(validate_selected_response(make(), &root, true, FastMode::Mft).is_err());
+        assert!(
+            validate_selected_response(make(), &root.join("other"), false, FastMode::Mft).is_err()
+        );
+        let mut wrong = make();
+        wrong.engine.as_mut().unwrap().collector = Some(Collector::NtfsRecords);
+        assert!(validate_selected_response(wrong, &root, false, FastMode::Mft).is_err());
+        assert!(selected_target(&root, FastMode::Auto).is_err());
+        assert!(selected_target(&root, FastMode::Mft).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn persistent_response_stops_at_its_frame_without_waiting_for_process_exit() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-helper-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("known"), b"123").unwrap();
+        let now = SystemTime::now();
+        let mut record = SavedScan::new(
+            Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+            now,
+            now,
+            Duration::ZERO,
+        );
+        record.engine = Some(Report {
+            requested: Method::Ntfs,
+            actual: Method::Ntfs,
+            fallback: None,
+            ..Default::default()
+        });
+        let mut wire = Vec::new();
+        write_completed(&mut wire, &record).unwrap();
+        write_completed(&mut wire, &record).unwrap();
+        wire.extend_from_slice(b"NEXT");
+        let mut reader = wire.as_slice();
+        for _ in 0..2 {
+            let result = read_completed(&mut reader, &root, false).unwrap();
+            assert_eq!(
+                (result.folders[0].logical_bytes, result.files.len()),
+                (3, 1)
+            );
+        }
+        assert_eq!(reader, b"NEXT");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn cancelled_transport_returns_without_retrying_the_read() {
         let (done, wait) = std::sync::mpsc::channel();
@@ -851,6 +1187,7 @@ mod tests {
             );
             let _writer = Handle(writer);
             let mut pipe = Pipe {
+                idle: false,
                 handle: Handle(reader),
                 cancelled: &|| true,
             };
@@ -877,6 +1214,7 @@ mod tests {
                 requested: crate::engine::Method::Ntfs,
                 actual: crate::engine::Method::Ntfs,
                 fallback: None,
+                ..Default::default()
             });
             r
         };

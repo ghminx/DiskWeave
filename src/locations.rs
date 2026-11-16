@@ -197,6 +197,11 @@ impl Locations {
                 parallelism: Default::default(),
                 detailed: record.scan.detailed,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
+                fast_mode: record
+                    .engine
+                    .as_ref()
+                    .and_then(|r| r.fast_mode)
+                    .unwrap_or_default(),
             },
             entries: vec![Location {
                 restored: false,
@@ -333,6 +338,19 @@ impl Locations {
     }
     pub fn method(&self) -> crate::engine::Method {
         self.settings.method
+    }
+    pub fn fast_mode(&self) -> crate::engine::FastMode {
+        self.settings.fast_mode
+    }
+    pub fn configure_fast_mode(&mut self, mode: crate::engine::FastMode) -> io::Result<()> {
+        if self.is_running() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "스캔 중에는 고속 수집 방식을 변경할 수 없습니다",
+            ));
+        }
+        self.settings.fast_mode = mode;
+        Ok(())
     }
     pub fn configure_method(&mut self, method: crate::engine::Method) -> io::Result<()> {
         if self.is_running() {
@@ -509,6 +527,10 @@ impl Locations {
                 .expect("대기 중인 위치의 스캔 방식");
             entry
                 .scan
+                .configure_fast_mode(self.settings.fast_mode)
+                .expect("대기 위치의 고속 수집 방식");
+            entry
+                .scan
                 .start(entry.path.clone())
                 .expect("동시에 하나의 스캔만 실행");
             self.active = Some(id);
@@ -576,6 +598,19 @@ impl Locations {
             .and_then(|id| self.get(id))
             .and_then(|e| e.scan.completed())
     }
+    pub fn preview(&self) -> Option<&crate::scanner::preview::Model> {
+        self.selected
+            .and_then(|id| self.get(id))
+            .and_then(|entry| entry.scan.preview())
+    }
+    pub fn take_finished_preview(&mut self) -> Option<crate::scanner::preview::Model> {
+        let id = self.selected?;
+        self.entries
+            .iter_mut()
+            .find(|e| e.id == id)?
+            .scan
+            .take_finished_preview()
+    }
     pub fn snapshots(&self) -> Vec<Snapshot> {
         self.entries
             .iter()
@@ -595,6 +630,52 @@ impl Locations {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn preview_is_location_scoped_and_never_published_as_a_saved_or_searchable_result() {
+        let root = std::env::temp_dir().join(format!(
+            "diskweave-preview-locations-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("first/child")).unwrap();
+        std::fs::create_dir_all(root.join("second")).unwrap();
+        let mut locations = Locations::default();
+        let first = locations.add(&root.join("first")).unwrap();
+        let second = locations.add(&root.join("second")).unwrap();
+        locations.choose(first);
+        locations.start_selected(&[first]).unwrap();
+        assert_eq!(
+            locations.preview().unwrap().root,
+            std::path::absolute(root.join("first")).unwrap()
+        );
+        assert!(locations.snapshots().is_empty());
+        assert!(locations
+            .export_catalog()
+            .locations
+            .iter()
+            .all(|e| e.record.is_none()));
+        assert_eq!(locations.get(first).unwrap().generation, 0);
+        locations.choose(second);
+        assert!(locations.preview().is_none());
+        locations.choose(first);
+        locations.cancel();
+        assert!(locations.preview().is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() && Instant::now() < deadline {
+            locations.poll();
+            std::thread::yield_now();
+        }
+        assert!(!locations.is_running());
+        assert!(locations.snapshots().is_empty());
+        locations.start_selected(&[first]).unwrap();
+        while locations.is_running() && Instant::now() < deadline {
+            locations.poll();
+            std::thread::yield_now();
+        }
+        assert_eq!(locations.snapshots().len(), 1);
+        assert_eq!(locations.get(first).unwrap().generation, 1);
+        assert!(locations.preview().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn accepted_tracking_checkpoints_are_saved_even_when_the_visible_data_is_unchanged() {
         let root =
@@ -763,6 +844,7 @@ mod tests {
             requested: crate::engine::Method::Ntfs,
             actual: crate::engine::Method::Ntfs,
             fallback: None,
+            ..Default::default()
         });
         let view = Locations::from_saved(&record);
         assert_eq!(view.method(), crate::engine::Method::Ntfs);

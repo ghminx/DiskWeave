@@ -13,7 +13,7 @@ pub(super) struct Collection<'a> {
 }
 enum Task {
     Folder(usize, PathBuf),
-    Metadata(Vec<(usize, PathBuf)>),
+    Metadata(Vec<MetadataRequest>),
 }
 type Entry = Result<directory::Entry, (PathBuf, io::Error)>;
 enum Event {
@@ -128,12 +128,31 @@ pub(super) fn scan_collected(
     count: usize,
     collection: Collection<'_>,
     cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    probe: &impl MetadataProbe,
+) -> io::Result<ScanResult> {
+    scan_observed(
+        root, detailed, count, collection, cancelled, progress, probe, None,
+    )
+}
+#[allow(
+    clippy::too_many_arguments,
+    reason = "기존 수집 인자와 선택적 미리보기 관찰 경계 유지"
+)]
+pub(super) fn scan_observed<'a>(
+    root: &Path,
+    detailed: bool,
+    count: usize,
+    collection: Collection<'_>,
+    cancelled: impl Fn() -> bool,
     mut progress: impl FnMut(ScanProgress),
-    probe: &(impl Fn(&Path) -> crate::metadata::Report + Sync),
+    probe: &impl MetadataProbe,
+    observer: Option<&'a mut preview::Observer<'a>>,
 ) -> io::Result<ScanResult> {
     let Collection { strategy, metrics } = collection;
     let trace = metrics.map(|m| &m.trace);
     let mut result = empty_result(root, detailed)?;
+    let mut preview = preview::Recorder::new(observer)?;
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|threads| {
         let (tx, rx) = mpsc::sync_channel(count * 2);
@@ -161,41 +180,24 @@ pub(super) fn scan_collected(
                                 if strategy == directory::Strategy::Reference {
                                     folder(id, index, path, &stop, &tx, trace);
                                 } else {
-                                    let checking = scope(trace, Stage::FolderCheck);
-                                    let current = fs::symlink_metadata(&path).and_then(|m| {
-                                        if m.is_dir()
-                                            && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT
-                                                == 0
-                                        {
-                                            Ok(directory::Entry::from_metadata(path.clone(), m))
-                                        } else {
-                                            Err(io::Error::other(
-                                                "열거 대상의 종류가 변경되었습니다",
-                                            ))
-                                        }
-                                    });
-                                    drop(checking);
-                                    let _enumeration = scope(trace, Stage::Enumerate);
                                     let mut observed = None;
-                                    let value = current.and_then(|entry| {
-                                        observed = Some(entry);
-                                        directory::collect(
-                                            &path,
-                                            strategy,
-                                            &|| stop.load(Ordering::Relaxed),
-                                            &mut |entries| {
-                                                if send(&tx, Event::Entries(index, entries), trace)
-                                                {
-                                                    Ok(())
-                                                } else {
-                                                    Err(io::Error::new(
-                                                        io::ErrorKind::BrokenPipe,
-                                                        "열거 결과 전달 중단",
-                                                    ))
-                                                }
-                                            },
-                                        )
-                                    });
+                                    let value = directory::collect_folder(
+                                        &path,
+                                        strategy,
+                                        &|| stop.load(Ordering::Relaxed),
+                                        &mut |entries| {
+                                            if send(&tx, Event::Entries(index, entries), trace) {
+                                                Ok(())
+                                            } else {
+                                                Err(io::Error::new(
+                                                    io::ErrorKind::BrokenPipe,
+                                                    "열거 결과 전달 중단",
+                                                ))
+                                            }
+                                        },
+                                        &mut |entry| observed = Some(entry),
+                                        trace,
+                                    );
                                     send(&tx, Event::FolderDone(id, index, value, observed), trace);
                                 }
                                 if let (Some(metrics), Some(clock)) = (metrics, clock) {
@@ -207,13 +209,20 @@ pub(super) fn scan_collected(
                             }
                             Task::Metadata(paths) => {
                                 let _metadata = scope(trace, Stage::MetadataTask);
-                                let mut reports = Vec::with_capacity(paths.len());
-                                for (index, path) in paths {
-                                    if stop.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    reports.push((index, probe(&path)));
+                                let values = probe.read_batch(&paths, &stop);
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
                                 }
+                                assert_eq!(
+                                    values.len(),
+                                    paths.len(),
+                                    "상세 조회 묶음 응답 개수 불일치"
+                                );
+                                let reports = paths
+                                    .into_iter()
+                                    .zip(values)
+                                    .map(|(request, report)| (request.index, report))
+                                    .collect();
                                 if !send(&tx, Event::Metadata(id, reports), trace) {
                                     return;
                                 }
@@ -253,7 +262,13 @@ pub(super) fn scan_collected(
                             let paths = (next_file..end)
                                 .map(|index| {
                                     let f = &result.files[index];
-                                    (index, result.folders[f.parent].path.join(&f.name))
+                                    MetadataRequest {
+                                        index,
+                                        path: result.folders[f.parent].path.join(&f.name),
+                                        identity: f.extra.identity.value(),
+                                        logical_bytes: f.logical_bytes,
+                                        allocation: f.extra.allocation.value(),
+                                    }
                                 })
                                 .collect();
                             next_file = end;
@@ -290,6 +305,7 @@ pub(super) fn scan_collected(
                             let m = match entry {
                                 Ok(v) => v,
                                 Err((path, e)) => {
+                                    preview.error(parent);
                                     result.record_error(path, e);
                                     continue;
                                 }
@@ -300,6 +316,7 @@ pub(super) fn scan_collected(
                                 continue;
                             }
                             if m.attributes & 0x10 != 0 {
+                                preview.folder(Some(parent), path.file_name().unwrap());
                                 result.folders.push(Folder {
                                     allocation: Default::default(),
                                     created: m.created,
@@ -334,6 +351,7 @@ pub(super) fn scan_collected(
                                         io::Error::other("논리 크기 합계가 표현 범위를 넘습니다")
                                     })?;
                                 folder.file_count += 1;
+                                preview.file(parent, m.logical_bytes, detailed);
                                 if !detailed {
                                     folder.allocation.add(extra.allocation)?;
                                     counts.files_scanned += 1;
@@ -349,17 +367,22 @@ pub(super) fn scan_collected(
                             folder.modified = observed.modified;
                             folder.attributes = observed.attributes;
                         }
+                        preview.done(index);
                         match value {
                             Ok(()) => counts.folders_scanned += 1,
                             Err(e) if index == 0 || e.kind() == io::ErrorKind::InvalidData => {
                                 return Err(e)
                             }
-                            Err(e) => result.record_error(result.folders[index].path.clone(), e),
+                            Err(e) => {
+                                preview.error(index);
+                                result.record_error(result.folders[index].path.clone(), e);
+                            }
                         }
                     }
                     Some(Event::Metadata(id, reports)) => {
                         idle[id] = true;
                         for (index, report) in reports {
+                            preview.metadata(result.files[index].parent, report.issue.is_some());
                             if let Some(error) = report.issue {
                                 result.metadata_error_count += 1;
                                 if result.metadata_issues.len() < MAX_REPORTED_ERRORS {
@@ -385,6 +408,7 @@ pub(super) fn scan_collected(
                     }
                     None => {}
                 }
+                preview.flush(false)?;
                 if last.elapsed() >= Duration::from_millis(30) {
                     progress(counts);
                     last = Instant::now();
@@ -400,7 +424,9 @@ pub(super) fn scan_collected(
                     .fetch_add(clock.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             crate::output::check(&cancelled)?;
+            preview.finish()?;
             progress(counts);
+            crate::output::check(&cancelled)?;
             Ok(result)
         })();
         stop.store(true, Ordering::Relaxed);

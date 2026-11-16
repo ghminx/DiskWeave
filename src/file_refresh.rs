@@ -108,6 +108,7 @@ impl Controller {
                         requested: crate::engine::Method::Basic,
                         actual: crate::engine::Method::Basic,
                         fallback: None,
+                        ..Default::default()
                     });
                     Ok(record)
                 })();

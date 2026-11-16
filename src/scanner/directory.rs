@@ -23,9 +23,29 @@ pub enum Strategy {
         reason = "기본 적용하지 않는 개발용 일괄 열거 비교 경로 유지"
     )]
     Bulk,
+    #[allow(dead_code, reason = "제품 기본값과 분리한 개발용 단계별 비교")]
+    Experimental(Experiment),
     #[default]
     Combined,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 개발용 일괄 열거 설정. 버퍼 크기는 64 KiB/1 MiB/4 MiB로 제한.
+pub struct Experiment {
+    pub shared_handle: bool,
+    pub reuse_buffer: bool,
+    pub buffer_bytes: usize,
+}
+impl Default for Experiment {
+    fn default() -> Self {
+        Self {
+            shared_handle: false,
+            reuse_buffer: false,
+            buffer_bytes: 65536,
+        }
+    }
+}
+// worker별 동기 열거 저장소. 전달하는 항목에는 이 버퍼의 참조를 보관하지 않음.
+thread_local! {static PAGE_BUFFER:std::cell::RefCell<Vec<u64>>=const{std::cell::RefCell::new(Vec::new())};}
 pub struct Entry {
     pub path: PathBuf,
     pub name: OsString,
@@ -36,6 +56,47 @@ pub struct Entry {
     pub extra: crate::metadata::Extra,
 }
 pub type Item = Result<Entry, (PathBuf, io::Error)>;
+/// 실제 방문 시 폴더 관찰값과 자식 항목 전달. 열거 실패에도 이미 확인한 폴더 값 유지.
+pub fn collect_folder(
+    path: &Path,
+    strategy: Strategy,
+    cancel: &impl Fn() -> bool,
+    emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
+    observe: &mut impl FnMut(Entry),
+    trace: Option<&crate::scanner::profile::Trace>,
+) -> io::Result<()> {
+    use crate::scanner::profile::{scope, Stage};
+    crate::output::check(cancel)?;
+    let checking = scope(trace, Stage::FolderCheck);
+    let experiment = match strategy {
+        Strategy::Experimental(value) => value,
+        _ => Experiment::default(),
+    };
+    if experiment.shared_handle {
+        let source = Native::open_observed(path, &mut |metadata| {
+            observe(Entry::from_metadata(path.to_owned(), metadata))
+        });
+        drop(checking);
+        return match source {
+            Ok(mut source) => {
+                let _enumeration = scope(trace, Stage::Enumerate);
+                collect_native(path, &mut source, cancel, emit, experiment)
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                collect_folder(path, Strategy::LargeFetch, cancel, emit, observe, trace)
+            }
+            Err(e) => Err(e),
+        };
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::other("열거 대상의 종류가 변경되었습니다"));
+    }
+    observe(Entry::from_metadata(path.to_owned(), metadata));
+    drop(checking);
+    let _enumeration = scope(trace, Stage::Enumerate);
+    collect(path, strategy, cancel, emit)
+}
 impl Entry {
     pub(super) fn from_metadata(path: PathBuf, m: fs::Metadata) -> Self {
         Self {
@@ -77,14 +138,22 @@ pub fn collect(
     emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
 ) -> io::Result<()> {
     crate::output::check(cancel)?;
-    if strategy == Strategy::Bulk {
-        let result =
-            Native::open(path).and_then(|mut source| collect_from(path, &mut source, cancel, emit));
-        return match result {
+    if matches!(strategy, Strategy::Bulk | Strategy::Experimental(_)) {
+        return match Native::open(path) {
+            Ok(mut source) => collect_native(
+                path,
+                &mut source,
+                cancel,
+                emit,
+                match strategy {
+                    Strategy::Experimental(value) => value,
+                    _ => Experiment::default(),
+                },
+            ),
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                 collect(path, Strategy::LargeFetch, cancel, emit)
             }
-            other => other,
+            Err(e) => Err(e),
         };
     }
     let mut batch = Vec::with_capacity(128);
@@ -195,7 +264,7 @@ pub fn collect(
                 }
             }
         }
-        Strategy::Bulk => unreachable!(),
+        Strategy::Bulk | Strategy::Experimental(_) => unreachable!(),
     }
     if !batch.is_empty() {
         emit(batch)?;
@@ -219,9 +288,13 @@ struct Native {
     file: fs::File,
     volume: u64,
     first: bool,
+    returned_page: bool,
 }
 impl Native {
     fn open(path: &Path) -> io::Result<Self> {
+        Self::open_observed(path, &mut |_| {})
+    }
+    fn open_observed(path: &Path, observe: &mut impl FnMut(fs::Metadata)) -> io::Result<Self> {
         let file = fs::File::options()
             .access_mode(1)
             .share_mode(7)
@@ -231,6 +304,7 @@ impl Native {
         if !m.is_dir() || m.file_attributes() & 0x400 != 0 {
             return Err(io::Error::other("열거할 폴더의 종류가 변경되었습니다"));
         }
+        observe(m);
         let mut id = FILE_ID_INFO::default();
         // 동일 디렉터리 핸들에서 64-bit 볼륨 ID 확인. 출력 구조체의 크기/수명 유지.
         if unsafe {
@@ -248,6 +322,7 @@ impl Native {
             file,
             volume: id.VolumeSerialNumber,
             first: true,
+            returned_page: false,
         })
     }
 }
@@ -272,6 +347,7 @@ impl Source for Native {
             )
         } != 0
         {
+            self.returned_page = true;
             Ok(true)
         } else {
             let e = io::Error::last_os_error();
@@ -283,6 +359,26 @@ impl Source for Native {
         }
     }
 }
+fn collect_native(
+    path: &Path,
+    source: &mut Native,
+    cancel: &impl Fn() -> bool,
+    emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
+    experiment: Experiment,
+) -> io::Result<()> {
+    let result = if !experiment.reuse_buffer && experiment.buffer_bytes == 65536 {
+        collect_from(path, source, cancel, emit)
+    } else {
+        collect_from_with_options(path, source, cancel, emit, experiment)
+    };
+    match result {
+        // 중간 미지원도 Unsupported로 분류될 수 있어 성공 페이지 이후 재열거 금지.
+        Err(e) if e.kind() == io::ErrorKind::Unsupported && !source.returned_page => {
+            collect(path, Strategy::LargeFetch, cancel, emit)
+        }
+        other => other,
+    }
+}
 /// 길이·정렬·파일명을 검증한 일괄 열거. 첫 페이지 미지원만 안전한 대체 처리로 구분.
 pub fn collect_from(
     path: &Path,
@@ -290,7 +386,39 @@ pub fn collect_from(
     cancel: &impl Fn() -> bool,
     emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut storage = vec![0u64; 8192];
+    collect_from_with_options(path, source, cancel, emit, Experiment::default())
+}
+pub fn collect_from_with_options(
+    path: &Path,
+    source: &mut impl Source,
+    cancel: &impl Fn() -> bool,
+    emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
+    experiment: Experiment,
+) -> io::Result<()> {
+    if !matches!(experiment.buffer_bytes, 65536 | 1048576 | 4194304) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "열거 버퍼는 64 KiB/1 MiB/4 MiB만 지원합니다",
+        ));
+    }
+    let words = experiment.buffer_bytes / 8;
+    if experiment.reuse_buffer {
+        PAGE_BUFFER.with(|buffer| {
+            let mut storage = buffer.borrow_mut();
+            storage.resize(words, 0);
+            read_pages(path, source, cancel, emit, &mut storage)
+        })
+    } else {
+        read_pages(path, source, cancel, emit, &mut vec![0u64; words])
+    }
+}
+fn read_pages(
+    path: &Path,
+    source: &mut impl Source,
+    cancel: &impl Fn() -> bool,
+    emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
+    storage: &mut [u64],
+) -> io::Result<()> {
     let mut first = true;
     loop {
         crate::output::check(cancel)?;
@@ -298,6 +426,7 @@ pub fn collect_from(
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), storage.len() * 8)
         };
+        // 유효 Byte 수가 없는 API에서 짧은 손상 응답이 이전 파일명을 읽지 않도록 초기화 유지.
         bytes.fill(0);
         let present = source
             .read(bytes)
@@ -391,6 +520,201 @@ pub fn collect_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_pages_bound_buffer_sizes_and_reject_short_dirty_responses() {
+        struct Pages {
+            pages: std::collections::VecDeque<Vec<u8>>,
+            bytes: usize,
+        }
+        impl Source for Pages {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<bool> {
+                assert_eq!(buffer.len(), self.bytes);
+                if let Some(page) = self.pages.pop_front() {
+                    buffer[..page.len()].copy_from_slice(&page);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            fn volume(&self) -> u64 {
+                17
+            }
+        }
+        let page = |name: &[u16]| {
+            let mut bytes = vec![0u8; 88 + name.len() * 2];
+            bytes[40..48].copy_from_slice(&3i64.to_le_bytes());
+            bytes[48..56].copy_from_slice(&4096i64.to_le_bytes());
+            bytes[60..64].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+            bytes[72] = 5;
+            bytes[87] = 0x81;
+            for (i, value) in name.iter().enumerate() {
+                bytes[88 + i * 2..90 + i * 2].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes
+        };
+        for buffer_bytes in [65536, 1048576, 4194304] {
+            let options = Experiment {
+                reuse_buffer: true,
+                buffer_bytes,
+                ..Default::default()
+            };
+            let mut entries = vec![];
+            collect_from_with_options(
+                Path::new("scope"),
+                &mut Pages {
+                    pages: [page(&[97, 98])].into(),
+                    bytes: buffer_bytes,
+                },
+                &|| false,
+                &mut |batch| {
+                    entries.extend(batch);
+                    Ok(())
+                },
+                options,
+            )
+            .unwrap();
+            let entry = entries.pop().unwrap().unwrap();
+            assert_eq!((entry.name, entry.logical_bytes), (OsString::from("ab"), 3));
+            let id = entry.extra.identity.value().unwrap();
+            assert_eq!(id.volume, 17);
+            assert_eq!(id.file[15], 0x81);
+            let mut short = page(&[99]);
+            short[60..64].copy_from_slice(&4u32.to_le_bytes());
+            assert_eq!(
+                collect_from_with_options(
+                    Path::new("scope"),
+                    &mut Pages {
+                        pages: [short].into(),
+                        bytes: buffer_bytes
+                    },
+                    &|| false,
+                    &mut |_| Ok(()),
+                    options
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for buffer_bytes in [0, 1, 65535, usize::MAX] {
+            assert_eq!(
+                collect_from_with_options(
+                    Path::new("scope"),
+                    &mut Pages {
+                        pages: Default::default(),
+                        bytes: 0
+                    },
+                    &|| false,
+                    &mut |_| Ok(()),
+                    Experiment {
+                        buffer_bytes,
+                        ..Default::default()
+                    }
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+    #[test]
+    fn configured_page_failures_keep_permission_errors_and_cancellation_distinct() {
+        struct Failure(i32);
+        impl Source for Failure {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<bool> {
+                Err(io::Error::from_raw_os_error(self.0))
+            }
+            fn volume(&self) -> u64 {
+                0
+            }
+        }
+        for buffer_bytes in [65536, 1048576, 4194304] {
+            let options = Experiment {
+                reuse_buffer: true,
+                buffer_bytes,
+                ..Default::default()
+            };
+            for (code, kind) in [
+                (5, io::ErrorKind::PermissionDenied),
+                (2, io::ErrorKind::NotFound),
+                (50, io::ErrorKind::Unsupported),
+            ] {
+                assert_eq!(
+                    collect_from_with_options(
+                        Path::new("scope"),
+                        &mut Failure(code),
+                        &|| false,
+                        &mut |_| Ok(()),
+                        options
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    kind
+                );
+            }
+            assert_eq!(
+                collect_from_with_options(
+                    Path::new("scope"),
+                    &mut Failure(5),
+                    &|| true,
+                    &mut |_| Ok(()),
+                    options
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::Interrupted
+            );
+        }
+    }
+    #[test]
+    fn shared_folder_collection_publishes_current_folder_and_all_children() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-shared-folder-{}", std::process::id()));
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("data"), b"123").unwrap();
+        for buffer_bytes in [65536, 1048576, 4194304] {
+            let mut observed = None;
+            let mut entries = vec![];
+            collect_folder(
+                &root,
+                Strategy::Experimental(Experiment {
+                    shared_handle: true,
+                    buffer_bytes,
+                    ..Default::default()
+                }),
+                &|| false,
+                &mut |batch| {
+                    entries.extend(batch);
+                    Ok(())
+                },
+                &mut |entry| observed = Some(entry),
+                None,
+            )
+            .unwrap();
+            let folder = observed.unwrap();
+            assert_eq!(folder.path, root);
+            assert_eq!(
+                folder.modified,
+                fs::symlink_metadata(&root).unwrap().modified().ok()
+            );
+            assert_eq!(entries.len(), 2);
+            let data = entries
+                .iter()
+                .map(|e| e.as_ref().unwrap())
+                .find(|e| e.name == "data")
+                .unwrap();
+            assert_eq!(data.logical_bytes, 3);
+            assert!(
+                data.extra.identity.value().is_some(),
+                "현재 NTFS에서 실제 일괄 수집 경로 확인"
+            );
+            assert!(entries
+                .iter()
+                .map(|e| e.as_ref().unwrap())
+                .any(|e| e.name == "child" && e.attributes & 0x10 != 0));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn drive_root_metadata_has_no_file_name_and_remains_a_directory_entry() {
         let current = std::env::current_dir().unwrap();
@@ -543,11 +867,24 @@ mod tests {
         assert!(empty.is_empty());
         let odd = std::ffi::OsString::from_wide(&[0xD800, b'x' as u16]);
         std::fs::write(root.join(&odd), b"123").unwrap();
+        let mut expected = std::collections::HashSet::from([odd.clone()]);
         for index in 0..900 {
-            std::fs::write(root.join(format!("한글-{index:04}")), b"x").unwrap();
+            let name = OsString::from(format!("한글-{index:04}"));
+            std::fs::write(root.join(&name), b"x").unwrap();
+            expected.insert(name);
         }
         let mut found = Vec::new();
-        for strategy in [Strategy::LargeFetch, Strategy::Bulk] {
+        let mut strategies = vec![Strategy::LargeFetch, Strategy::Bulk];
+        for reuse_buffer in [false, true] {
+            for buffer_bytes in [65536, 1048576, 4194304] {
+                strategies.push(Strategy::Experimental(Experiment {
+                    reuse_buffer,
+                    buffer_bytes,
+                    ..Default::default()
+                }));
+            }
+        }
+        for strategy in strategies {
             found.clear();
             collect(&root, strategy, &|| false, &mut |page| {
                 found.extend(page.into_iter().map(Result::unwrap));
@@ -555,6 +892,13 @@ mod tests {
             })
             .unwrap();
             assert_eq!(found.len(), 901);
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect::<std::collections::HashSet<_>>(),
+                expected
+            );
             assert_eq!(found.iter().map(|e| e.logical_bytes).sum::<u64>(), 903);
             assert!(found.iter().any(|e| e
                 .path

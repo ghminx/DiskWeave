@@ -358,7 +358,7 @@ impl Drop for IndexController {
         self.sender = None;
     }
 }
-fn default_path() -> io::Result<PathBuf> {
+pub(crate) fn default_path() -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::{
         System::Com::CoTaskMemFree,

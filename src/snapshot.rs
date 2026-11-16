@@ -460,12 +460,18 @@ mod tests {
             requested: crate::engine::Method::Ntfs,
             actual: crate::engine::Method::Basic,
             fallback: Some("권한 없음".into()),
+            fast_mode: Some(crate::engine::FastMode::Mft),
+            collector: Some(crate::engine::Collector::Basic),
         });
         let mut bytes = Vec::new();
         write_to(&record, &mut bytes, || false).unwrap();
         let loaded = read_from(bytes.as_slice(), || false).unwrap();
         assert_eq!(loaded.engine, record.engine);
         let mut old: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        old["engine"].as_object_mut().unwrap().remove("fast_mode");
+        old["engine"].as_object_mut().unwrap().remove("collector");
+        let legacy = read_from(serde_json::to_vec(&old).unwrap().as_slice(), || false).unwrap();
+        assert_eq!(legacy.engine.unwrap().collector, None);
         old.as_object_mut().unwrap().remove("engine");
         assert!(
             read_from(serde_json::to_vec(&old).unwrap().as_slice(), || false)

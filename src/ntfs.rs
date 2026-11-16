@@ -111,12 +111,33 @@ fn decode(page: &[u8]) -> io::Result<Vec<Record>> {
 ///
 /// Returns:
 ///     부모가 자식보다 앞선 경로별 집계 결과. 구조 불일치 시 오류 반환.
+#[allow(dead_code, reason = "기존 CLI·개발 도구의 공개 수집 경계 유지")]
 pub fn collect(
     root: &Path,
     detailed: bool,
     source: &mut impl Source,
     cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+) -> io::Result<ScanResult> {
+    collect_observed(root, detailed, source, cancelled, progress, None)
+}
+pub fn collect_with_preview<'a>(
+    root: &Path,
+    detailed: bool,
+    source: &mut impl Source,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    preview: &'a mut crate::scanner::preview::Observer<'a>,
+) -> io::Result<ScanResult> {
+    collect_observed(root, detailed, source, cancelled, progress, Some(preview))
+}
+fn collect_observed<'a>(
+    root: &Path,
+    detailed: bool,
+    source: &mut impl Source,
+    cancelled: impl Fn() -> bool,
     mut progress: impl FnMut(ScanProgress),
+    observer: Option<&'a mut crate::scanner::preview::Observer<'a>>,
 ) -> io::Result<ScanResult> {
     crate::output::check(&cancelled)?;
     let root_id = source.root_id()?;
@@ -171,6 +192,7 @@ pub fn collect(
     if m.attributes & 0x410 != 0x10 {
         return Err(invalid("NTFS 루트 종류 변경"));
     }
+    let mut preview = crate::scanner::preview::Recorder::new(observer)?;
     let mut excluded = HashSet::new();
     let mut blocked = HashSet::<PathBuf>::new();
     let mut paths = HashMap::from([(root_id, root.to_owned())]);
@@ -182,6 +204,7 @@ pub fn collect(
         let mut next = Vec::new();
         for r in pending {
             crate::output::check(&cancelled)?;
+            preview.flush(false)?;
             if excluded.contains(&r.parent)
                 || matches!(r.id,Id::V2(n) if n & 0x0000_ffff_ffff_ffff < 16)
                 || matches!(r.parent,Id::V2(n) if n & 0x0000_ffff_ffff_ffff < 16 && n & 0x0000_ffff_ffff_ffff !=5)
@@ -214,6 +237,8 @@ pub fn collect(
                         result.record_error(path.clone(), e);
                         let index = result.folders.len();
                         folders.insert(path.clone(), index);
+                        preview.folder(Some(p), &r.name);
+                        preview.error(index);
                         result.folders.push(Folder {
                             allocation: Default::default(),
                             created: None,
@@ -235,6 +260,7 @@ pub fn collect(
                 }
                 let index = result.folders.len();
                 folders.insert(path.clone(), index);
+                preview.folder(Some(p), &r.name);
                 result.folders.push(Folder {
                     allocation: Default::default(),
                     created: m.created,
@@ -246,6 +272,7 @@ pub fn collect(
                     folder_count: 0,
                     modified: m.modified,
                 });
+                preview.flush(false)?;
             } else {
                 files.push((path, r.id));
             }
@@ -261,12 +288,17 @@ pub fn collect(
         }
         pending = next;
     }
+    preview.flush(true)?;
     let mut seen = HashSet::new();
     for (path, id) in files {
         crate::output::check(&cancelled)?;
+        preview.flush(false)?;
         let first = match source.inspect(&path, detailed) {
             Ok(info) => info,
             Err(error) => {
+                if let Some(parent) = path.parent().and_then(|p| folders.get(p)) {
+                    preview.error(*parent);
+                }
                 result.record_error(path, error);
                 continue;
             }
@@ -282,6 +314,9 @@ pub fn collect(
         } {
             Ok(v) => v,
             Err(e) => {
+                if let Some(parent) = path.parent().and_then(|p| folders.get(p)) {
+                    preview.error(*parent);
+                }
                 result.record_error(path, e);
                 continue;
             }
@@ -312,6 +347,7 @@ pub fn collect(
             } {
                 Ok(m) => m,
                 Err(e) => {
+                    preview.error(parent);
                     result.record_error(path, e);
                     continue;
                 }
@@ -320,6 +356,7 @@ pub fn collect(
                 return Err(invalid("NTFS 파일 종류 변경"));
             }
             if let Some(error) = m.extra.issue {
+                preview.error(parent);
                 result.metadata_error_count += 1;
                 if result.metadata_issues.len() < 20 {
                     result.metadata_issues.push(ScanIssue {
@@ -334,6 +371,7 @@ pub fn collect(
                 .checked_add(m.bytes)
                 .ok_or_else(|| invalid("용량 합계 초과"))?;
             folder.file_count += 1;
+            preview.file(parent, m.bytes, false);
             folder.allocation.add(m.extra.values.allocation)?;
             result.files.push(FileEntry {
                 extra: m.extra.values,
@@ -348,6 +386,7 @@ pub fn collect(
                 modified: m.modified,
             });
         }
+        preview.flush(false)?;
         progress(ScanProgress {
             folders_scanned: result.folders.len() as u64,
             files_scanned: result.files.len() as u64,
@@ -359,6 +398,8 @@ pub fn collect(
         folders_scanned: result.folders.len() as u64,
         files_scanned: result.files.len() as u64,
     });
+    preview.finish()?;
+    crate::output::check(&cancelled)?;
     Ok(result)
 }
 
@@ -451,6 +492,43 @@ mod tests {
             huge: false,
             single: false,
         }
+    }
+    #[test]
+    fn preview_aggregate_overflow_is_reported_without_panicking() {
+        let mut source = fixture();
+        source.huge = true;
+        let root = source.root.clone();
+        fs::write(root.join("another.bin"), b"7").unwrap();
+        source.pages[0].extend(record(102, 5 | (1 << 48), "another.bin", 0));
+        let error =
+            collect_with_preview(&root, true, &mut source, || false, |_| {}, &mut |_| Ok(()))
+                .err()
+                .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn preview_keeps_hard_link_paths_and_waits_until_metadata_is_complete() {
+        let mut source = fixture();
+        let root = source.root.clone();
+        let mut model = crate::scanner::preview::Model::new(root.clone());
+        let mut saw_folders_waiting = false;
+        let result =
+            collect_with_preview(&root, true, &mut source, || false, |_| {}, &mut |batch| {
+                model.apply(batch)?;
+                saw_folders_waiting |= model.folders.len() > 1
+                    && model.folders[0].state() == crate::scanner::preview::State::Calculating;
+                Ok(())
+            })
+            .unwrap();
+        assert!(saw_folders_waiting);
+        assert_eq!((model.folders[0].bytes, model.folders[0].files), (14, 2));
+        assert_eq!(
+            model.folders[0].state(),
+            crate::scanner::preview::State::Complete
+        );
+        assert_eq!(result.folders[0].logical_bytes, model.folders[0].bytes);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn single_link_files_keep_metadata_without_an_extra_name_enumeration() {

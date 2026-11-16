@@ -42,6 +42,8 @@ pub enum ScanStatus {
 }
 
 struct ActiveScan {
+    preview_mail: crate::scanner::preview::Mailbox,
+    preview_error: Option<String>,
     path: PathBuf,
     started: Instant,
     clock: SystemTime,
@@ -52,6 +54,7 @@ struct ActiveScan {
 
 #[derive(Default)]
 pub struct ScanController {
+    preview: Option<crate::scanner::preview::Model>,
     settings: crate::metadata::ScanSettings,
     active: Option<ActiveScan>,
     completed: Option<CompletedScan>,
@@ -65,6 +68,11 @@ impl ScanController {
                 parallelism: Default::default(),
                 detailed: record.scan.detailed,
                 method: record.engine.as_ref().map_or_default(|r| r.requested),
+                fast_mode: record
+                    .engine
+                    .as_ref()
+                    .and_then(|r| r.fast_mode)
+                    .unwrap_or_default(),
             },
             completed: Some(CompletedScan {
                 tracking: record.tracking.clone(),
@@ -84,6 +92,7 @@ impl ScanController {
             self.completed = Self::from_saved(record).completed;
         }
     }
+    #[cfg(test)]
     pub fn parallelism(&self) -> crate::scanner::Parallelism {
         self.settings.parallelism
     }
@@ -97,8 +106,23 @@ impl ScanController {
         self.settings.parallelism = value;
         Ok(())
     }
+    #[cfg(test)]
     pub fn method(&self) -> crate::engine::Method {
         self.settings.method
+    }
+    #[cfg(test)]
+    pub fn fast_mode(&self) -> crate::engine::FastMode {
+        self.settings.fast_mode
+    }
+    pub fn configure_fast_mode(
+        &mut self,
+        mode: crate::engine::FastMode,
+    ) -> Result<(), &'static str> {
+        if self.is_running() {
+            return Err("스캔 중에는 고속 수집 방식을 변경할 수 없습니다");
+        }
+        self.settings.fast_mode = mode;
+        Ok(())
     }
     pub fn configure_method(&mut self, method: crate::engine::Method) -> Result<(), &'static str> {
         if self.is_running() {
@@ -112,6 +136,7 @@ impl ScanController {
             .as_ref()
             .map(|a| a.progress.lock().unwrap().stage)
     }
+    #[cfg(test)]
     pub fn details_requested(&self) -> bool {
         self.settings.detailed
     }
@@ -132,35 +157,26 @@ impl ScanController {
         let worker_cancelled = Arc::clone(&cancelled);
         let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
         let worker_progress = Arc::clone(&progress);
-        let detailed = self.details_requested();
-        let method = self.method();
-        let parallelism = self.parallelism();
+        let preview_mail = crate::scanner::preview::Mailbox::default();
+        let worker_preview = preview_mail.clone();
+        let settings = self.settings;
         let clock = SystemTime::now();
         std::thread::spawn(move || {
-            let result = if parallelism == crate::scanner::Parallelism::Auto {
-                crate::engine::scan_with(
-                    &worker_path,
-                    method,
-                    detailed,
-                    || worker_cancelled.load(Ordering::Relaxed),
-                    |update| *worker_progress.lock().unwrap() = update,
-                    crate::ntfs_helper::scan,
-                )
-            } else {
-                crate::engine::scan_with_parallelism(
-                    &worker_path,
-                    method,
-                    detailed,
-                    parallelism,
-                    || worker_cancelled.load(Ordering::Relaxed),
-                    |update| *worker_progress.lock().unwrap() = update,
-                    crate::ntfs_helper::scan,
-                )
-            };
+            let result = crate::engine::scan_selected(
+                &worker_path,
+                &settings,
+                || worker_cancelled.load(Ordering::Relaxed),
+                |update| *worker_progress.lock().unwrap() = update,
+                Some(&mut |batch| worker_preview.publish(batch)),
+                crate::ntfs_helper::scan_selected,
+            );
             let _ = sender.send((SystemTime::now(), result));
         });
         self.status = ScanStatus::Running;
+        self.preview = Some(crate::scanner::preview::Model::new(path.clone()));
         self.active = Some(ActiveScan {
+            preview_mail,
+            preview_error: None,
             path,
             started: Instant::now(),
             clock,
@@ -180,21 +196,40 @@ impl ScanController {
 
     /// 새 완료 결과로 교체된 경우에만 true 반환.
     pub fn poll(&mut self) -> bool {
-        let Some(active) = self.active.as_ref() else {
+        let Some(active) = self.active.as_mut() else {
             return false;
         };
+        if let Some(batch) = active.preview_mail.drain() {
+            if let Err(error) = self.preview.as_mut().expect("활성 미리보기").apply(batch) {
+                active.preview_error = Some(error.to_string());
+                active.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
         let (finished, result) = match active.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
                 self.status = ScanStatus::Failed("스캔 작업이 예기치 않게 종료됐습니다".to_owned());
                 self.active = None;
+                self.preview = None;
                 return false;
             }
         };
+        // 완료 채널 수신 직전에 도착한 마지막 폴더 묶음까지 반영.
+        if let Some(batch) = active.preview_mail.drain() {
+            if let Err(error) = self.preview.as_mut().expect("활성 미리보기").apply(batch) {
+                active.preview_error = Some(error.to_string());
+            }
+        }
         let active = self.active.take().expect("수신 중인 스캔 작업");
+        if let Some(error) = active.preview_error {
+            self.status = ScanStatus::Failed(error);
+            self.preview = None;
+            return false;
+        }
         if active.cancelled.load(Ordering::Relaxed) {
             self.status = ScanStatus::Cancelled;
+            self.preview = None;
             return false;
         }
         match result {
@@ -213,6 +248,7 @@ impl ScanController {
             }
             Err(error) => {
                 self.status = ScanStatus::Failed(error.to_string());
+                self.preview = None;
                 false
             }
         }
@@ -238,6 +274,17 @@ impl ScanController {
 
     pub fn completed(&self) -> Option<&CompletedScan> {
         self.completed.as_ref()
+    }
+    pub fn preview(&self) -> Option<&crate::scanner::preview::Model> {
+        self.active
+            .as_ref()
+            .filter(|a| !a.cancelled.load(Ordering::Relaxed))?;
+        self.preview.as_ref()
+    }
+    pub fn take_finished_preview(&mut self) -> Option<crate::scanner::preview::Model> {
+        matches!(self.status, ScanStatus::Completed)
+            .then(|| self.preview.take())
+            .flatten()
     }
 }
 
@@ -312,7 +359,14 @@ mod tests {
             .configure_parallelism(crate::scanner::Parallelism::Two)
             .unwrap();
         controller.configure(false).unwrap();
+        controller
+            .configure_fast_mode(crate::engine::FastMode::Mft)
+            .unwrap();
         controller.start(root.clone()).unwrap();
+        assert!(controller
+            .configure_fast_mode(crate::engine::FastMode::Legacy)
+            .is_err());
+        assert_eq!(controller.fast_mode(), crate::engine::FastMode::Mft);
         assert!(controller.configure(true).is_err());
         assert!(controller
             .configure_parallelism(crate::scanner::Parallelism::Eight)

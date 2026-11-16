@@ -15,6 +15,10 @@ mod global_search;
 mod gui;
 mod index_job;
 mod index_store;
+#[cfg(test)]
+#[allow(dead_code, reason = "공유 수집기의 제품·개발 경로 대조 시험")]
+#[path = "../tools/ntfs-validation/layout.rs"]
+mod layout;
 mod list_selection;
 mod local_date;
 mod locations;
@@ -23,7 +27,11 @@ mod map_job;
 mod metadata;
 mod ntfs;
 mod ntfs_helper;
+#[allow(dead_code, reason = "제품 수집기와 개발용 독립 비교 경계 공유")]
+mod ntfs_mft;
 mod ntfs_native;
+#[allow(dead_code, reason = "MFT 직접·혼합 수집 비교 경계 공유")]
+mod ntfs_tree;
 mod output;
 mod presentation;
 mod recycle;
@@ -34,6 +42,7 @@ mod search;
 mod search_job;
 mod search_view;
 mod snapshot;
+mod startup;
 mod target_selection;
 mod tracking;
 mod treemap;
@@ -91,7 +100,7 @@ fn run() -> io::Result<()> {
     if arguments.first().is_some_and(|a| a == "--ntfs-worker") {
         return ntfs_helper::worker(&arguments[1..]);
     }
-    if arguments.is_empty() {
+    if arguments.is_empty() || arguments.as_slice() == ["--gui-elevated"] {
         return gui::run().map_err(|error| io::Error::other(error.to_string()));
     }
     let (root, view) = match arguments.as_slice() {

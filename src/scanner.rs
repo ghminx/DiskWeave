@@ -145,6 +145,89 @@ pub struct ScanMetrics {
     pub read_ns: [std::sync::atomic::AtomicU64; 6],
     pub read_calls: [std::sync::atomic::AtomicU64; 6],
 }
+/// 열거 결과의 출처를 유지하는 제한된 상세 조회 요청.
+pub struct MetadataRequest {
+    pub index: usize,
+    pub path: PathBuf,
+    #[allow(dead_code, reason = "개발용 파일 ID 조회 후보에 열거 출처 전달")]
+    pub identity: Option<crate::metadata::Identity>,
+    #[allow(dead_code, reason = "개발용 MFT 조합에서 현재 열거와 크기/할당량 대조")]
+    pub logical_bytes: u64,
+    #[allow(dead_code, reason = "개발용 MFT 조합에서 현재 열거와 크기/할당량 대조")]
+    pub allocation: Option<u64>,
+}
+pub trait MetadataProbe: Sync {
+    fn read_batch(
+        &self,
+        requests: &[MetadataRequest],
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Vec<crate::metadata::Report>;
+}
+impl<F: Fn(&Path) -> crate::metadata::Report + Sync> MetadataProbe for F {
+    fn read_batch(
+        &self,
+        requests: &[MetadataRequest],
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Vec<crate::metadata::Report> {
+        requests
+            .iter()
+            .take_while(|_| !stop.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|r| self(&r.path))
+            .collect()
+    }
+}
+/// 동일한 수집·집계·취소 계약에서 OS 상세 조회 후보만 대조하는 개발용 경계.
+#[allow(dead_code, reason = "개발 도구에서만 후보 평가")]
+pub fn scan_with_metadata_source(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    strategy: directory::Strategy,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    probe: &impl MetadataProbe,
+) -> io::Result<ScanResult> {
+    parallel::scan_collected(
+        root,
+        detailed,
+        parallelism.workers(),
+        parallel::Collection {
+            strategy,
+            metrics: None,
+        },
+        cancelled,
+        progress,
+        probe,
+    )
+}
+/// MFT 보완 조회와 기존 폴더 미리보기의 동일 수집 경계.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "기존 수집 계약과 선택적 미리보기 전달"
+)]
+pub fn scan_metadata_observed<'a>(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    probe: &impl MetadataProbe,
+    observer: Option<&'a mut preview::Observer<'a>>,
+) -> io::Result<ScanResult> {
+    parallel::scan_observed(
+        root,
+        detailed,
+        parallelism.workers(),
+        parallel::Collection {
+            strategy: directory::Strategy::Bulk,
+            metrics: None,
+        },
+        cancelled,
+        progress,
+        probe,
+        observer,
+    )
+}
 /// 비교용 수집 경로를 고정한 스캔. 제품 설정과 원본 파일 변경 없이 실험 경로 대조.
 pub fn scan_with_strategy(
     root: &Path,
@@ -172,7 +255,9 @@ pub fn scan_with_strategy(
     let named = if detailed
         && matches!(
             strategy,
-            directory::Strategy::Bulk | directory::Strategy::Combined
+            directory::Strategy::Bulk
+                | directory::Strategy::Combined
+                | directory::Strategy::Experimental(_)
         ) {
         Some(crate::metadata::Named::for_root(root)?)
     } else {
@@ -525,6 +610,95 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn incomplete_batch_is_failure_and_all_workers_leave_before_return() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Broken(AtomicUsize);
+        impl MetadataProbe for Broken {
+            fn read_batch(
+                &self,
+                _: &[MetadataRequest],
+                _: &std::sync::atomic::AtomicBool,
+            ) -> Vec<crate::metadata::Report> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let reports = vec![];
+                self.0.fetch_sub(1, Ordering::SeqCst);
+                reports
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("diskweave-invalid-batch-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), b"123").unwrap();
+        let probe = Broken(AtomicUsize::new(0));
+        let result = scan_with_metadata_source(
+            &root,
+            true,
+            Parallelism::Eight,
+            directory::Strategy::Bulk,
+            || false,
+            |_| {},
+            &probe,
+        );
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Other);
+        assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+        assert_eq!(scan(&root, || false).unwrap().folders[0].logical_bytes, 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn metadata_batches_receive_enumerated_identity_without_changing_scan_totals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Probe {
+            count: AtomicUsize,
+            maximum: AtomicUsize,
+        }
+        impl MetadataProbe for Probe {
+            fn read_batch(
+                &self,
+                requests: &[MetadataRequest],
+                stop: &std::sync::atomic::AtomicBool,
+            ) -> Vec<crate::metadata::Report> {
+                assert!(requests.iter().all(|r| r.identity.is_some()));
+                assert!(requests
+                    .iter()
+                    .all(|r| r.logical_bytes == 3 && r.allocation.is_some()));
+                self.maximum.fetch_max(requests.len(), Ordering::SeqCst);
+                requests
+                    .iter()
+                    .take_while(|_| !stop.load(Ordering::Relaxed))
+                    .map(|r| {
+                        self.count.fetch_add(1, Ordering::SeqCst);
+                        crate::metadata::read(&r.path)
+                    })
+                    .collect()
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("diskweave-batch-probe-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..300 {
+            fs::write(root.join(format!("{i}.bin")), b"123").unwrap();
+        }
+        let probe = Probe {
+            count: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        };
+        let result = scan_with_metadata_source(
+            &root,
+            true,
+            Parallelism::Eight,
+            directory::Strategy::Bulk,
+            || false,
+            |_| {},
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(result.folders[0].logical_bytes, 900);
+        assert_eq!(result.files.len(), 300);
+        assert_eq!(probe.count.load(Ordering::SeqCst), 300);
+        assert!((1..=128).contains(&probe.maximum.load(Ordering::SeqCst)));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn sixteen_workers_preserve_totals_and_finish_all_queries_before_cancellation_returns() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = std::env::temp_dir().join(format!("diskweave-sixteen-{}", std::process::id()));
@@ -638,6 +812,132 @@ mod tests {
         assert_eq!(cpu.measured_samples + cpu.missing_samples, 4);
         fs::remove_dir_all(root).unwrap();
     }
+    fn collection_strategies() -> Vec<directory::Strategy> {
+        let mut modes = vec![
+            directory::Strategy::LargeFetch,
+            directory::Strategy::Bulk,
+            directory::Strategy::Combined,
+        ];
+        for shared_handle in [false, true] {
+            for reuse_buffer in [false, true] {
+                for buffer_bytes in [65536, 1048576, 4194304] {
+                    modes.push(directory::Strategy::Experimental(directory::Experiment {
+                        shared_handle,
+                        reuse_buffer,
+                        buffer_bytes,
+                    }));
+                }
+            }
+        }
+        modes
+    }
+    #[test]
+    fn experimental_scans_exclude_junction_cycles_and_keep_basic_missing_fields() {
+        use std::os::windows::process::CommandExt;
+        let root =
+            std::env::temp_dir().join(format!("diskweave-native-cycle-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data"), b"12").unwrap();
+        let cycle = root.join("cycle");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&cycle)
+            .arg(&root)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        for strategy in collection_strategies() {
+            for detailed in [false, true] {
+                let result = scan_with_strategy(
+                    &root,
+                    detailed,
+                    Parallelism::Four,
+                    strategy,
+                    || false,
+                    |_| {},
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    (
+                        result.files.len(),
+                        result.folders.len(),
+                        result.folders[0].logical_bytes,
+                        result.skipped_reparse_points,
+                        result.error_count
+                    ),
+                    (1, 1, 2, 1, 0)
+                );
+                if !detailed {
+                    assert_eq!(result.files[0].extra, Default::default());
+                    assert_eq!(result.folders[0].allocation.not_collected, 1);
+                }
+            }
+        }
+        fs::remove_dir(cycle).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancelling_native_candidates_releases_folder_handles_and_allows_another_scan() {
+        use std::{cell::Cell, os::windows::fs::OpenOptionsExt};
+        let root =
+            std::env::temp_dir().join(format!("diskweave-native-cancel-{}", std::process::id()));
+        for group in 0..16 {
+            let folder = root.join(group.to_string());
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..128 {
+                fs::write(folder.join(file.to_string()), b"12").unwrap();
+            }
+        }
+        for strategy in collection_strategies() {
+            let polls = Cell::new(0);
+            let cancelled = scan_with_strategy(
+                &root,
+                true,
+                Parallelism::Four,
+                strategy,
+                || {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 8
+                },
+                |_| {},
+                None,
+            );
+            assert!(matches!(cancelled,Err(e) if e.kind()==io::ErrorKind::Interrupted));
+            for path in
+                std::iter::once(root.clone()).chain((0..16).map(|n| root.join(n.to_string())))
+            {
+                let exclusive = fs::File::options()
+                    .access_mode(0x80)
+                    .share_mode(0)
+                    .custom_flags(0x02200000)
+                    .open(path)
+                    .unwrap();
+                drop(exclusive);
+            }
+            let complete = scan_with_strategy(
+                &root,
+                true,
+                Parallelism::Four,
+                strategy,
+                || false,
+                |_| {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    complete.files.len(),
+                    complete.folders.len(),
+                    complete.folders[0].logical_bytes,
+                    complete.metadata_error_count
+                ),
+                (2048, 17, 4096, 0)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn collected_scan_keeps_reference_totals_fields_and_parent_relations() {
         let root = std::env::temp_dir().join(format!("diskweave-collected-{}", std::process::id()));
@@ -645,11 +945,7 @@ mod tests {
         fs::write(root.join("original"), b"12345").unwrap();
         fs::hard_link(root.join("original"), root.join("nested/alias")).unwrap();
         let old = scan_with_probe(&root, true, || false, |_| {}, crate::metadata::read).unwrap();
-        for strategy in [
-            directory::Strategy::LargeFetch,
-            directory::Strategy::Bulk,
-            directory::Strategy::Combined,
-        ] {
+        for strategy in collection_strategies() {
             let new = scan_with_strategy(
                 &root,
                 true,
@@ -716,11 +1012,7 @@ mod tests {
             Parallelism::Twelve,
             Parallelism::Sixteen,
         ] {
-            for strategy in [
-                directory::Strategy::LargeFetch,
-                directory::Strategy::Bulk,
-                directory::Strategy::Combined,
-            ] {
+            for strategy in collection_strategies() {
                 let result =
                     scan_with_strategy(&root, true, workers, strategy, || false, |_| {}, None)
                         .unwrap();
@@ -1456,4 +1748,30 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+}
+#[path = "scanner/preview.rs"]
+pub mod preview;
+
+/// 중간 폴더 갱신과 완료 결과를 분리하여 전달하는 GUI 수집 경계.
+pub fn scan_preview<'a>(
+    root: &Path,
+    detailed: bool,
+    parallelism: Parallelism,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ScanProgress),
+    preview: &'a mut preview::Observer<'a>,
+) -> io::Result<ScanResult> {
+    parallel::scan_observed(
+        root,
+        detailed,
+        parallelism.workers(),
+        parallel::Collection {
+            strategy: Default::default(),
+            metrics: None,
+        },
+        cancelled,
+        progress,
+        &crate::metadata::read,
+        Some(preview),
+    )
 }
