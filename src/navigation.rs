@@ -109,14 +109,9 @@ impl History {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Back,
-    Forward,
-    Up,
     Search,
     Path,
     Rescan,
-    Previous,
-    Next,
     Open,
     CopyPath,
 }
@@ -142,14 +137,6 @@ pub fn shortcut(
     if editing || busy {
         return None;
     }
-    if m.alt && !m.ctrl && !m.shift {
-        return match key {
-            Key::ArrowLeft => Some(Action::Back),
-            Key::ArrowRight => Some(Action::Forward),
-            Key::ArrowUp => Some(Action::Up),
-            _ => None,
-        };
-    }
     if m.ctrl && m.shift && !m.alt && key == Key::C {
         return Some(Action::CopyPath);
     }
@@ -158,8 +145,6 @@ pub fn shortcut(
     }
     match key {
         Key::F5 => Some(Action::Rescan),
-        Key::ArrowUp => Some(Action::Previous),
-        Key::ArrowDown => Some(Action::Next),
         Key::Enter => Some(Action::Open),
         _ => None,
     }
@@ -168,6 +153,23 @@ pub fn shortcut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removed_navigation_keys_are_not_application_shortcuts() {
+        use eframe::egui::{Key, Modifiers};
+        for (key, modifiers) in [
+            (Key::ArrowLeft, Modifiers::ALT),
+            (Key::ArrowRight, Modifiers::ALT),
+            (Key::ArrowUp, Modifiers::ALT),
+            (Key::ArrowUp, Modifiers::NONE),
+            (Key::ArrowDown, Modifiers::NONE),
+        ] {
+            assert_eq!(
+                shortcut(key, modifiers, false, false, false),
+                None,
+                "{key:?} {modifiers:?}"
+            );
+        }
+    }
     #[test]
     fn history_restores_search_selection_scroll_and_drops_forward_branch() {
         let fixture = crate::duplicates::tests::Fixture::new();
@@ -228,10 +230,16 @@ mod tests {
     #[test]
     fn keyboard_policy_preserves_text_popup_and_workflow_ownership() {
         use eframe::egui::{Key, Modifiers};
-        assert_eq!(
-            shortcut(Key::ArrowLeft, Modifiers::ALT, false, false, false),
-            Some(Action::Back)
-        );
+        for (key, modifiers, action) in [
+            (Key::F, Modifiers::CTRL, Action::Search),
+            (Key::L, Modifiers::CTRL, Action::Path),
+            (Key::F5, Modifiers::NONE, Action::Rescan),
+            (Key::Enter, Modifiers::NONE, Action::Open),
+            (Key::C, Modifiers::CTRL | Modifiers::SHIFT, Action::CopyPath),
+        ] {
+            assert_eq!(shortcut(key, modifiers, false, false, false), Some(action));
+            assert_eq!(shortcut(key, modifiers, false, true, false), None);
+        }
         assert_eq!(
             shortcut(Key::F, Modifiers::CTRL, true, false, false),
             Some(Action::Search)

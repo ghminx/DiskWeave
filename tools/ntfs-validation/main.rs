@@ -12,6 +12,7 @@ mod file_open;
 mod file_ops;
 #[path = "../../src/global_search.rs"]
 mod global_search;
+mod identity_cases;
 #[path = "../../src/local_date.rs"]
 mod local_date;
 #[path = "../../src/locations.rs"]
@@ -36,6 +37,7 @@ mod scanner;
 mod search;
 #[path = "../../src/snapshot.rs"]
 mod snapshot;
+mod stream_bench;
 mod system_watch;
 #[path = "../../src/tracking.rs"]
 mod tracking;
@@ -95,6 +97,16 @@ fn run() -> io::Result<()> {
     }
     if args.len() == 2 && args[0] == "--system-watch" {
         return system_watch::run(Path::new(&args[1]));
+    }
+    if args.len() == 3 && args[0] == "--identity-pair" {
+        return identity_cases::run(Path::new(&args[1]), Path::new(&args[2]));
+    }
+    if args.len() == 4 && args[0] == "--stream-benchmark" {
+        return stream_bench::run(
+            &args[1].to_string_lossy(),
+            &args[2].to_string_lossy(),
+            Path::new(&args[3]),
+        );
     }
     if args.len() != 1 {
         return Err(io::Error::other("독립 시험 볼륨의 요청 파일이 필요합니다"));

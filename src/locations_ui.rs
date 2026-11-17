@@ -33,12 +33,6 @@ impl LocationsView {
         self.key = None;
         self.live_selection = Some((input, paths));
     }
-    pub fn move_selection(&mut self, forward: bool) -> Option<usize> {
-        let len = self.job.results.as_ref()?.hits.len();
-        let row = self.selection.move_by(len, forward)?;
-        self.selection_changed = true;
-        Some(row)
-    }
     pub fn selected_targets(&self) -> Vec<crate::map_job::Target> {
         let Some(results) = &self.job.results else {
             return vec![];

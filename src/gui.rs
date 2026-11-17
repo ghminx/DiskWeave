@@ -1595,15 +1595,6 @@ impl DiskWeaveApp {
         });
         use crate::navigation::Action;
         match action {
-            Some(Action::Back) => self.history_move(false),
-            Some(Action::Forward) => self.history_move(true),
-            Some(Action::Up) => {
-                if let (Some(s), Some(e)) = (self.source(), self.explorer.as_ref()) {
-                    if let Some(parent) = s.scan.folders[e.folder()].parent {
-                        self.navigate(parent, true);
-                    }
-                }
-            }
             Some(Action::Search) => {
                 ctx.memory_mut(|m| m.request_focus(egui::Id::unique("search_query")))
             }
@@ -1619,20 +1610,6 @@ impl DiskWeaveApp {
                 {
                     self.target.choose_registered(path);
                     self.begin_scan();
-                }
-            }
-            Some(Action::Previous | Action::Next) if matches!(self.tab, 0 | 3) => {
-                let forward = action == Some(Action::Next);
-                if self.locations_view.global_mode {
-                    self.search.reveal_row = self.locations_view.move_selection(forward);
-                    self.detail_target = self.locations_view.selected_target();
-                } else if let Some(results) = self.search.job.results() {
-                    if let Some(row) = self.search.selection.move_by(results.items.len(), forward) {
-                        self.search.reveal_row = Some(row);
-                        if let Some(s) = self.source() {
-                            self.detail_target = Some((s.id, s.generation, results.items[row]));
-                        }
-                    }
                 }
             }
             Some(Action::Open) if matches!(self.tab, 0 | 3) => {
@@ -1938,11 +1915,10 @@ impl DiskWeaveApp {
                             ui.separator();
                             ui.strong("키보드 안내");
                             for text in [
-                                "Alt+← / →  뒤로 / 앞으로",
-                                "Alt+↑  상위 폴더",
                                 "Ctrl+F  검색 · Ctrl+L  대상 경로",
                                 "F5  선택 위치 다시 스캔",
-                                "↑ / ↓ · Enter  목록 선택 / 열기",
+                                "Enter  폴더 이동 / 파일 열기",
+                                "Ctrl+A  목록 전체 선택",
                                 "Ctrl+Shift+C  경로 복사",
                                 "F2  이름 변경 · Delete  휴지통 확인",
                             ] {
@@ -2210,6 +2186,8 @@ impl DiskWeaveApp {
                 "스캔 중"
             } else if stale {
                 "갱신 필요"
+            } else if live && matches!(self.tracking.status, crate::tracking::Status::Starting) {
+                "갱신 준비 중"
             } else if live && self.tracking.excluded > 0 {
                 "갱신 중 · 일부 제외"
             } else if live {
@@ -3756,7 +3734,7 @@ mod session_tests {
     }
 
     #[test]
-    fn keyboard_dispatch_moves_history_and_rescans_only_after_text_focus_is_released() {
+    fn keyboard_dispatch_keeps_approved_keys_and_preserves_button_navigation() {
         fn press(
             app: &mut DiskWeaveApp,
             ctx: &egui::Context,
@@ -3798,11 +3776,42 @@ mod session_tests {
             .unwrap();
         app.navigate(child, true);
         press(&mut app, &ctx, egui::Key::ArrowUp, egui::Modifiers::ALT);
-        assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
         press(&mut app, &ctx, egui::Key::ArrowLeft, egui::Modifiers::ALT);
         assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
         press(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
+        let selected = app.capture_navigation().unwrap().selected;
+        for key in [egui::Key::ArrowUp, egui::Key::ArrowDown] {
+            press(&mut app, &ctx, key, egui::Modifiers::NONE);
+            assert_eq!(app.capture_navigation().unwrap().selected, selected);
+        }
+        app.history_move(false);
         assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
+        app.history_move(true);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
+        app.navigate(0, true);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
+        while matches!(
+            app.search.job.status(),
+            crate::search_job::SearchStatus::Running
+        ) {
+            app.search.poll();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let row = app
+            .search
+            .job
+            .results()
+            .unwrap()
+            .items
+            .iter()
+            .position(|&item| item == Item::Folder(child))
+            .unwrap();
+        app.search.selection.click(row, false, false);
+        press(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
         press(&mut app, &ctx, egui::Key::L, egui::Modifiers::CTRL);
         assert_eq!(
             ctx.memory(|m| m.focused()),

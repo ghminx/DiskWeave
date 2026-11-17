@@ -29,16 +29,72 @@ pub fn target(root: &Path) -> io::Result<crate::ntfs_native::Target> {
     crate::ntfs_native::target(Path::new(&std::ffi::OsString::from_wide(&mount[..len])))
 }
 pub struct Native {
+    changes: crate::usn::buffered::Background<JournalReader>,
+    files: RawNative,
+}
+impl Native {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        let (files, journal) = RawNative::open(root)?;
+        Ok(Self {
+            changes: crate::usn::buffered::Background::new(journal)?,
+            files,
+        })
+    }
+}
+impl Source for Native {
+    fn journal(&mut self) -> io::Result<Journal> {
+        self.changes.journal()
+    }
+    fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<Event>> {
+        self.changes.read(start, end)
+    }
+    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+        self.files.inspect(path, detailed)
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        self.files.list(path)
+    }
+}
+struct RawNative {
     _backup: Backup,
     root: PathBuf,
     resolved: PathBuf,
+    volume: String,
+}
+struct JournalReader {
+    root: PathBuf,
     volume: String,
     device: File,
     journal: u64,
     ancestors: Vec<u64>,
 }
-impl Native {
-    pub fn open(root: &Path) -> io::Result<Self> {
+/// 반환된 위치의 범위와 일반 디렉터리의 상대 경로 일치 검증.
+pub(crate) fn validate_resolved_entry(
+    root: &Path,
+    relative: &Path,
+    info: &crate::ntfs::Info,
+) -> io::Result<()> {
+    let actual = info
+        .resolved
+        .as_deref()
+        .ok_or_else(|| io::Error::other("파일 핸들의 실제 위치 누락"))?;
+    if !crate::locations::contains_path(root, actual)? {
+        return Err(io::Error::other(
+            "파일 핸들이 추적 폴더 밖으로 변경되었습니다",
+        ));
+    }
+    if info.attributes & 0x410 == 0x10 {
+        let expected = root.join(relative);
+        if !crate::locations::contains_path(&expected, actual)?
+            || !crate::locations::contains_path(actual, &expected)?
+        {
+            return Err(io::Error::other(crate::usn::RedirectedDirectory));
+        }
+    }
+    Ok(())
+}
+impl RawNative {
+    fn open(root: &Path) -> io::Result<(Self, JournalReader)> {
         let backup = Backup::enable()?;
         let root = std::path::absolute(root)?;
         let t = target(&root)?;
@@ -79,20 +135,24 @@ impl Native {
         if raw == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        let mut native = Self {
-            _backup: backup,
-            root,
-            resolved: info.resolved.unwrap(),
-            volume: t.volume,
+        let journal = JournalReader {
+            root: root.clone(),
+            volume: t.volume.clone(),
             device: unsafe { File::from_raw_handle(raw) },
             journal: 0,
             ancestors,
         };
-        native.journal()?;
-        Ok(native)
+        let files = Self {
+            _backup: backup,
+            root,
+            resolved: info.resolved.unwrap(),
+            volume: t.volume,
+        };
+        Ok((files, journal))
     }
 }
-impl Source for Native {
+
+impl Source for JournalReader {
     fn journal(&mut self) -> io::Result<Journal> {
         if target(&self.root)?.volume != self.volume {
             return Err(io::Error::other("추적 드라이브가 교체되었습니다"));
@@ -182,16 +242,28 @@ impl Source for Native {
         }
         Ok(events)
     }
+    fn inspect(&mut self, _: &Path, _: bool) -> io::Result<crate::ntfs::Info> {
+        Err(io::Error::other(
+            "저널 전용 수집기의 파일 조회는 지원하지 않습니다",
+        ))
+    }
+    fn list(&mut self, _: &Path) -> io::Result<Vec<PathBuf>> {
+        Err(io::Error::other(
+            "저널 전용 수집기의 폴더 열거는 지원하지 않습니다",
+        ))
+    }
+}
+impl RawNative {
     fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
         if !crate::locations::contains_path(&self.root, path)? {
             return Err(io::Error::other("요청한 경로가 추적 폴더 밖입니다"));
         }
         let info = crate::ntfs_native::inspect_file(path, detailed, &self.volume)?;
-        if !crate::locations::contains_path(&self.resolved, info.resolved.as_ref().unwrap())? {
-            return Err(io::Error::other(
-                "파일 핸들이 추적 폴더 밖으로 변경되었습니다",
-            ));
-        }
+        let relative = path
+            .components()
+            .skip(self.root.components().count())
+            .collect::<PathBuf>();
+        validate_resolved_entry(&self.resolved, &relative, &info)?;
         Ok(info)
     }
     fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -282,7 +354,7 @@ impl Drop for Backup {
         }
     }
 }
-impl Native {
+impl RawNative {
     fn backup_list(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
         use std::os::windows::fs::OpenOptionsExt;
         let file = File::options()
@@ -359,5 +431,42 @@ impl Native {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    #[test]
+    fn unmarked_directory_aliases_are_separate_from_hard_links_and_scope_escapes() {
+        let resolved = Path::new("\\\\?\\Volume{11111111-1111-1111-1111-111111111111}\\fixture");
+        let mut info = crate::ntfs::Info {
+            resolved: Some(resolved.join("physical")),
+            reference: Some(crate::ntfs::Id::V2(7)),
+            bytes: 0,
+            attributes: 16,
+            created: None,
+            modified: None,
+            extra: crate::metadata::Report {
+                values: Default::default(),
+                issue: None,
+            },
+        };
+
+        let error = validate_resolved_entry(resolved, Path::new("alias"), &info).unwrap_err();
+        assert!(error
+            .get_ref()
+            .unwrap()
+            .is::<crate::usn::RedirectedDirectory>());
+        info.attributes = 32;
+        assert!(validate_resolved_entry(resolved, Path::new("alias"), &info).is_ok());
+        info.attributes = 16;
+        info.resolved = Some(resolved.join("ALIAS"));
+        assert!(validate_resolved_entry(resolved, Path::new("alias"), &info).is_ok());
+        info.resolved = Some(resolved.parent().unwrap().join("outside"));
+        let error = validate_resolved_entry(resolved, Path::new("alias"), &info).unwrap_err();
+        assert!(!error
+            .get_ref()
+            .is_some_and(|e| e.is::<crate::usn::RedirectedDirectory>()));
     }
 }

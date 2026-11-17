@@ -70,6 +70,7 @@ pub struct Controller {
     pub confirmed_after: Option<SystemTime>,
     pub excluded: usize,
     active: Option<Active>,
+    publication_ready: Arc<AtomicBool>,
 }
 impl Controller {
     pub fn start(
@@ -79,7 +80,15 @@ impl Controller {
         detailed: bool,
         resume: Option<Arc<SavedScan>>,
     ) -> io::Result<()> {
+        if self.running() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "다른 위치를 추적하려면 현재 추적을 중지하세요",
+            ));
+        }
         crate::usn_native::target(&root)?;
+        self.publication_ready = Arc::new(AtomicBool::new(true));
+        let ready = Arc::clone(&self.publication_ready);
         let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
         let worker_progress = Arc::clone(&progress);
         self.start_with(
@@ -88,9 +97,19 @@ impl Controller {
             detailed,
             resume,
             move |root, detailed, resume, cancel, publish| {
-                crate::ntfs_helper::watch(root, detailed, resume, cancel, publish, |event| {
-                    *worker_progress.lock().unwrap() = event;
-                })
+                crate::ntfs_helper::watch(
+                    root,
+                    detailed,
+                    resume,
+                    crate::ntfs_helper::WatchControl {
+                        cancelled: cancel,
+                        ready: &|| ready.load(Ordering::Relaxed),
+                    },
+                    publish,
+                    |event| {
+                        *worker_progress.lock().unwrap() = event;
+                    },
+                )
             },
         )?;
         self.progress = progress;
@@ -122,6 +141,8 @@ impl Controller {
         let output = Arc::new(Mutex::new(Output::default()));
         let worker_cancel = Arc::clone(&cancel);
         let worker_output = Arc::clone(&output);
+        self.publication_ready.store(true, Ordering::Relaxed);
+        let publication_ready = Arc::clone(&self.publication_ready);
         let path = root.clone();
         std::thread::spawn(move || {
             let stopped = || worker_cancel.load(Ordering::Relaxed);
@@ -187,6 +208,7 @@ impl Controller {
                     }
                     update => output.update = Some(update),
                 }
+                publication_ready.store(false, Ordering::Relaxed);
                 Ok(())
             });
             if !stopped() {
@@ -215,6 +237,9 @@ impl Controller {
         let mut output = active.output.lock().unwrap();
         let update = output.update.take();
         let finish = output.finished.take();
+        if update.is_some() {
+            self.publication_ready.store(true, Ordering::Relaxed);
+        }
         drop(output);
         if let Some(update) = &update {
             let (finished, confirmed_after) = match update {
@@ -247,6 +272,11 @@ impl Controller {
     pub fn label(&self) -> &str {
         match &self.status {
             Status::Stopped => "실시간 갱신 중지됨",
+            Status::Starting
+                if self.progress.lock().unwrap().stage == crate::engine::Stage::Transferring =>
+            {
+                "초기 분석 목록 받는 중…"
+            }
             Status::Starting => "권한 승인·기준 수집·변경 내용 확인 중…",
             Status::Following if self.excluded > 0 && self.applying() => "변경 반영 중 · 일부 제외",
             Status::Following if self.excluded > 0 => "갱신 중 · 일부 제외",
@@ -256,7 +286,11 @@ impl Controller {
         }
     }
     pub fn applying(&self) -> bool {
-        self.running() && self.progress.lock().unwrap().stage == crate::engine::Stage::Metadata
+        self.running()
+            && matches!(
+                self.progress.lock().unwrap().stage,
+                crate::engine::Stage::Metadata | crate::engine::Stage::Transferring
+            )
     }
     pub fn progress(&self) -> crate::scanner::ScanProgress {
         self.progress.lock().unwrap().counts

@@ -141,6 +141,101 @@ impl usn::Source for ReplaceDuringRead<'_> {
         usn::Source::list(self.source, path)
     }
 }
+struct MoveDuringList<'a> {
+    source: &'a mut usn_native::Native,
+    pending: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
+    replacement: bool,
+}
+impl usn::Source for MoveDuringList<'_> {
+    fn journal(&mut self) -> io::Result<usn::Journal> {
+        usn::Source::journal(self.source)
+    }
+    fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<usn::Event>> {
+        usn::Source::read(self.source, start, end)
+    }
+    fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+        usn::Source::inspect(self.source, path, detailed)
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(parent, _, _)| parent == path)
+        {
+            let (_, old, new) = self.pending.take().unwrap();
+            fs::rename(&old, new)?;
+            if self.replacement {
+                fs::create_dir(&old)?;
+                fs::write(old.join("fresh"), b"1234567")?;
+            }
+        }
+        usn::Source::list(self.source, path)
+    }
+}
+fn late_moves(scope: &Path, cases: &mut Vec<serde_json::Value>) -> io::Result<()> {
+    for mode in 0..3 {
+        let case_only = mode == 1;
+        let replacement = mode == 2;
+        let label = if replacement {
+            "child-replaced-during-list"
+        } else if case_only {
+            "case-only-rename-after-window"
+        } else {
+            "folder-move-after-window"
+        };
+        let root = scope.join(label);
+        let old = root.join("old");
+        let destination = root.join("destination");
+        fs::create_dir_all(&old)?;
+        fs::create_dir(&destination)?;
+        fs::write(old.join("payload"), b"123")?;
+        let mut source = usn_native::Native::open(&root)?;
+        let mut index = usn::Index::begin(&root, true, &mut source, &|| false)?;
+        let parent = if case_only || replacement {
+            old.clone()
+        } else {
+            destination.clone()
+        };
+        let new = if replacement {
+            root.join("previous")
+        } else if case_only {
+            root.join("OLD")
+        } else {
+            destination.join("new")
+        };
+        fs::write(parent.join("trigger"), b"x")?;
+        index.refresh(
+            &mut MoveDuringList {
+                source: &mut source,
+                pending: Some((parent, old, new.clone())),
+                replacement,
+            },
+            &|| false,
+        )?;
+        let first = index.snapshot(&|| false)?;
+        first.tracking.as_ref().unwrap().validate(&first.scan)?;
+        if first.scan.folders[0].logical_bytes != if replacement { 11 } else { 4 } {
+            return Err(io::Error::other("이동 경합에서 크기가 중복 집계됨"));
+        }
+        let report = compare(&mut index, &mut source, &root, label)?;
+        let complete = index.snapshot(&|| false)?;
+        complete
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&complete.scan)?;
+        if !complete
+            .scan
+            .folders
+            .iter()
+            .any(|folder| folder.path == new)
+        {
+            return Err(io::Error::other("이동 이후 경로 재연결 실패"));
+        }
+        cases.push(report);
+    }
+    Ok(())
+}
 pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     let mut total = 0;
     let path: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -204,6 +299,7 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
     let mut source = usn_native::Native::open(&scope)?;
     let mut index = usn::Index::begin(&scope, true, &mut source, &|| false)?;
     cases.push(compare(&mut index, &mut source, &scope, "baseline")?);
+    late_moves(&scope, &mut cases)?;
     let replacement = scope.join("replace-save.bin");
     fs::write(&replacement, b"12345")?;
     cases.push(compare(
@@ -287,7 +383,10 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
             &watch_root,
             true,
             Some(Arc::new(loaded)),
-            &|| worker_stop.load(Ordering::Relaxed),
+            crate::ntfs_helper::WatchControl {
+                cancelled: &|| worker_stop.load(Ordering::Relaxed),
+                ready: &|| true,
+            },
             |update| {
                 if let crate::usn::WatchUpdate::Record(record) = update {
                     *worker_output.lock().unwrap() = Some(*record);

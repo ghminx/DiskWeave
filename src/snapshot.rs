@@ -277,6 +277,10 @@ pub fn load(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<SavedScan> 
     }
     read_from(file, cancelled)
 }
+#[allow(
+    dead_code,
+    reason = "수동 Snapshot 형식의 개발용 스트림 대조 및 회귀 검사"
+)]
 pub fn write_to(
     record: &SavedScan,
     writer: &mut dyn Write,

@@ -4,6 +4,10 @@ use crate::{
     snapshot::SavedScan,
 };
 use serde::{Deserialize, Serialize};
+#[path = "usn/buffered.rs"]
+pub mod buffered;
+#[path = "usn/stream.rs"]
+pub mod stream;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -13,7 +17,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Journal {
     pub volume: String,
     pub id: u64,
@@ -36,6 +40,26 @@ pub trait Source {
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
+}
+fn verify_continuity(volume: &str, generation: u64, cursor: i64, j: &Journal) -> io::Result<()> {
+    let reason = if j.volume != volume {
+        Some("volume")
+    } else if j.id != generation {
+        Some("generation")
+    } else if cursor < j.first.max(j.lowest) {
+        Some("retention")
+    } else if cursor > j.next {
+        Some("future")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(invalid(&format!(
+            "변경 기록 연속성 오류 ({reason}): cursor={cursor}, first={}, lowest={}, next={}, saved_journal={generation}, current_journal={}. 다시 스캔해 주세요",
+            j.first, j.lowest, j.next, j.id
+        )));
+    }
+    Ok(())
 }
 /// USN 페이지의 길이·형식·이름·단조 증가를 확인한 뒤 변경 ID만 반환.
 pub fn decode(page: &[u8], start: i64) -> io::Result<(i64, Vec<Event>)> {
@@ -99,7 +123,16 @@ pub struct Excluded {
 pub enum UnavailableReason {
     Os(i32),
     Changing,
+    Redirected,
 }
+#[derive(Debug)]
+pub struct RedirectedDirectory;
+impl std::fmt::Display for RedirectedDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("표시 경로와 실제 위치가 다른 별칭 폴더")
+    }
+}
+impl std::error::Error for RedirectedDirectory {}
 impl UnavailableReason {
     pub fn label(&self) -> &'static str {
         match self {
@@ -108,12 +141,14 @@ impl UnavailableReason {
             Self::Os(33) => "파일 잠금 충돌",
             Self::Os(_) => "조회 실패",
             Self::Changing => "계속 변경 중 · 확인 대기",
+            Self::Redirected => "실제 위치가 다른 별칭 폴더 · 제외",
         }
     }
     pub fn error(&self) -> io::Error {
         match self {
             Self::Os(code) => io::Error::from_raw_os_error(*code),
             Self::Changing => io::Error::other(self.label()),
+            Self::Redirected => io::Error::other(RedirectedDirectory),
         }
     }
 }
@@ -132,8 +167,17 @@ impl Unavailable {
         std::ffi::OsString::from_wide(&self.path).into()
     }
 }
-fn skippable(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+fn unavailable_reason(error: &io::Error) -> Option<UnavailableReason> {
+    match error.raw_os_error() {
+        Some(code @ (5 | 32 | 33)) => Some(UnavailableReason::Os(code)),
+        _ if error
+            .get_ref()
+            .is_some_and(|e| e.is::<RedirectedDirectory>()) =>
+        {
+            Some(UnavailableReason::Redirected)
+        }
+        _ => None,
+    }
 }
 fn confirmed_missing(source: &mut impl Source, path: &Path) -> io::Result<bool> {
     let parent = path
@@ -192,7 +236,40 @@ pub struct Checkpoint {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-#[derive(Clone, PartialEq, Eq)]
+fn conflicting_directories(nodes: &BTreeMap<PathBuf, Node>) -> Vec<(u64, PathBuf, PathBuf)> {
+    let mut by_id = HashMap::new();
+    let mut conflicts = Vec::new();
+    for (path, node) in nodes
+        .iter()
+        .filter(|(_, node)| node.dir() && !node.excluded())
+    {
+        if let Some(previous) = by_id.insert(node.id, path) {
+            conflicts.push((node.id, previous.clone(), path.clone()));
+        }
+    }
+    conflicts
+}
+fn recheck_directory_parent(
+    path: &Path,
+    attempted: &mut HashSet<PathBuf>,
+    directories: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("반영 중 추적 루트가 교체되었습니다"))?;
+    if !attempted.insert(path.to_owned()) || attempted.len() > 64 {
+        return Err(invalid(&format!(
+            "하위 폴더가 계속 교체되어 위치를 확인할 수 없습니다 [{}]",
+            path.display()
+        )));
+    }
+    directories.push(parent.to_owned());
+    // 부모 확인 전에 원래 ID가 돌아와도 자식 변경을 다시 확인하도록 재예약.
+    directories.push(path.to_owned());
+    Ok(())
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Node {
     id: u64,
     attributes: u32,
@@ -248,11 +325,17 @@ pub struct Index {
     pub checkpoint: Checkpoint,
     scan: Option<Arc<ScanResult>>,
     started: SystemTime,
+    changes: Vec<stream::Change>,
 }
 impl Checkpoint {
     pub fn validate(&self, scan: &ScanResult) -> io::Result<()> {
-        if !matches!(self.version, 1 | 3)
+        if !matches!(self.version, 1 | 3 | 4)
             || self.version == 1 && !self.unavailable.is_empty()
+            || self.version != 4
+                && self
+                    .unavailable
+                    .iter()
+                    .any(|e| e.reason == UnavailableReason::Redirected)
             || scan.error_count != self.unavailable.len() as u64
             || self.volume.is_empty()
             || self.root == 0
@@ -325,6 +408,7 @@ impl Checkpoint {
                 || !paths.insert(p.clone())
                 || matches!(e.reason, UnavailableReason::Os(code) if ![5, 32, 33].contains(&code))
                 || matches!(e.reason, UnavailableReason::Changing) && e.listing
+                || e.reason == UnavailableReason::Redirected && (e.listing || !e.directory)
                 || e.previous_id == Some(0)
                 || parents.get(p.parent().unwrap()).map(|v| v.0) != Some(e.parent)
                 || e.listing
@@ -406,7 +490,7 @@ impl Index {
             return Err(invalid("일반 폴더만 변경 추적할 수 있습니다"));
         }
         let checkpoint = Checkpoint {
-            version: 3,
+            version: 4,
             volume: journal.volume,
             root: first.id,
             journal: journal.id,
@@ -438,6 +522,7 @@ impl Index {
             checkpoint,
             scan: None,
             started,
+            changes: vec![],
         };
         index.refresh(source, cancelled)?;
         Ok(index)
@@ -453,6 +538,8 @@ impl Index {
         if relative.as_os_str().is_empty() {
             return Err(context(relative, reason.error()));
         }
+        // 별칭은 논리 경로의 폴더 ID 자체를 신뢰할 수 없으므로 노드 보존 금지.
+        let listing = listing && reason != UnavailableReason::Redirected;
         let parent = nodes
             .get(relative.parent().unwrap())
             .ok_or_else(|| invalid("미수집 항목의 부모가 없습니다"))?
@@ -465,7 +552,8 @@ impl Index {
                 .as_ref()
                 .map(|n| n.id)
                 .or_else(|| unavailable.get(relative).and_then(|e| e.previous_id)),
-            directory: previous.as_ref().is_some_and(Node::dir),
+            directory: previous.as_ref().is_some_and(Node::dir)
+                || reason == UnavailableReason::Redirected,
             reason,
             listing,
             checked: now,
@@ -496,10 +584,10 @@ impl Index {
             let absolute = root.join(&parent);
             let children = match source.list(&absolute) {
                 Ok(v) => v,
-                Err(e) if !parent.as_os_str().is_empty() && skippable(&e) => {
+                Err(e) if !parent.as_os_str().is_empty() && unavailable_reason(&e).is_some() => {
                     Self::exclude(
                         &parent,
-                        UnavailableReason::Os(e.raw_os_error().unwrap()),
+                        unavailable_reason(&e).unwrap(),
                         true,
                         source.now(),
                         nodes,
@@ -521,10 +609,10 @@ impl Index {
                 let info = match inspect_present(source, &path, detailed) {
                     Ok(Some(v)) => v,
                     Ok(None) => continue,
-                    Err(e) if skippable(&e) => {
+                    Err(e) if unavailable_reason(&e).is_some() => {
                         Self::exclude(
                             &rel,
-                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            unavailable_reason(&e).unwrap(),
                             false,
                             source.now(),
                             nodes,
@@ -636,20 +724,21 @@ impl Index {
                 .iter()
                 .map(|e| (e.relative(), e.clone()))
                 .collect(),
-            checkpoint: state.clone(),
+            checkpoint: {
+                let mut current = state.clone();
+                current.version = 4;
+                current
+            },
             scan: Some(Arc::clone(&record.scan)),
             started: record.started,
+            changes: vec![],
         })
     }
     fn verify(&self, j: &Journal) -> io::Result<()> {
-        if j.volume != self.checkpoint.volume
-            || j.id != self.checkpoint.journal
-            || self.checkpoint.next < j.first.max(j.lowest)
-            || self.checkpoint.next > j.next
-        {
-            return Err(invalid("드라이브 또는 변경 기록이 바뀌었거나 필요한 기록이 유실되었습니다. 다시 스캔해 주세요"));
-        }
-        Ok(())
+        self.verify_at(j, self.checkpoint.next)
+    }
+    fn verify_at(&self, j: &Journal, cursor: i64) -> io::Result<()> {
+        verify_continuity(&self.checkpoint.volume, self.checkpoint.journal, cursor, j)
     }
     pub fn refresh(
         &mut self,
@@ -686,20 +775,26 @@ impl Index {
         {
             // 유휴 확인마다 전체 파일 목록을 복사하지 않도록 변경 없는 배치 종료.
             let final_journal = source.journal()?;
-            self.verify(&final_journal)?;
-            if journal.next < final_journal.first.max(final_journal.lowest) {
-                return Err(invalid("반영 중 변경 기록이 유실되었습니다"));
-            }
+            self.verify_at(&final_journal, journal.next)?;
             crate::output::check(cancelled)?;
             self.checkpoint.next = journal.next;
             self.checkpoint.confirmed_after = Some(confirmed_after);
             return Ok(false);
         }
         let mut by_id: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-        for (path, n) in &self.nodes {
-            by_id.entry(n.id).or_default().push(path.clone());
-        }
         let mut directories = HashSet::new();
+        for (path, n) in &self.nodes {
+            let paths = by_id.entry(n.id).or_default();
+            if n.dir() && !n.excluded() && !paths.is_empty() {
+                for p in paths.iter().chain(std::iter::once(path)) {
+                    let parent = p
+                        .parent()
+                        .ok_or_else(|| invalid("추적 루트와 중복된 폴더 ID"))?;
+                    directories.insert(parent.to_owned());
+                }
+            }
+            paths.push(path.clone());
+        }
         let mut files = HashSet::new();
         let mut pending: HashSet<_> = self.checkpoint.pending.iter().copied().collect();
         for e in &events {
@@ -762,11 +857,22 @@ impl Index {
         next.insert(PathBuf::new(), root);
         let mut replacements = HashMap::new();
         let mut directories: Vec<_> = directories.into_iter().collect();
-        directories.sort_by_key(|p| p.components().count());
         let mut remaining_files = Some(files);
+        let mut repaired = HashSet::new();
+        let mut directory_rechecks = HashSet::new();
+        let mut check_directories = !directories.is_empty();
         // 구조 변경을 먼저 반영하고 남은 파일의 교체만 부모 재확인으로 연결.
         loop {
-            for directory in std::mem::take(&mut directories) {
+            directories.sort_by(|a, b| {
+                a.components()
+                    .count()
+                    .cmp(&b.components().count())
+                    .then_with(|| a.cmp(b))
+            });
+            directories.dedup();
+            let mut batch = std::mem::take(&mut directories).into_iter();
+            let mut rechecking = false;
+            while let Some(directory) = batch.next() {
                 crate::output::check(cancelled)?;
                 if !next
                     .get(&directory)
@@ -787,10 +893,13 @@ impl Index {
                 };
                 let info = match observed {
                     Ok(Some(v)) => v,
-                    Err(e) if !directory.as_os_str().is_empty() && skippable(&e) => {
+                    Err(e)
+                        if !directory.as_os_str().is_empty()
+                            && unavailable_reason(&e).is_some() =>
+                    {
                         Self::exclude(
                             &directory,
-                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            unavailable_reason(&e).unwrap(),
                             false,
                             now,
                             &mut next,
@@ -807,18 +916,26 @@ impl Index {
                 };
                 let current = Node::from_info(info)?;
                 if current.id != next[&directory].id || !current.dir() || current.excluded() {
-                    return Err(invalid(&format!(
-                        "반영 중 상위 폴더가 교체되었습니다 [{}]",
-                        absolute.display()
-                    )));
+                    attempted.remove(&directory);
+                    recheck_directory_parent(
+                        &directory,
+                        &mut directory_rechecks,
+                        &mut directories,
+                    )?;
+                    directories.extend(batch);
+                    rechecking = true;
+                    break;
                 }
                 next.insert(directory.clone(), current);
                 let children = match source.list(&absolute) {
                     Ok(v) => v,
-                    Err(e) if !directory.as_os_str().is_empty() && skippable(&e) => {
+                    Err(e)
+                        if !directory.as_os_str().is_empty()
+                            && unavailable_reason(&e).is_some() =>
+                    {
                         Self::exclude(
                             &directory,
-                            UnavailableReason::Os(e.raw_os_error().unwrap()),
+                            unavailable_reason(&e).unwrap(),
                             true,
                             now,
                             &mut next,
@@ -828,6 +945,43 @@ impl Index {
                     }
                     Err(e) => return Err(context(&absolute, e)),
                 };
+                let verified = if directory.as_os_str().is_empty() {
+                    source.inspect(&absolute, false).map(Some)
+                } else {
+                    inspect_present(source, &absolute, false)
+                };
+                let after = match verified {
+                    Ok(info) => info.map(Node::from_info).transpose()?,
+                    Err(e)
+                        if !directory.as_os_str().is_empty()
+                            && unavailable_reason(&e).is_some() =>
+                    {
+                        Self::exclude(
+                            &directory,
+                            unavailable_reason(&e).unwrap(),
+                            false,
+                            now,
+                            &mut next,
+                            &mut unavailable,
+                        )?;
+                        continue;
+                    }
+                    Err(e) => return Err(context(&absolute, e)),
+                };
+                if after.as_ref().is_none_or(|value| {
+                    value.id != next[&directory].id || !value.dir() || value.excluded()
+                }) {
+                    attempted.remove(&directory);
+                    recheck_directory_parent(
+                        &directory,
+                        &mut directory_rechecks,
+                        &mut directories,
+                    )?;
+                    directories.extend(batch);
+                    rechecking = true;
+                    break;
+                }
+                next.insert(directory.clone(), after.unwrap());
                 unavailable.remove(&directory);
                 let mut seen = HashSet::new();
                 for path in children {
@@ -847,10 +1001,10 @@ impl Index {
                     }
                     let info = match inspect_present(source, &path, self.detailed) {
                         Ok(Some(v)) => v,
-                        Err(e) if skippable(&e) => {
+                        Err(e) if unavailable_reason(&e).is_some() => {
                             Self::exclude(
                                 &rel,
-                                UnavailableReason::Os(e.raw_os_error().unwrap()),
+                                unavailable_reason(&e).unwrap(),
                                 false,
                                 now,
                                 &mut next,
@@ -915,65 +1069,81 @@ impl Index {
                     unavailable.retain(|key, _| !key.starts_with(&p));
                 }
             }
-            let Some(files) = remaining_files.take() else {
-                break;
-            };
-            for path in files {
-                crate::output::check(cancelled)?;
-                if !next.contains_key(&path) || next[&path].id != self.nodes[&path].id {
-                    continue;
-                }
-                let absolute = self.root.join(&path);
-                let info = match inspect_present(source, &absolute, self.detailed) {
-                    Ok(Some(v)) => v,
-                    Err(e) if skippable(&e) => {
-                        Self::exclude(
-                            &path,
-                            UnavailableReason::Os(e.raw_os_error().unwrap()),
-                            false,
-                            now,
-                            &mut next,
-                            &mut unavailable,
-                        )?;
+            if rechecking {
+                continue;
+            }
+            if let Some(files) = remaining_files.take() {
+                for path in files {
+                    crate::output::check(cancelled)?;
+                    if !next.contains_key(&path) || next[&path].id != self.nodes[&path].id {
                         continue;
                     }
-                    Ok(None) => {
-                        next.retain(|p, _| !p.starts_with(&path));
-                        unavailable.retain(|p, _| !p.starts_with(&path));
+                    let absolute = self.root.join(&path);
+                    let info = match inspect_present(source, &absolute, self.detailed) {
+                        Ok(Some(v)) => v,
+                        Err(e) if unavailable_reason(&e).is_some() => {
+                            Self::exclude(
+                                &path,
+                                unavailable_reason(&e).unwrap(),
+                                false,
+                                now,
+                                &mut next,
+                                &mut unavailable,
+                            )?;
+                            continue;
+                        }
+                        Ok(None) => {
+                            next.retain(|p, _| !p.starts_with(&path));
+                            unavailable.retain(|p, _| !p.starts_with(&path));
+                            continue;
+                        }
+                        Err(e) => return Err(context(&absolute, e)),
+                    };
+                    let node = Node::from_info(info)?;
+                    if node.id != next[&path].id || node.dir() || node.excluded() {
+                        replacements.insert(path.clone(), (node.id, node.attributes & 0x410));
+                        directories.push(path.parent().unwrap().to_owned());
+                        check_directories = true;
                         continue;
                     }
-                    Err(e) => return Err(context(&absolute, e)),
-                };
-                let node = Node::from_info(info)?;
-                if node.id != next[&path].id || node.dir() || node.excluded() {
-                    replacements.insert(path.clone(), (node.id, node.attributes & 0x410));
-                    directories.push(path.parent().unwrap().to_owned());
-                    continue;
+                    next.insert(path, node);
                 }
-                next.insert(path, node);
+            }
+            if check_directories {
+                // USN 확인 이후 이동한 폴더는 양쪽 부모의 현재 이름으로 재연결.
+                let conflicts = conflicting_directories(&next);
+                let mut this_round = HashSet::new();
+                for (id, before, after) in conflicts {
+                    if repaired.contains(&id) {
+                        return Err(invalid(&format!(
+                            "폴더 위치 재확인 후에도 ID가 중복됩니다 [{} / {}]",
+                            before.display(),
+                            after.display()
+                        )));
+                    }
+                    this_round.insert(id);
+                    for path in [before, after] {
+                        let parent = path
+                            .parent()
+                            .ok_or_else(|| invalid("추적 루트와 중복된 폴더 ID"))?;
+                        directories.push(parent.to_owned());
+                    }
+                }
+                repaired.extend(this_round);
             }
             if directories.is_empty() {
                 break;
             }
-            directories.sort_by(|a, b| {
-                a.components()
-                    .count()
-                    .cmp(&b.components().count())
-                    .then_with(|| a.cmp(b))
-            });
-            directories.dedup();
         }
         let final_root = Node::from_info(source.inspect(&self.root, false)?)?;
         if final_root.id != self.checkpoint.root || final_root.excluded() {
             return Err(invalid("반영 중 추적 폴더가 바뀌었습니다"));
         }
         let final_journal = source.journal()?;
-        self.verify(&final_journal)?;
-        if journal.next < final_journal.first.max(final_journal.lowest) {
-            return Err(invalid("반영 중 변경 기록이 유실되었습니다"));
-        }
+        self.verify_at(&final_journal, journal.next)?;
         crate::output::check(cancelled)?;
         let changed = self.nodes != next || self.unavailable != unavailable;
+        self.changes = stream::diff(&self.nodes, &next, &self.unavailable, &unavailable);
         self.nodes = next;
         self.unavailable = unavailable;
         self.checkpoint.next = journal.next;
@@ -1116,7 +1286,7 @@ impl Index {
             self.checkpoint.files = files;
             self.checkpoint.excluded = excluded;
             self.checkpoint.unavailable = self.unavailable.values().cloned().collect();
-            self.checkpoint.version = 3;
+            self.checkpoint.version = 4;
             self.scan = Some(Arc::new(scan));
         }
         let mut record = SavedScan::new(
@@ -1152,6 +1322,16 @@ mod tests {
         advance_on_journal: Option<Duration>,
         replace_on_read: Vec<(PathBuf, u64, u64)>,
         list_budget: HashMap<PathBuf, usize>,
+        move_on_list: Option<(PathBuf, PathBuf, PathBuf)>,
+        cancel_on_list: Option<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>,
+        identity_alias: Option<(PathBuf, u64)>,
+        replace_directory_on_inspect: Option<PathBuf>,
+        replace_directory_on_list: Option<PathBuf>,
+        restore_directory_on_list: Option<(PathBuf, PathBuf, PathBuf)>,
+        redirected: HashSet<PathBuf>,
+        redirect_on_list: Option<PathBuf>,
+        journal_on_read: Option<Journal>,
+        rolling_journal: bool,
     }
     impl Source for Fixture {
         fn journal(&mut self) -> io::Result<Journal> {
@@ -1161,6 +1341,10 @@ mod tests {
             Ok(self.journal.clone())
         }
         fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<Event>> {
+            verify_continuity(&self.journal.volume, self.journal.id, start, &self.journal)?;
+            if let Some(journal) = self.journal_on_read.take() {
+                self.journal = journal;
+            }
             let events = self
                 .events
                 .iter()
@@ -1184,6 +1368,15 @@ mod tests {
         }
         fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
             self.queries.push(path.to_owned());
+            if self.redirected.contains(path) {
+                return Err(io::Error::other(RedirectedDirectory));
+            }
+            if self.replace_directory_on_inspect.as_deref() == Some(path) {
+                self.replace_directory_on_inspect = None;
+                fs::rename(path, self.root.join("previous-directory"))?;
+                fs::create_dir(path)?;
+                fs::write(path.join("fresh"), b"1234567")?;
+            }
             if self.not_found_once.as_deref() == Some(path) {
                 self.not_found_once = None;
                 return Err(io::Error::from_raw_os_error(2));
@@ -1210,9 +1403,60 @@ mod tests {
             if self.blocked.as_deref() == Some(path) {
                 return Err(io::Error::from_raw_os_error(32));
             }
-            crate::ntfs_native::inspect_file(path, detailed, &self.journal.volume)
+            let mut info = crate::ntfs_native::inspect_file(path, detailed, &self.journal.volume)?;
+            if let Some((target, id)) = &self.identity_alias {
+                if path == target {
+                    info.reference = Some(crate::ntfs::Id::V2(*id));
+                }
+            }
+            if self.rolling_journal {
+                self.clock += Duration::from_secs(1);
+                let Some(crate::ntfs::Id::V2(id)) = info.reference else {
+                    unreachable!()
+                };
+                self.event(id, id, 0x80000001);
+                self.journal.first = (self.journal.next - 32).max(0);
+            }
+            Ok(info)
         }
         fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            if self.redirect_on_list.as_deref() == Some(path) {
+                self.redirect_on_list = None;
+                self.redirected.insert(path.to_owned());
+                return Err(io::Error::other(RedirectedDirectory));
+            }
+            if self
+                .restore_directory_on_list
+                .as_ref()
+                .is_some_and(|(parent, _, _)| parent == path)
+            {
+                let (_, child, previous) = self.restore_directory_on_list.take().unwrap();
+                fs::rename(&child, self.root.join("interim-directory"))?;
+                fs::rename(previous, child)?;
+            }
+            if self.replace_directory_on_list.as_deref() == Some(path) {
+                self.replace_directory_on_list = None;
+                self.replace_directory_on_inspect = Some(path.to_owned());
+                self.inspect(path, false)?;
+            }
+            if let Some((target, cancel)) = &self.cancel_on_list {
+                if path == target {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if self
+                .move_on_list
+                .as_ref()
+                .is_some_and(|(parent, _, _)| parent == path)
+            {
+                let (_, old, new) = self.move_on_list.take().unwrap();
+                let id = self.id(&old);
+                let before = self.id(old.parent().unwrap());
+                let after = self.id(new.parent().unwrap());
+                fs::rename(old, new)?;
+                self.event(id, before, 0x1000);
+                self.event(id, after, 0x80002000);
+            }
             if let Some(remaining) = self.list_budget.get_mut(path) {
                 if *remaining == 0 {
                     return Err(io::Error::other("시험용 폴더 조회 예산 초과"));
@@ -1261,6 +1505,16 @@ mod tests {
                 advance_on_journal: None,
                 replace_on_read: vec![],
                 list_budget: HashMap::new(),
+                move_on_list: None,
+                cancel_on_list: None,
+                identity_alias: None,
+                replace_directory_on_inspect: None,
+                replace_directory_on_list: None,
+                restore_directory_on_list: None,
+                redirected: HashSet::new(),
+                redirect_on_list: None,
+                journal_on_read: None,
+                rolling_journal: false,
             }
         }
         fn id(&mut self, path: &Path) -> u64 {
@@ -1349,6 +1603,379 @@ mod tests {
         f.failures.insert(bad, 2);
         assert!(Index::begin(&root, true, &mut f, &|| false).is_err());
     }
+    #[test]
+    fn folder_moving_after_the_journal_window_is_not_published_at_two_paths() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let old = root.join("old");
+        let destination = root.join("scope");
+        let new = destination.join("new");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("payload"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let mut sender = stream::Sender::new(17, Default::default());
+        let mut receiver = stream::Receiver::new(root.clone(), true, Default::default());
+        let mut baseline = Vec::new();
+        sender.write(&mut baseline, &mut index, &|| false).unwrap();
+        receiver
+            .receive(&mut baseline.as_slice(), &|| false)
+            .unwrap();
+        let id = f.id(&old);
+        let trigger = destination.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let file = f.id(&trigger);
+        let parent = f.id(&destination);
+        f.event(file, parent, 0x80000100);
+        f.move_on_list = Some((destination, old.clone(), new.clone()));
+        index.refresh(&mut f, &|| false).unwrap();
+        let result = index.snapshot(&|| false).unwrap();
+        result
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&result.scan)
+            .unwrap();
+        assert!(!result.scan.folders.iter().any(|folder| folder.path == old));
+        let position = result
+            .scan
+            .folders
+            .iter()
+            .position(|folder| folder.path == new)
+            .unwrap();
+        assert_eq!(result.tracking.as_ref().unwrap().folders[position], id);
+        assert_eq!(result.scan.folders[0].logical_bytes, 4);
+        let reference = crate::scanner::scan_with_options(&root, true, || false, |_| {}).unwrap();
+        let files = |scan: &ScanResult| {
+            scan.files
+                .iter()
+                .map(|file| {
+                    (
+                        scan.folders[file.parent].path.join(&file.name),
+                        (
+                            file.logical_bytes,
+                            file.created,
+                            file.modified,
+                            file.attributes,
+                            file.extra,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let folders = |scan: &ScanResult| {
+            scan.folders
+                .iter()
+                .map(|folder| {
+                    (
+                        folder.path.clone(),
+                        (
+                            folder.access,
+                            folder.logical_bytes,
+                            folder.file_count,
+                            folder.folder_count,
+                            folder.created,
+                            folder.modified,
+                            folder.attributes,
+                            folder.allocation,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(files(&result.scan), files(&reference));
+        assert_eq!(folders(&result.scan), folders(&reference));
+        let mut delta = Vec::new();
+        sender.write(&mut delta, &mut index, &|| false).unwrap();
+        receiver.receive(&mut delta.as_slice(), &|| false).unwrap();
+        let received = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(files(&received.scan), files(&reference));
+        assert_eq!(folders(&received.scan), folders(&reference));
+        assert_eq!(received.tracking, result.tracking);
+    }
+
+    #[test]
+    fn cancelling_folder_reconciliation_preserves_the_previous_result_and_checkpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let old = root.join("old");
+        let destination = root.join("scope");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("payload"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let trigger = destination.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let id = f.id(&trigger);
+        let parent = f.id(&destination);
+        f.event(id, parent, 0x80000100);
+        f.move_on_list = Some((destination.clone(), old, destination.join("new")));
+        let cancel = Arc::new(AtomicBool::new(false));
+        f.cancel_on_list = Some((root, Arc::clone(&cancel)));
+        assert!(index
+            .refresh(&mut f, &|| cancel.load(Ordering::Relaxed))
+            .is_err());
+        let after = index.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&before.scan, &after.scan));
+        assert_eq!(before.tracking, after.tracking);
+    }
+
+    #[test]
+    fn a_persistent_folder_identity_conflict_stops_without_committing_a_bad_result() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let id = f.id(&a);
+        let parent = f.id(&root);
+        f.event(id, parent, 0x80002000);
+        f.identity_alias = Some((b, id));
+        let error = index.refresh(&mut f, &|| false).unwrap_err();
+        assert!(error.to_string().contains("재확인 후에도"));
+        let after = index.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&before.scan, &after.scan));
+        assert_eq!(before.tracking, after.tracking);
+    }
+
+    #[test]
+    fn a_case_only_folder_rename_after_the_window_keeps_one_identity_and_catches_up() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let old = root.join("mixed");
+        let renamed = root.join("MIXED");
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("payload"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let id = f.id(&old);
+        let trigger = old.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let file = f.id(&trigger);
+        f.event(file, id, 0x80000100);
+        f.move_on_list = Some((old.clone(), old.clone(), renamed.clone()));
+        index.refresh(&mut f, &|| false).unwrap();
+        let first = index.snapshot(&|| false).unwrap();
+        first
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&first.scan)
+            .unwrap();
+        index.refresh(&mut f, &|| false).unwrap();
+        let after = index.snapshot(&|| false).unwrap();
+        after
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&after.scan)
+            .unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 4);
+        assert!(!after.scan.folders.iter().any(|d| d.path == old));
+        let position = after
+            .scan
+            .folders
+            .iter()
+            .position(|d| d.path == renamed)
+            .unwrap();
+        assert_eq!(after.tracking.unwrap().folders[position], id);
+    }
+
+    #[test]
+    fn a_replaced_child_directory_is_reconnected_through_its_verified_parent() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let child = root.join("scope");
+        fs::write(child.join("old"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let previous = f.id(&child);
+        let trigger = child.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let id = f.id(&trigger);
+        f.event(id, previous, 0x80000100);
+        f.replace_directory_on_inspect = Some(child.clone());
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+        let current = record
+            .scan
+            .folders
+            .iter()
+            .position(|d| d.path == child)
+            .unwrap();
+        assert_ne!(record.tracking.as_ref().unwrap().folders[current], previous);
+        assert_eq!(record.scan.folders[current].logical_bytes, 7);
+        assert_eq!(record.scan.folders[0].logical_bytes, 11);
+    }
+
+    #[test]
+    fn a_child_replaced_while_listing_does_not_keep_its_previous_identity() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let child = root.join("scope");
+        fs::write(child.join("old"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let previous = f.id(&child);
+        let trigger = child.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let id = f.id(&trigger);
+        f.event(id, previous, 0x80000100);
+        f.replace_directory_on_list = Some(child.clone());
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+        let current = record
+            .scan
+            .folders
+            .iter()
+            .position(|d| d.path == child)
+            .unwrap();
+        assert_ne!(record.tracking.as_ref().unwrap().folders[current], previous);
+        assert_eq!(record.scan.folders[0].logical_bytes, 11);
+    }
+
+    #[test]
+    fn a_directory_returning_before_parent_recheck_still_receives_its_child_changes() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let child = root.join("scope");
+        fs::write(child.join("old"), b"123").unwrap();
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let original = f.id(&child);
+        let trigger = child.join("trigger");
+        fs::write(&trigger, b"x").unwrap();
+        let id = f.id(&trigger);
+        f.event(id, original, 0x80000100);
+        f.replace_directory_on_inspect = Some(child.clone());
+        f.restore_directory_on_list =
+            Some((root.clone(), child.clone(), root.join("previous-directory")));
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+        let folder = record
+            .scan
+            .folders
+            .iter()
+            .position(|d| d.path == child)
+            .unwrap();
+        assert_eq!(record.tracking.as_ref().unwrap().folders[folder], original);
+        assert_eq!(record.scan.folders[folder].logical_bytes, 4);
+        assert_eq!(record.scan.folders[0].logical_bytes, 11);
+    }
+
+    #[test]
+    fn a_previously_unreadable_directory_can_recover_after_its_identity_changes() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let child = root.join("scope");
+        fs::write(child.join("old"), b"123").unwrap();
+        f.list_failures.insert(child.clone(), 5);
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        assert_eq!(index.snapshot(&|| false).unwrap().scan.error_count, 1);
+        f.list_failures.clear();
+        fs::rename(&child, root.join("previous")).unwrap();
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("fresh"), b"1234567").unwrap();
+        f.clock += Duration::from_secs(31);
+        index.refresh(&mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+        assert_eq!(record.scan.error_count, 0);
+        assert_eq!(record.scan.folders[0].logical_bytes, 10);
+        assert!(record.tracking.unwrap().unavailable.is_empty());
+    }
+
+    #[test]
+    fn unmarked_alias_directories_are_reported_without_following_or_double_counting_them() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let alias = root.join("scope");
+        fs::write(root.join("known"), b"x").unwrap();
+        fs::write(alias.join("payload"), b"123").unwrap();
+        f.redirected.insert(alias.clone());
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        let state = record.tracking.as_ref().unwrap();
+        state.validate(&record.scan).unwrap();
+        assert_eq!(record.scan.folders[0].logical_bytes, 1);
+        assert_eq!(record.scan.error_count, 1);
+        assert!(state.unavailable[0].reason.label().contains("별칭"));
+        assert!(state.unavailable[0].directory);
+        let mut old_schema = state.clone();
+        old_schema.version = 3;
+        assert!(old_schema.validate(&record.scan).is_err());
+        let mut sender = stream::Sender::new(19, Default::default());
+        let mut receiver = stream::Receiver::new(root.clone(), true, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let transferred = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(transferred.tracking, record.tracking);
+        assert_eq!(transferred.scan.folders[0].logical_bytes, 1);
+        let mut bytes = Vec::new();
+        crate::snapshot::write_to(&record, &mut bytes, || false).unwrap();
+        let restored = crate::snapshot::read_from(bytes.as_slice(), || false).unwrap();
+        assert_eq!(restored.tracking, record.tracking);
+        f.redirected.clear();
+        f.clock += Duration::from_secs(31);
+        index.refresh(&mut f, &|| false).unwrap();
+        let recovered = index.snapshot(&|| false).unwrap();
+        recovered
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&recovered.scan)
+            .unwrap();
+        assert_eq!(recovered.scan.error_count, 0);
+        assert_eq!(recovered.scan.folders[0].logical_bytes, 4);
+    }
+
+    #[test]
+    fn an_alias_detected_when_listing_drops_its_unverified_directory_node() {
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        let alias = root.join("scope");
+        fs::write(alias.join("payload"), b"123").unwrap();
+        f.redirect_on_list = Some(alias.clone());
+        let mut index = Index::begin(&root, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+        assert_eq!(record.scan.folders.len(), 1);
+        assert_eq!(record.scan.folders[0].logical_bytes, 0);
+        assert_eq!(record.scan.error_count, 1);
+        let excluded = &record.tracking.as_ref().unwrap().unavailable[0];
+        assert_eq!(excluded.relative(), Path::new("scope"));
+        assert!(!excluded.listing);
+        assert_eq!(excluded.reason, UnavailableReason::Redirected);
+    }
+
     #[test]
     fn denied_subtree_round_trips_and_recovers_without_claiming_unknown_bytes() {
         let mut f = Fixture::new();
@@ -1882,6 +2509,78 @@ mod tests {
             attributes: 0x400,
         });
         assert!(checkpoint.validate(&record.scan).is_err());
+    }
+    #[test]
+    fn baseline_captures_records_before_the_os_discards_them() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        for i in 0..20 {
+            fs::write(scope.join(format!("file-{i}")), b"abc").unwrap();
+        }
+        f.rolling_journal = true;
+        let mut source = buffered::Buffered::new(f).unwrap();
+        let mut index = Index::begin(&scope, false, &mut source, &|| false).unwrap();
+        let result = index.snapshot(&|| false).unwrap();
+        assert_eq!(result.scan.folders[0].logical_bytes, 60);
+        assert_eq!(result.scan.files.len(), 20);
+        result
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&result.scan)
+            .unwrap();
+    }
+    #[test]
+    fn records_already_read_need_not_remain_in_the_os_journal() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("a");
+        fs::write(&file, b"a").unwrap();
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        fs::write(&file, b"abc").unwrap();
+        let id = f.id(&file);
+        let parent = f.id(&scope);
+        f.event(id, parent, 0x80000001);
+        let end = f.journal.next;
+        let mut after_read = f.journal.clone();
+        after_read.first = end;
+        f.journal_on_read = Some(after_read);
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        assert_eq!(index.checkpoint.next, end);
+        assert_eq!(
+            index.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
+            3
+        );
+    }
+    #[test]
+    fn continuity_failure_identifies_the_invalid_boundary_and_preserves_the_result() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let previous = index.snapshot(&|| false).unwrap();
+        let original = f.journal.clone();
+        for (kind, value) in [
+            ("volume", 0),
+            ("generation", 1),
+            ("retention", 2),
+            ("future", 3),
+        ] {
+            f.journal = original.clone();
+            match value {
+                0 => f.journal.volume.push_str("-replaced"),
+                1 => f.journal.id += 1,
+                2 => f.journal.first = original.next + 1,
+                _ => f.journal.next -= 1,
+            }
+            let error = index.refresh(&mut f, &|| false).unwrap_err().to_string();
+            assert!(error.contains(kind), "{kind}: {error}");
+            assert!(error.contains("cursor="), "{error}");
+            assert_eq!(index.checkpoint, previous.tracking.clone().unwrap());
+            assert!(Arc::ptr_eq(
+                &previous.scan,
+                &index.snapshot(&|| false).unwrap().scan
+            ));
+        }
     }
     #[test]
     fn root_replacement_journal_loss_cancellation_and_open_writes_keep_the_last_checkpoint() {

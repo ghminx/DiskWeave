@@ -409,9 +409,9 @@ pub fn navigation_button(ui: &mut Ui, enabled: bool, direction: i8) -> Response 
         stroke,
     ));
     response.on_hover_text(match direction {
-        1 => "앞으로 (Alt+→)",
-        0 => "상위 폴더 (Alt+↑)",
-        _ => "뒤로 (Alt+←)",
+        1 => "앞으로",
+        0 => "상위 폴더",
+        _ => "뒤로",
     })
 }
 

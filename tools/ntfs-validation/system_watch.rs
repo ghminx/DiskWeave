@@ -21,7 +21,6 @@ pub fn run(output: &Path) -> io::Result<()> {
         std::env::temp_dir().join(format!("diskweave-live-{}-{token}", std::process::id()));
     fs::create_dir(&fixture)?;
     let file = fixture.join("probe.bin");
-    fs::write(&file, b"abc")?;
     let start = Instant::now();
     let stop = AtomicBool::new(false);
     let mut stage = 0;
@@ -33,7 +32,12 @@ pub fn run(output: &Path) -> io::Result<()> {
         Path::new("C:\\"),
         true,
         None,
-        &|| stop.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(900),
+        crate::ntfs_helper::WatchControl {
+            cancelled: &|| {
+                stop.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(1800)
+            },
+            ready: &|| true,
+        },
         |update| {
             let crate::usn::WatchUpdate::Record(record) = update else {
                 return Ok(());
@@ -51,8 +55,8 @@ pub fn run(output: &Path) -> io::Result<()> {
                 .find(|f| record.scan.folders[f.parent].path.join(&f.name) == file);
             let bytes = found.map(|f| f.logical_bytes);
             let expected = match stage {
-                0 => Some(3),
-                1 => Some(17),
+                1 => Some(3),
+                2 => Some(17),
                 _ => None,
             };
             if bytes != expected {
@@ -71,8 +75,9 @@ pub fn run(output: &Path) -> io::Result<()> {
                 "seconds":start.elapsed().as_secs_f64(),"checkpoint_valid":true
             }));
             let change = match stage {
-                0 => fs::write(&file, b"12345678901234567"),
-                1 => fs::remove_file(&file),
+                0 => fs::write(&file, b"abc"),
+                1 => fs::write(&file, b"12345678901234567"),
+                2 => fs::remove_file(&file),
                 _ => {
                     stop.store(true, Ordering::Relaxed);
                     Ok(())
@@ -100,7 +105,7 @@ pub fn run(output: &Path) -> io::Result<()> {
         fs::remove_file(&file)?;
     }
     fs::remove_dir(&fixture)?;
-    let success = stage == 3 && failure.is_none() && result.is_err();
+    let success = stage == 4 && failure.is_none() && result.is_err();
     serde_json::to_writer_pretty(fs::File::create(output)?, &serde_json::json!({
         "success":success,"observations":observations,
         "error":failure.as_ref().map(ToString::to_string).or_else(|| (!success).then(|| format!("{result:?}"))),

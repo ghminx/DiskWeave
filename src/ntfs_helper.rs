@@ -14,7 +14,7 @@ use std::{
     path::Path,
     ptr::{null, null_mut},
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -101,9 +101,8 @@ enum Message {
         files: u64,
         folders: u64,
     },
-    Ready,
+    Stream,
     Checking,
-    Cursor,
     Failed(String),
 }
 
@@ -231,16 +230,21 @@ impl Pipe<'_> {
         self.write_all(&data)
     }
     pub(crate) fn receive<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
-        let mut size = [0; 4];
-        self.read_exact(&mut size)?;
-        let size = u32::from_le_bytes(size) as usize;
-        if size > 256 * 1024 {
-            return Err(invalid("도우미 메시지 길이 초과"));
-        }
-        let mut data = vec![0; size];
-        self.read_exact(&mut data)?;
-        serde_json::from_slice(&data).map_err(crate::output::json_error)
+        receive_message(self)
     }
+}
+pub(crate) fn receive_message<T: serde::de::DeserializeOwned>(
+    reader: &mut impl Read,
+) -> io::Result<T> {
+    let mut size = [0; 4];
+    reader.read_exact(&mut size)?;
+    let size = u32::from_le_bytes(size) as usize;
+    if size > 256 * 1024 {
+        return Err(invalid("도우미 메시지 길이 초과"));
+    }
+    let mut data = vec![0; size];
+    reader.read_exact(&mut data)?;
+    serde_json::from_slice(&data).map_err(crate::output::json_error)
 }
 impl Read for Pipe<'_> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
@@ -263,12 +267,14 @@ impl Write for Pipe<'_> {
         Ok(())
     }
 }
+#[cfg(test)]
 struct Chunks<R> {
     pipe: R,
     remaining: usize,
     total: u64,
     ended: bool,
 }
+#[cfg(test)]
 impl<R: Read> Read for Chunks<R> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         if b.is_empty() || self.ended {
@@ -296,10 +302,12 @@ impl<R: Read> Read for Chunks<R> {
         Ok(len)
     }
 }
+#[cfg(test)]
 struct ChunkWriter<W> {
     pipe: W,
     total: u64,
 }
+#[cfg(test)]
 impl<W: Write> Write for ChunkWriter<W> {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         if b.is_empty() {
@@ -319,6 +327,7 @@ impl<W: Write> Write for ChunkWriter<W> {
     }
 }
 /// 결과 끝 표시를 포함한 유한 응답 전송. 연결 유지 상태에서도 수신 종료 보장.
+#[cfg(test)]
 pub fn write_completed(mut writer: impl Write, record: &SavedScan) -> io::Result<()> {
     let chunks = ChunkWriter {
         pipe: &mut writer,
@@ -330,6 +339,7 @@ pub fn write_completed(mut writer: impl Write, record: &SavedScan) -> io::Result
     drop(buffer);
     writer.write_all(&0u32.to_le_bytes())
 }
+#[cfg(test)]
 fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
     crate::snapshot::read_from(
         Chunks {
@@ -346,28 +356,25 @@ fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
 pub fn read_completed(reader: impl Read, root: &Path, detailed: bool) -> io::Result<ScanResult> {
     validate_response(read_record_from(reader)?, root, detailed)
 }
-impl Pipe<'_> {
-    fn record(&mut self, record: &SavedScan) -> io::Result<()> {
-        write_completed(self, record)
-    }
-    fn read_record(&mut self) -> io::Result<SavedScan> {
-        read_record_from(self)
-    }
+use crate::usn::WatchUpdate;
+pub struct WatchControl<'a> {
+    pub cancelled: &'a dyn Fn() -> bool,
+    pub ready: &'a dyn Fn() -> bool,
 }
-use crate::usn::{Advance, WatchUpdate};
 /// 명시적으로 선택한 NTFS 위치의 변경 추적을 제한된 읽기 전용 도우미에서 실행.
 pub fn watch(
     root: &Path,
     detailed: bool,
     resume: Option<Arc<SavedScan>>,
-    cancelled: &dyn Fn() -> bool,
+    control: WatchControl<'_>,
     mut publish: impl FnMut(WatchUpdate) -> io::Result<()>,
     mut progress: impl FnMut(Progress),
 ) -> io::Result<()> {
     let target = crate::usn_native::target(root)?;
+    let cancelled = control.cancelled;
     let (mut pipe, _worker) = launch(cancelled)?;
     pipe.send(&Request {
-        version: 1,
+        version: 2,
         session: false,
         target: target.clone(),
         detailed,
@@ -377,40 +384,51 @@ pub fn watch(
         scope: None,
     })?;
     if let Some(record) = &resume {
-        pipe.record(record)?;
+        let mut index = crate::usn::Index::restore(record)?;
+        let mut sender =
+            crate::usn::stream::Sender::new(std::process::id() as u64, Default::default());
+        sender.write(
+            &mut io::BufWriter::with_capacity(65536, &mut pipe),
+            &mut index,
+            &cancelled,
+        )?;
     }
+    let mut receiver =
+        crate::usn::stream::Receiver::new(root.to_owned(), detailed, Default::default());
+    // 제어 메시지와 목록이 같은 버퍼를 공유하여 선읽기된 다음 메시지 보존.
+    let mut pipe = io::BufReader::with_capacity(65536, pipe);
+    let mut last = Progress::default();
     loop {
         crate::output::check(&cancelled)?;
-        let update = match pipe.receive()? {
+        match receive_message(&mut pipe)? {
             Message::Preview(_) => return Err(invalid("실시간 추적에 잘못된 미리보기 응답")),
-            Message::Ready => {
-                let record = pipe.read_record()?;
-                if record.scan.folders[0].path != root
-                    || record.scan.detailed != detailed
-                    || record
-                        .tracking
-                        .as_ref()
-                        .is_none_or(|c| c.volume != target.volume)
-                {
-                    return Err(invalid("변경 추적 응답의 대상·옵션 불일치"));
+            Message::Stream => {
+                progress(Progress {
+                    stage: Stage::Transferring,
+                    ..last
+                });
+                receiver.receive(&mut pipe, &cancelled)?;
+                if crate::usn_native::target(root)?.volume != target.volume {
+                    return Err(invalid("응답 중 추적 드라이브가 바뀌었습니다"));
                 }
-                WatchUpdate::Record(Box::new(record))
-            }
-            Message::Cursor => {
-                let value: Advance = serde_json::from_reader(Chunks {
-                    pipe: &mut pipe,
-                    remaining: 0,
-                    total: 0,
-                    ended: false,
-                })
-                .map_err(crate::output::json_error)?;
-                WatchUpdate::Cursor(value)
+                progress(Progress {
+                    stage: if receiver.pending() {
+                        Stage::Metadata
+                    } else {
+                        Stage::Basic
+                    },
+                    ..last
+                });
+                if let Some(update) = receiver.publication((control.ready)(), &cancelled)? {
+                    publish(update)?;
+                }
             }
             Message::Checking => {
-                progress(Progress {
+                last = Progress {
                     stage: Stage::Basic,
                     counts: Default::default(),
-                });
+                };
+                progress(last);
                 continue;
             }
             Message::Progress {
@@ -418,21 +436,18 @@ pub fn watch(
                 files,
                 folders,
             } => {
-                progress(Progress {
+                last = Progress {
                     stage,
                     counts: ScanProgress {
                         files_scanned: files,
                         folders_scanned: folders,
                     },
-                });
+                };
+                progress(last);
                 continue;
             }
             Message::Failed(error) => return Err(io::Error::other(error)),
-        };
-        if crate::usn_native::target(root)?.volume != target.volume {
-            return Err(invalid("응답 중 추적 드라이브가 바뀌었습니다"));
         }
-        publish(update)?;
     }
 }
 fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
@@ -451,11 +466,19 @@ fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
         }
         let mut source = crate::usn_native::Native::open(&root)?;
         let mut index = if request.resume {
-            let record = pipe.read_record()?;
-            if record.scan.folders[0].path != root || record.scan.detailed != request.detailed {
-                return Err(invalid("복원 대상·수집 옵션 불일치"));
+            let mut receiver = crate::usn::stream::Receiver::new(
+                root.clone(),
+                request.detailed,
+                Default::default(),
+            );
+            receiver.receive(
+                &mut io::BufReader::with_capacity(65536, &mut *pipe),
+                &|| false,
+            )?;
+            let mut index = receiver.into_index()?;
+            if index.checkpoint.volume != request.target.volume {
+                return Err(invalid("복원 볼륨 불일치"));
             }
-            let mut index = crate::usn::Index::restore(&record)?;
             index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
             index
         } else {
@@ -466,37 +489,24 @@ fn watch_worker(pipe: &mut Pipe<'_>, request: &Request) -> io::Result<()> {
                 &|| false,
             )?
         };
-        let record = index.snapshot(&|| false)?;
-        pipe.send(&Message::Ready)?;
-        pipe.record(&record)?;
+        let mut sender =
+            crate::usn::stream::Sender::new(std::process::id() as u64, Default::default());
+        pipe.send(&Message::Stream)?;
+        sender.write(
+            &mut io::BufWriter::with_capacity(65536, &mut *pipe),
+            &mut index,
+            &|| false,
+        )?;
         loop {
             pipe.send(&Message::Checking)?;
             std::thread::sleep(Duration::from_secs(1));
-            let changed = index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
-            if changed {
-                let record = index.snapshot(&|| false)?;
-                pipe.send(&Message::Ready)?;
-                pipe.record(&record)?;
-            } else {
-                pipe.send(&Message::Cursor)?;
-                let value = Advance {
-                    next: index.checkpoint.next,
-                    pending: index.checkpoint.pending.clone(),
-                    confirmed_after: index.checkpoint.confirmed_after,
-                    finished: SystemTime::now(),
-                };
-                let mut writer = io::BufWriter::with_capacity(
-                    65536,
-                    ChunkWriter {
-                        pipe: &mut *pipe,
-                        total: 0,
-                    },
-                );
-                serde_json::to_writer(&mut writer, &value).map_err(crate::output::json_error)?;
-                writer.flush()?;
-                drop(writer);
-                pipe.write_all(&0u32.to_le_bytes())?;
-            }
+            index.refresh(&mut Traced::new(&mut source, pipe), &|| false)?;
+            pipe.send(&Message::Stream)?;
+            sender.write(
+                &mut io::BufWriter::with_capacity(65536, &mut *pipe),
+                &mut index,
+                &|| false,
+            )?;
         }
     })();
     if let Err(error) = result {
@@ -742,7 +752,7 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
     pipe.idle = true;
     let request: Request = pipe.receive()?;
     pipe.idle = false;
-    if request.version != 1 {
+    if request.version != 2 {
         return Err(invalid("지원하지 않는 도우미 버전"));
     }
     if request.watch.is_none() || request.fast_mode != FastMode::Auto || request.scope.is_some() {
@@ -755,6 +765,88 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::engine::Report;
+    use std::time::SystemTime;
+
+    #[test]
+    fn buffered_updates_keep_following_control_messages_without_per_item_pipe_reads() {
+        let root = std::env::temp_dir().join(format!("diskweave-buffered-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for n in 0..100 {
+            std::fs::write(root.join(format!("file-{n}")), b"x").unwrap();
+        }
+        let now = SystemTime::now();
+        let mut record = SavedScan::new(
+            Arc::new(crate::scanner::scan(&root, || false).unwrap()),
+            now,
+            now,
+            Duration::ZERO,
+        );
+        record.tracking = Some(crate::usn::Checkpoint {
+            version: 3,
+            volume: "test".into(),
+            root: 1,
+            journal: 7,
+            next: 100,
+            folders: vec![1],
+            files: (2..102).collect(),
+            excluded: vec![],
+            pending: vec![],
+            unavailable: vec![],
+            confirmed_after: None,
+        });
+        let mut index = crate::usn::Index::restore(&record).unwrap();
+        let mut sender = crate::usn::stream::Sender::new(17, Default::default());
+        let mut wire = vec![];
+        let control = |wire: &mut Vec<u8>, message: Message| {
+            let data = serde_json::to_vec(&message).unwrap();
+            wire.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            wire.extend(data);
+        };
+        control(&mut wire, Message::Stream);
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        control(&mut wire, Message::Checking);
+        control(&mut wire, Message::Stream);
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        struct Counted<'a> {
+            data: &'a [u8],
+            reads: usize,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                self.data.read(b)
+            }
+        }
+        let mut reader = io::BufReader::with_capacity(
+            65536,
+            Counted {
+                data: &wire,
+                reads: 0,
+            },
+        );
+        let mut receiver =
+            crate::usn::stream::Receiver::new(root.clone(), false, Default::default());
+        assert!(matches!(
+            receive_message::<Message>(&mut reader).unwrap(),
+            Message::Stream
+        ));
+        assert!(receiver.receive(&mut reader, &|| false).unwrap());
+        assert!(matches!(
+            receive_message::<Message>(&mut reader).unwrap(),
+            Message::Checking
+        ));
+        assert!(matches!(
+            receive_message::<Message>(&mut reader).unwrap(),
+            Message::Stream
+        ));
+        assert!(!receiver.receive(&mut reader, &|| false).unwrap());
+        assert_eq!(
+            receiver.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
+            100
+        );
+        assert!(reader.get_ref().reads < 8);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn persistent_response_stops_at_its_frame_without_waiting_for_process_exit() {
