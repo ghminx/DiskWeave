@@ -8,6 +8,8 @@ Windows 10/11 x64용 디스크 용량 분석·파일 관리 프로그램. 분석
 
 ## 실행
 
+로컬 사전 배포 ZIP은 `tools/Build-Portable.ps1`로 생성함. 압축을 푼 뒤 `DiskWeave.exe`를 실행하며 설치가 필요하지 않음. 화면·단축키 설정만 사용자 LocalAppData에 저장하고 분석 목록·검색어·탐색 이력은 저장하지 않음. [사용 안내](docs/portable-readme.md)와 [사용성·배포 검증 및 한계](docs/usability-release.md)를 기준으로 함.
+
 Rust stable 도구 모음 설치 후 다음 명령 실행.
 
 ```powershell
