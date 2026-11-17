@@ -1,5 +1,8 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod analysis;
 mod analysis_panel;
+mod app_settings;
 mod comparison;
 mod documents;
 mod drives;
@@ -23,6 +26,7 @@ mod locations;
 mod locations_ui;
 mod map_job;
 mod metadata;
+mod navigation;
 mod ntfs;
 mod ntfs_helper;
 mod ntfs_native;
@@ -100,6 +104,13 @@ fn run() -> io::Result<()> {
     }
     if arguments.is_empty() || arguments.as_slice() == ["--gui-elevated"] {
         return gui::run().map_err(|error| io::Error::other(error.to_string()));
+    }
+    // GUI 기본 실행에서도 부모 콘솔과 리다이렉트된 CLI 출력 유지
+    unsafe {
+        use windows_sys::Win32::System::Console::*;
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
     }
     let (root, view) = match arguments.as_slice() {
         [path] => (PathBuf::from(path), View::Tree),

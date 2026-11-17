@@ -29,6 +29,24 @@ pub struct ListSelection {
 }
 
 impl ListSelection {
+    pub fn move_by(&mut self, len: usize, forward: bool) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let row = match self.rows().next() {
+            Some(r) if forward => (r + 1).min(len - 1),
+            Some(r) => r.saturating_sub(1),
+            None => {
+                if forward {
+                    0
+                } else {
+                    len - 1
+                }
+            }
+        };
+        self.click(row, false, false);
+        Some(row)
+    }
     pub fn click(&mut self, row: usize, ctrl: bool, shift: bool) {
         if shift {
             let anchor = self.anchor.unwrap_or(row);
@@ -86,7 +104,11 @@ impl ListSelection {
         };
         explorer.open_folder(result, folder);
         explorer.select(item);
-        *input = crate::search::SearchInput::default();
+        *input = crate::search::SearchInput {
+            sort: input.sort,
+            descending: input.descending,
+            ..Default::default()
+        };
         self.clear();
         true
     }
@@ -96,6 +118,19 @@ impl ListSelection {
 mod tests {
     use super::*;
     use crate::explorer::Item;
+
+    #[test]
+    fn keyboard_selection_stays_within_the_displayed_rows() {
+        let mut selection = ListSelection::default();
+        assert_eq!(selection.move_by(0, true), None);
+        assert_eq!(selection.move_by(3, false), Some(2));
+        assert_eq!(selection.move_by(3, true), Some(2));
+        assert_eq!(selection.move_by(3, false), Some(1));
+        selection.all(3);
+        assert_eq!(selection.move_by(3, false), Some(0));
+        assert_eq!(selection.count(), 1);
+        assert_eq!(selection.move_by(3, false), Some(0));
+    }
 
     #[test]
     fn analysis_navigation_clears_filters_and_reveals_the_selected_file() {

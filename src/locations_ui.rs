@@ -24,6 +24,21 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn restore_selection(
+        &mut self,
+        input: SearchInput,
+        paths: std::collections::HashSet<(u64, PathBuf)>,
+    ) {
+        self.selection.clear();
+        self.key = None;
+        self.live_selection = Some((input, paths));
+    }
+    pub fn move_selection(&mut self, forward: bool) -> Option<usize> {
+        let len = self.job.results.as_ref()?.hits.len();
+        let row = self.selection.move_by(len, forward)?;
+        self.selection_changed = true;
+        Some(row)
+    }
     pub fn selected_targets(&self) -> Vec<crate::map_job::Target> {
         let Some(results) = &self.job.results else {
             return vec![];
@@ -347,6 +362,12 @@ impl LocationsView {
             let output = egui::ScrollArea::both()
                 .id_salt("global_results")
                 .horizontal_scroll_offset(search.horizontal_offset)
+                .vertical_scroll_offset(
+                    search
+                        .reveal_row
+                        .take()
+                        .map_or(search.vertical_offset, |r| r as f32 * crate::ui_style::ROW),
+                )
                 .max_height((ui.available_height() - 28.0).max(30.0))
                 .show_rows(ui, crate::ui_style::ROW, results.hits.len(), |ui, rows| {
                     for row in rows {
@@ -513,6 +534,7 @@ impl LocationsView {
                     }
                 });
             search.horizontal_offset = output.state.clamped_offset().x;
+            search.vertical_offset = output.state.clamped_offset().y;
             egui::Frame::new().fill(crate::ui_style::SIDEBAR).inner_margin(egui::Margin::symmetric(12,6)).show(ui,|ui| {
                 ui.set_min_width(ui.available_width());
                 ui.small(format!("{}개 항목 · {}개 선택{}",results.hits.len(),self.selection.count(),if results.unknown_dates>0{format!(" · 수정 날짜 확인 불가 {}개 제외",results.unknown_dates)}else{String::new()}))

@@ -229,26 +229,51 @@ impl MapView {
             }
         }
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            for (row, tile) in output.data.tiles.iter().enumerate().take(5) {
-                if let Some(hit) = tile.target {
-                    let name = crate::search::item_name(&output.sources[hit.source].scan, hit.item)
-                        .to_string_lossy();
-                    ui.colored_label(self.colors[row], egui::RichText::new("■").size(8.0));
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(name)
-                                .size(10.0)
-                                .color(crate::ui_style::SOFT),
-                        )
-                        .truncate(),
-                    );
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.small(&summary)
-                    .on_hover_text("클릭으로 선택 · 폴더 더블클릭으로 이동 · 0 B는 목록에서 확인");
-            });
+            let summary_width = ui.available_width().min(300.0);
+            let legend_width = (ui.available_width() - summary_width - 8.0).max(0.0);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(legend_width, 18.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let width = legend_width / 5.0;
+                    for (row, tile) in output.data.tiles.iter().enumerate().take(5) {
+                        if let Some(hit) = tile.target {
+                            let name = crate::search::item_name(
+                                &output.sources[hit.source].scan,
+                                hit.item,
+                            )
+                            .to_string_lossy();
+                            let (rect, response) = ui
+                                .allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                egui::Rect::from_center_size(
+                                    rect.left_center() + egui::vec2(4.0, 0.0),
+                                    egui::vec2(6.0, 6.0),
+                                ),
+                                1.0,
+                                self.colors[row],
+                            );
+                            crate::ui_style::text(
+                                ui,
+                                rect.shrink2(egui::vec2(12.0, 0.0)),
+                                &name,
+                                false,
+                                crate::ui_style::SOFT,
+                                10.0,
+                            );
+                            response.on_hover_text(name);
+                        }
+                    }
+                },
+            );
+            ui.add_sized(
+                [summary_width, 18.0],
+                egui::Label::new(egui::RichText::new(&summary).small()).truncate(),
+            )
+            .on_hover_text(format!(
+                "{summary}\n클릭으로 선택 · 폴더 더블클릭으로 이동 · 0 B는 목록에서 확인"
+            ));
         });
         event
     }

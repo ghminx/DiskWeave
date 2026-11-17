@@ -21,6 +21,14 @@ use std::time::Duration;
 
 #[derive(Default)]
 pub struct DiskWeaveApp {
+    settings_path: Option<PathBuf>,
+    settings_error: Option<String>,
+    settings_saved: Option<crate::app_settings::UiSettings>,
+    settings_attempt: Option<crate::app_settings::UiSettings>,
+    settings_pending: Option<(crate::app_settings::UiSettings, std::time::Instant)>,
+    window_state: Option<crate::app_settings::WindowState>,
+    window_restore: Option<(crate::app_settings::WindowState, u8)>,
+    history: crate::navigation::History,
     duplicates: crate::duplicate_job::Controller,
     duplicate_view: crate::duplicate_ui::DuplicateUi,
     quick: crate::quick_search::QuickSearch,
@@ -58,6 +66,11 @@ pub struct DiskWeaveApp {
 }
 
 pub fn run() -> eframe::Result {
+    let settings_path = crate::quick_settings::path();
+    let settings = settings_path
+        .as_ref()
+        .map_err(|e| e.to_string())
+        .and_then(|p| crate::app_settings::load(p).map_err(|e| e.to_string()));
     let icon =
         eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand/diskweave-icon.png"))
             .expect("프로젝트 아이콘 PNG");
@@ -76,7 +89,15 @@ pub fn run() -> eframe::Result {
         options,
         Box::new(|creation| {
             crate::ui_style::apply(&creation.egui_ctx);
-            Ok(Box::new(DiskWeaveApp::new()))
+            let mut app = DiskWeaveApp::new();
+            app.settings_path = settings_path.ok();
+            match settings {
+                Ok(settings) => app.apply_ui_settings(settings.ui),
+                Err(e) => {
+                    app.settings_error = Some(format!("화면 설정을 불러오지 못했습니다: {e}"))
+                }
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -923,6 +944,139 @@ impl DiskWeaveApp {
     pub fn new() -> Self {
         Self::default()
     }
+    fn apply_ui_settings(&mut self, settings: crate::app_settings::UiSettings) {
+        self.search.widths.restore(settings.columns);
+        self.search.input.sort = settings.sort;
+        self.search.input.descending = settings.descending;
+        self.map_height = settings.map_height;
+        self.map_collapsed = settings.map_collapsed;
+        let parallelism = match settings.workers {
+            1 => crate::scanner::Parallelism::Sequential,
+            2 => crate::scanner::Parallelism::Two,
+            4 => crate::scanner::Parallelism::Four,
+            8 => crate::scanner::Parallelism::Eight,
+            _ => crate::scanner::Parallelism::Auto,
+        };
+        if let Err(e) = self.scan.configure_parallelism(parallelism) {
+            self.settings_error = Some(e.to_string());
+        }
+        self.window_state = settings.window.clone();
+        if let Some(window) = &settings.window {
+            match crate::app_settings::screens().and_then(|s| window.fit(&s)) {
+                Ok(w) => {
+                    self.window_state = Some(w.clone());
+                    self.window_restore = Some((w, 0));
+                }
+                Err(e) => self.settings_error = Some(format!("창 위치를 복원하지 못했습니다: {e}")),
+            }
+        }
+        self.settings_saved = Some(settings);
+    }
+    pub fn ui_preferences(&self) -> crate::app_settings::UiSettings {
+        use crate::scanner::Parallelism;
+        crate::app_settings::UiSettings {
+            window: self.window_state.clone(),
+            columns: self.search.widths.saved(),
+            sort: self.search.input.sort,
+            descending: self.search.input.descending,
+            map_height: self.map_height.clamp(64.0, 2000.0),
+            map_collapsed: self.search.preferred_map_collapsed(self.map_collapsed),
+            workers: match self.scan.parallelism() {
+                Parallelism::Auto => 0,
+                Parallelism::Sequential => 1,
+                Parallelism::Two => 2,
+                Parallelism::Four => 4,
+                _ => 8,
+            },
+        }
+    }
+    fn save_ui_settings(&mut self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        if self.window_restore.is_some() {
+            return;
+        }
+        let settings = self.ui_preferences();
+        if self.settings_saved.as_ref() == Some(&settings)
+            || self.settings_attempt.as_ref() == Some(&settings)
+        {
+            return;
+        }
+        match crate::app_settings::save_ui(path, settings.clone()) {
+            Ok(()) => {
+                self.settings_saved = Some(settings.clone());
+                self.settings_error = None;
+            }
+            Err(e) => self.settings_error = Some(format!("화면 설정을 저장하지 못했습니다: {e}")),
+        }
+        self.settings_attempt = Some(settings);
+        self.settings_pending = None;
+    }
+    fn settings_frame(&mut self, ctx: &egui::Context) {
+        if self.settings_path.is_none() {
+            return;
+        }
+        if let Some((window, step)) = self.window_restore.take() {
+            match step {
+                0 => ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                    egui::pos2(window.position[0], window.position[1]) / ctx.pixels_per_point(),
+                )),
+                1 => ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    window.size[0],
+                    window.size[1],
+                ))),
+                _ => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(window.maximized)),
+            }
+            if step < 2 {
+                self.window_restore = Some((window, step + 1));
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let scale = ctx.pixels_per_point();
+        ctx.input(|i| {
+            let viewport = i.viewport();
+            if viewport.minimized.unwrap_or(false) {
+                return;
+            }
+            let maximized = viewport.maximized.unwrap_or(false);
+            if maximized {
+                if let Some(window) = &mut self.window_state {
+                    window.maximized = true;
+                }
+            } else if let (Some(outer), Some(inner)) = (viewport.outer_rect, viewport.inner_rect) {
+                self.window_state = Some(crate::app_settings::WindowState {
+                    position: [outer.min.x * scale, outer.min.y * scale],
+                    size: [inner.width(), inner.height()],
+                    maximized: false,
+                });
+            }
+        });
+        let settings = self.ui_preferences();
+        if self.settings_saved.as_ref() == Some(&settings)
+            || self.settings_attempt.as_ref() == Some(&settings)
+        {
+            self.settings_pending = None;
+            return;
+        }
+        if self
+            .settings_pending
+            .as_ref()
+            .is_none_or(|(p, _)| p != &settings)
+        {
+            self.settings_pending = Some((settings, std::time::Instant::now()));
+        }
+        if self
+            .settings_pending
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() > Duration::from_millis(750))
+        {
+            self.save_ui_settings();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(750));
+        }
+    }
     fn document_tick(&mut self) {
         if self.results.poll() {
             match &self.results.job.view {
@@ -942,6 +1096,7 @@ impl DiskWeaveApp {
         }
     }
     pub fn tick_background(&mut self, ctx: &egui::Context) {
+        self.settings_frame(ctx);
         if self.archive_record.is_none() {
             if self.scan.is_running() {
                 self.tracking.stop();
@@ -1120,6 +1275,7 @@ impl DiskWeaveApp {
         if !requested {
             return;
         }
+        self.save_ui_settings();
         if !self.file_close_requested
             && self
                 .desktop
@@ -1267,7 +1423,8 @@ impl DiskWeaveApp {
             self.target.accept_drop(&paths).err()
         };
     }
-    fn analyze_at(&mut self, id: u64, generation: u64, item: Item) {
+    pub fn analyze_at(&mut self, id: u64, generation: u64, item: Item) {
+        let previous = self.capture_navigation();
         self.scan.choose(id);
         self.sync_scan();
         if !self
@@ -1290,8 +1447,10 @@ impl DiskWeaveApp {
             self.tab = 0;
             self.detail_target = Some((id, generation, item));
         }
+        self.remember_navigation(previous);
     }
-    fn navigate(&mut self, folder: usize, clear_search: bool) {
+    pub fn navigate(&mut self, folder: usize, clear_search: bool) {
+        let previous = self.capture_navigation();
         if let (Some(source), Some(explorer)) = (self.source(), &mut self.explorer) {
             if source.scan.folders[explorer.folder()].parent == Some(folder) {
                 explorer.up(&source.scan);
@@ -1299,11 +1458,88 @@ impl DiskWeaveApp {
                 explorer.open_folder(&source.scan, folder);
             }
             if clear_search {
-                self.search.input = SearchInput::default();
+                self.search.clear_conditions();
             }
             self.search.whole_scan = false;
+            self.search.vertical_offset = 0.0;
             self.search.refresh(&source.scan, folder);
             self.detail_target = Some((source.id, source.generation, Item::Folder(folder)));
+        }
+        self.remember_navigation(previous);
+    }
+    pub fn capture_navigation(&self) -> Option<crate::navigation::ViewState> {
+        if self.archive_record.is_some() {
+            return None;
+        }
+        let source = self.source()?;
+        let folder = self.explorer.as_ref()?.folder();
+        Some(crate::navigation::ViewState {
+            location: source.id,
+            folder: source.scan.folders[folder].path.clone(),
+            query: self.search.input.clone(),
+            whole_scan: self.search.whole_scan,
+            global: self.locations_view.global_mode,
+            selected: self.copy_selection_paths(),
+            scroll: [self.search.horizontal_offset, self.search.vertical_offset],
+            tab: self.tab,
+        })
+    }
+    fn remember_navigation(&mut self, from: Option<crate::navigation::ViewState>) {
+        if let (Some(from), Some(to)) = (from, self.capture_navigation()) {
+            self.history.visit(from, &to);
+        }
+    }
+    pub fn history_move(&mut self, forward: bool) {
+        let Some(current) = self.capture_navigation() else {
+            return;
+        };
+        let next = if forward {
+            self.history.forward(current)
+        } else {
+            self.history.back(current)
+        };
+        let Some(next) = next else { return };
+        let sources = self.scan.snapshots();
+        let resolved = match next.resolve(&sources) {
+            Ok(r) => r,
+            Err(e) => {
+                self.input_error = Some(e.to_string());
+                return;
+            }
+        };
+        self.scan.choose(resolved.source.id);
+        self.sync_scan();
+        let mut explorer = Explorer::new(&resolved.source.scan);
+        explorer.open_folder(&resolved.source.scan, resolved.folder);
+        if let Some(item) = resolved.selected.first() {
+            explorer.select(*item);
+        }
+        self.search.restore(
+            &resolved.source.scan,
+            resolved.folder,
+            next.query.clone(),
+            next.whole_scan,
+            resolved.selected,
+            next.scroll,
+        );
+        self.locations_view.global_mode = next.global;
+        if next.global {
+            let mut paths = std::collections::HashSet::new();
+            for path in &next.selected {
+                if let Some(s) = sources
+                    .iter()
+                    .find(|s| path.starts_with(&s.scan.folders[0].path))
+                {
+                    paths.insert((s.id, path.clone()));
+                }
+            }
+            self.locations_view.restore_selection(next.query, paths);
+        }
+        self.explorer = Some(explorer);
+        self.tab = next.tab;
+        self.detail_target = None;
+        if resolved.fallback {
+            self.input_error = Some("이전 폴더가 없어 남아 있는 상위 폴더로 이동했습니다".into());
         }
     }
     fn pick_map(&mut self, row: usize) {
@@ -1335,6 +1571,112 @@ impl DiskWeaveApp {
             self.locations_view.select_target(selected.target);
         } else if let (Some(source), Some(explorer)) = (self.source(), &mut self.explorer) {
             selected.apply_local(&source, explorer, &mut self.search);
+        }
+    }
+    fn navigation_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.archive_record.is_some() {
+            return;
+        }
+        let popup = egui::Popup::is_any_open(ctx) || self.file_ui.dialog.is_some();
+        let editing = ctx.egui_wants_keyboard_input();
+        let busy = self.scan.is_running() || self.file_blocked() || self.results.busy();
+        let action = ctx.input_mut(|i| {
+            let found = i.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => crate::navigation::shortcut(*key, *modifiers, editing, popup, busy)
+                    .map(|a| (*key, *modifiers, a)),
+                _ => None,
+            });
+            found.and_then(|(key, m, a)| i.consume_key(m, key).then_some(a))
+        });
+        use crate::navigation::Action;
+        match action {
+            Some(Action::Back) => self.history_move(false),
+            Some(Action::Forward) => self.history_move(true),
+            Some(Action::Up) => {
+                if let (Some(s), Some(e)) = (self.source(), self.explorer.as_ref()) {
+                    if let Some(parent) = s.scan.folders[e.folder()].parent {
+                        self.navigate(parent, true);
+                    }
+                }
+            }
+            Some(Action::Search) => {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique("search_query")))
+            }
+            Some(Action::Path) => {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique("scan_path")))
+            }
+            Some(Action::Rescan) => {
+                if let Some(path) = self
+                    .scan
+                    .selected_id()
+                    .and_then(|id| self.scan.get(id))
+                    .map(|s| s.path.clone())
+                {
+                    self.target.choose_registered(path);
+                    self.begin_scan();
+                }
+            }
+            Some(Action::Previous | Action::Next) if matches!(self.tab, 0 | 3) => {
+                let forward = action == Some(Action::Next);
+                if self.locations_view.global_mode {
+                    self.search.reveal_row = self.locations_view.move_selection(forward);
+                    self.detail_target = self.locations_view.selected_target();
+                } else if let Some(results) = self.search.job.results() {
+                    if let Some(row) = self.search.selection.move_by(results.items.len(), forward) {
+                        self.search.reveal_row = Some(row);
+                        if let Some(s) = self.source() {
+                            self.detail_target = Some((s.id, s.generation, results.items[row]));
+                        }
+                    }
+                }
+            }
+            Some(Action::Open) if matches!(self.tab, 0 | 3) => {
+                let target = if self.locations_view.global_mode {
+                    self.locations_view.selected_target()
+                } else {
+                    self.source().and_then(|s| {
+                        self.search
+                            .job
+                            .results()
+                            .and_then(|r| self.search.selection.single(&r.items))
+                            .map(|i| (s.id, s.generation, i))
+                    })
+                };
+                if let Some((id, generation, item)) = target {
+                    match item {
+                        Item::Folder(_) => self.analyze_at(id, generation, item),
+                        Item::File(_) => {
+                            if let Some(s) = self
+                                .scan
+                                .snapshots()
+                                .into_iter()
+                                .find(|s| s.id == id && s.generation == generation)
+                            {
+                                self.start_open(OpenRequest::for_item(
+                                    &s.scan,
+                                    item,
+                                    OpenAction::OpenFile,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Action::CopyPath) => {
+                let paths = self.copy_selection_paths();
+                self.input_error = crate::path_copy::copy_with(&paths, |text| {
+                    ctx.copy_text(text);
+                    Ok(())
+                })
+                .err()
+                .map(|e| e.to_string());
+            }
+            _ => {}
         }
     }
     fn derived_input(&self, matched: bool) -> Option<(PanelKey, Vec<Snapshot>)> {
@@ -1574,6 +1916,43 @@ impl DiskWeaveApp {
                 if self.archive_record.is_none() && ui.button("빠른 검색").clicked() {
                     self.quick.open();
                 }
+                if self.archive_record.is_none() {
+                    ui.menu_button(
+                        if self.settings_error.is_some() {
+                            "설정 !"
+                        } else {
+                            "설정"
+                        },
+                        |ui| {
+                            ui.set_max_width(360.0);
+                            ui.strong("화면 설정");
+                            ui.small("창·표·지도 설정을 자동으로 저장합니다.");
+                            ui.small("분석 목록·파일 경로·검색어는 저장하지 않습니다.");
+                            if let Some(error) = self.settings_error.clone() {
+                                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                if ui.button("저장 다시 시도").clicked() {
+                                    self.settings_attempt = None;
+                                    self.save_ui_settings();
+                                }
+                            }
+                            ui.separator();
+                            ui.strong("키보드 안내");
+                            for text in [
+                                "Alt+← / →  뒤로 / 앞으로",
+                                "Alt+↑  상위 폴더",
+                                "Ctrl+F  검색 · Ctrl+L  대상 경로",
+                                "F5  선택 위치 다시 스캔",
+                                "↑ / ↓ · Enter  목록 선택 / 열기",
+                                "Ctrl+Shift+C  경로 복사",
+                                "F2  이름 변경 · Delete  휴지통 확인",
+                            ] {
+                                ui.label(text);
+                            }
+                            ui.separator();
+                            ui.small(concat!("DiskWeave ", env!("CARGO_PKG_VERSION")));
+                        },
+                    );
+                }
                 if self.archive_record.is_some() {
                     ui.small("조회 전용");
                 }
@@ -1616,6 +1995,7 @@ impl DiskWeaveApp {
                         ui.menu_button("분석 위치 관리", |ui| {
                             ui.set_max_width(420.0);
                             ui.add_enabled_ui(editable, |ui| {
+                                let previous = self.capture_navigation();
                                 if let Some(path) = self.locations_view.controls(
                                     ui,
                                     &mut self.scan,
@@ -1627,6 +2007,8 @@ impl DiskWeaveApp {
                                     } else {
                                         self.input_error = self.target.choose_folder(path).err();
                                     }
+                                    self.sync_scan();
+                                    self.remember_navigation(previous);
                                 }
                             });
                         });
@@ -1715,6 +2097,7 @@ impl DiskWeaveApp {
                 .add_enabled(
                     editable,
                     egui::TextEdit::singleline(&mut path)
+                        .id(egui::Id::unique("scan_path"))
                         .desired_width((path_width - 24.0).max(40.0))
                         .margin(egui::vec2(10.0, 6.0))
                         .min_size(egui::vec2(40.0, 32.0))
@@ -2078,6 +2461,9 @@ impl DiskWeaveApp {
             return;
         }
         let mut destination = None;
+        let mut history_direction = None;
+        let history_back = self.history.can_back();
+        let history_forward = self.history.can_forward();
         let compact = ui.available_height() < 300.0;
         let available = ui.available_width();
         let layout = crate::workspace::SearchLayout::new(available);
@@ -2100,8 +2486,14 @@ impl DiskWeaveApp {
                     ui.spacing_mut().interact_size.y = 24.0;
                     if let (Some(source), Some(explorer)) = (&crumb_source, crumb_explorer) {
                         let folder = if whole { 0 } else { explorer.folder() };
+                        if crate::ui_style::navigation_button(ui, history_back, -1).clicked() {
+                            history_direction = Some(false);
+                        }
+                        if crate::ui_style::navigation_button(ui, history_forward, 1).clicked() {
+                            history_direction = Some(true);
+                        }
                         if !global {
-                            if crate::ui_style::back_button(ui, folder != 0).clicked() {
+                            if crate::ui_style::navigation_button(ui, folder != 0, 0).clicked() {
                                 destination = source.scan.folders[folder].parent;
                             }
                             let path = source.scan.folders[folder].path.display().to_string();
@@ -2188,6 +2580,10 @@ impl DiskWeaveApp {
         if let Some(scope) = chosen_scope {
             self.locations_view.choose_scope(&mut self.search, scope);
             self.detail_target = None;
+        }
+        if let Some(forward) = history_direction {
+            self.history_move(forward);
+            return;
         }
         if self.search.input.is_active()
             || self.search.input.mode != crate::search::SearchMode::Name
@@ -2381,6 +2777,7 @@ impl DiskWeaveApp {
             let mut scroll = egui::ScrollArea::both()
                 .id_salt("entry_list")
                 .horizontal_scroll_offset(self.search.horizontal_offset)
+                .vertical_scroll_offset(self.search.vertical_offset)
                 .max_height((ui.available_height() - if compact { 0.0 } else { 28.0 }).max(20.0));
             if let Some(row) = self.search.reveal_row.take() {
                 scroll = scroll.vertical_scroll_offset(row as f32 * crate::ui_style::ROW);
@@ -2517,6 +2914,7 @@ impl DiskWeaveApp {
                     }
                 });
             self.search.horizontal_offset = output.state.clamped_offset().x;
+            self.search.vertical_offset = output.state.clamped_offset().y;
         }
         if !compact {
             egui::Frame::new()
@@ -2559,9 +2957,12 @@ impl DiskWeaveApp {
             }
         }
         if analyze {
+            let previous = self.capture_navigation();
             if let Some(explorer) = &mut self.explorer {
                 self.search.analyze(&source.scan, explorer);
+                self.tab = 0;
             }
+            self.remember_navigation(previous);
         }
         if let Some(folder) = destination {
             self.navigate(folder, false);
@@ -3182,14 +3583,18 @@ impl eframe::App for DiskWeaveApp {
         if let Some(kind) = self.locations_view.file_requested.take() {
             self.begin_file_action(kind, None);
         }
-        if !self.file_blocked()
+        self.navigation_shortcuts(ui.ctx());
+        let file_keys_enabled = !self.file_blocked()
             && !ui.ctx().egui_wants_keyboard_input()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && self.file_ui.dialog.is_none()
+            && !self.scan.is_running();
+        if file_keys_enabled
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2))
         {
             self.begin_file_action(crate::file_ui::Kind::Rename, None);
         }
-        if !self.file_blocked()
-            && !ui.ctx().egui_wants_keyboard_input()
+        if file_keys_enabled
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
         {
             self.begin_file_action(crate::file_ui::Kind::Recycle, None);
@@ -3240,6 +3645,69 @@ impl eframe::App for DiskWeaveApp {
 mod session_tests {
     use super::*;
     #[test]
+    fn navigation_api_restores_search_selection_and_scroll_without_persisting_paths() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("nested/deep")).unwrap();
+        std::fs::create_dir(fixture.0.join("other")).unwrap();
+        std::fs::write(fixture.0.join("nested/deep/find-me"), b"data").unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let ctx = egui::Context::default();
+        let limit = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.tick_background(&ctx);
+            assert!(std::time::Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        app.search.input.text = "find-me".into();
+        app.search.whole_scan = true;
+        app.tab = 3;
+        app.search.refresh(&source.scan, 0);
+        while app.search.job.results().is_none() {
+            app.search.poll();
+            assert!(std::time::Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        app.search.selection.click(0, false, false);
+        app.search.horizontal_offset = 12.0;
+        app.search.vertical_offset = 44.0;
+        app.analyze_at(source.id, source.generation, Item::File(0));
+        assert_eq!(
+            app.capture_navigation().unwrap().folder,
+            fixture.0.join("nested/deep")
+        );
+        app.history_move(false);
+        while app.search.job.results().is_none() {
+            app.search.poll();
+            assert!(std::time::Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let restored = app.capture_navigation().unwrap();
+        assert_eq!(restored.query.text, "find-me");
+        assert_eq!(restored.scroll, [12.0, 44.0]);
+        assert_eq!(restored.selected.len(), 1);
+        app.history_move(true);
+        assert_eq!(
+            app.capture_navigation().unwrap().folder,
+            fixture.0.join("nested/deep")
+        );
+        app.history_move(false);
+        let other = source
+            .scan
+            .folder_index(std::path::Path::new("other"))
+            .unwrap();
+        app.navigate(other, true);
+        app.history_move(true);
+        assert_eq!(
+            app.capture_navigation().unwrap().folder,
+            fixture.0.join("other")
+        );
+        let serialized = serde_json::to_string(&app.ui_preferences()).unwrap();
+        assert!(!serialized.contains("find-me"));
+        assert!(!serialized.contains(&fixture.0.display().to_string()));
+    }
+    #[test]
     fn a_new_app_starts_an_empty_general_session_and_does_not_restore_previous_results() {
         let app = DiskWeaveApp::new();
         assert!(app.active_locations().entries.is_empty());
@@ -3249,6 +3717,113 @@ mod session_tests {
         drop(app);
         let reopened = DiskWeaveApp::new();
         assert!(reopened.active_locations().entries.is_empty());
+    }
+
+    #[test]
+    fn viewport_frames_record_physical_position_and_keep_normal_bounds_when_maximized() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let path = fixture.0.join("preferences.json");
+        let mut app = DiskWeaveApp::new();
+        app.settings_path = Some(path.clone());
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        let viewport = raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.native_pixels_per_point = Some(1.5);
+        viewport.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(20.0, 30.0),
+            egui::vec2(900.0, 600.0),
+        ));
+        viewport.inner_rect = viewport.outer_rect;
+        let mut output = ctx.run_ui(raw.clone(), |ui| app.settings_frame(ui.ctx()));
+        output.textures_delta.clear();
+        let normal = app.window_state.clone().unwrap();
+        assert_eq!(normal.position, [30.0, 45.0]);
+        assert_eq!(normal.size, [900.0, 600.0]);
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .maximized = Some(true);
+        let mut output = ctx.run_ui(raw, |ui| app.settings_frame(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(app.window_state.as_ref().unwrap().position, normal.position);
+        assert!(app.window_state.as_ref().unwrap().maximized);
+        app.save_ui_settings();
+        assert_eq!(
+            crate::app_settings::load(&path).unwrap().ui.window,
+            app.window_state
+        );
+        assert!(app.scan.entries.is_empty());
+    }
+
+    #[test]
+    fn keyboard_dispatch_moves_history_and_rescans_only_after_text_focus_is_released() {
+        fn press(
+            app: &mut DiskWeaveApp,
+            ctx: &egui::Context,
+            key: egui::Key,
+            modifiers: egui::Modifiers,
+        ) {
+            let mut raw = egui::RawInput::default();
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            let mut output = ctx.run_ui(raw, |ui| {
+                let mut text = String::new();
+                ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::unique("scan_path")));
+                ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::unique("search_query")));
+                app.navigation_shortcuts(ui.ctx());
+            });
+            output.textures_delta.clear();
+        }
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::create_dir(fixture.0.join("child")).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let ctx = egui::Context::default();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        app.scan.start(fixture.0.clone()).unwrap();
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        app.sync_scan();
+        let source = app.source().unwrap();
+        let child = source
+            .scan
+            .folder_index(std::path::Path::new("child"))
+            .unwrap();
+        app.navigate(child, true);
+        press(&mut app, &ctx, egui::Key::ArrowUp, egui::Modifiers::ALT);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
+        press(&mut app, &ctx, egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), child);
+        press(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
+        press(&mut app, &ctx, egui::Key::L, egui::Modifiers::CTRL);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::unique("scan_path"))
+        );
+        press(&mut app, &ctx, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(!app.scan.is_running());
+        press(&mut app, &ctx, egui::Key::F, egui::Modifiers::CTRL);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::unique("search_query"))
+        );
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("search_query")));
+        press(&mut app, &ctx, egui::Key::F5, egui::Modifiers::NONE);
+        assert!(app.scan.is_running());
+        assert_eq!(app.target.path(), Some(fixture.0.as_path()));
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
     }
 
     #[test]

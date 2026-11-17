@@ -47,6 +47,7 @@ pub struct SearchView {
     pub show_modified: bool,
     pub widths: crate::presentation::ColumnWidths,
     pub horizontal_offset: f32,
+    pub vertical_offset: f32,
     pub input: SearchInput,
     pub whole_scan: bool,
     pub selection: ListSelection,
@@ -68,6 +69,7 @@ impl Default for SearchView {
             show_modified: true,
             widths: Default::default(),
             horizontal_offset: Default::default(),
+            vertical_offset: 0.0,
             input: Default::default(),
             whole_scan: Default::default(),
             selection: Default::default(),
@@ -81,6 +83,35 @@ impl Default for SearchView {
 }
 
 impl SearchView {
+    pub fn preferred_map_collapsed(&self, current: bool) -> bool {
+        self.presentation.map_or(current, |(map, _, _)| map)
+    }
+    pub fn restore(
+        &mut self,
+        scan: &Arc<ScanResult>,
+        folder: usize,
+        input: SearchInput,
+        whole: bool,
+        selected: Vec<Item>,
+        scroll: [f32; 2],
+    ) {
+        self.input = input;
+        self.whole_scan = whole;
+        self.invalidate();
+        self.refresh(scan, folder);
+        self.live_selection = Some((
+            self.input.clone(),
+            if whole { 0 } else { folder },
+            whole,
+            Arc::clone(scan),
+            selected
+                .into_iter()
+                .map(|i| crate::search::item_path(scan, i))
+                .collect(),
+        ));
+        self.horizontal_offset = scroll[0].max(0.0);
+        self.vertical_offset = scroll[1].max(0.0);
+    }
     /// 완료 결과 교체 시 탐색 위치와 검색 선택을 같은 세대로 재연결.
     pub fn replace_result(
         &mut self,
@@ -266,7 +297,7 @@ impl SearchView {
     }
     pub fn reset(&mut self) {
         self.invalidate();
-        self.input = SearchInput::default();
+        self.clear_conditions();
         self.whole_scan = false;
     }
     pub fn invalidate(&mut self) {
@@ -782,7 +813,8 @@ mod tests {
         assert!(view.analyze(&scan, &mut explorer));
         wait(&mut view);
         assert_eq!(explorer.folder(), parent);
-        assert_eq!(view.reveal_row, Some(2));
+        assert_eq!(view.reveal_row, Some(0));
+        assert!(!view.input.descending);
         assert_eq!(
             view.selection.single(&view.job.results().unwrap().items),
             Some(Item::File(file))
@@ -798,7 +830,8 @@ mod tests {
         wait(&mut view);
         assert!(view.job.results().unwrap().items.is_empty());
         view.reset();
-        assert_eq!(view.input, SearchInput::default());
+        assert!(view.input.text.is_empty());
+        assert!(!view.input.descending);
         assert_eq!(view.selection.count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }

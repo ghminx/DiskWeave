@@ -388,26 +388,31 @@ pub fn chevron(ui: &Ui, rect: egui::Rect, expanded: bool) {
 }
 
 /// 이전 방향을 나타내는 고정 크기 왼쪽 화살표 버튼 생성.
-pub fn back_button(ui: &mut Ui, enabled: bool) -> Response {
+pub fn navigation_button(ui: &mut Ui, enabled: bool, direction: i8) -> Response {
     let response = ui.add_enabled(
         enabled,
         egui::Button::new("").min_size(egui::vec2(34.0, 30.0)),
     );
     let c = response.rect.center();
     let stroke = egui::Stroke::new(1.8, if enabled { TEXT } else { SOFT });
-    ui.painter().line_segment(
-        [c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)],
-        stroke,
-    );
+    let point = |x: f32, y: f32| {
+        c + match direction {
+            1 => egui::vec2(-x, y),
+            0 => egui::vec2(-y, x),
+            _ => egui::vec2(x, y),
+        }
+    };
+    ui.painter()
+        .line_segment([point(-6.0, 0.0), point(6.0, 0.0)], stroke);
     ui.painter().add(egui::Shape::line(
-        vec![
-            c + egui::vec2(-1.0, -5.0),
-            c + egui::vec2(-6.0, 0.0),
-            c + egui::vec2(-1.0, 5.0),
-        ],
+        vec![point(-1.0, -5.0), point(-6.0, 0.0), point(-1.0, 5.0)],
         stroke,
     ));
-    response.on_hover_text("상위 폴더로 이동")
+    response.on_hover_text(match direction {
+        1 => "앞으로 (Alt+→)",
+        0 => "상위 폴더 (Alt+↑)",
+        _ => "뒤로 (Alt+←)",
+    })
 }
 
 /// 우클릭 메뉴의 항목 높이와 그룹 간격 통일.

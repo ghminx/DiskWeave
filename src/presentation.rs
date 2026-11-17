@@ -128,6 +128,17 @@ impl Default for ColumnWidths {
     }
 }
 impl ColumnWidths {
+    pub fn saved(&self) -> Option<[f32; 8]> {
+        self.manual
+            .then(|| std::array::from_fn(|i| self.values[i].clamp(80.0, 800.0)))
+    }
+    pub fn restore(&mut self, values: Option<[f32; 8]>) {
+        if let Some(values) = values {
+            for (i, v) in values.into_iter().enumerate() {
+                self.set(i, v);
+            }
+        }
+    }
     pub fn cells(
         &self,
         ui: &mut eframe::egui::Ui,

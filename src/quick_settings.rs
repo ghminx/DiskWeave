@@ -96,17 +96,7 @@ pub fn load(path: &Path) -> io::Result<Preferences> {
     Ok(p)
 }
 pub fn save(path: &Path, p: &Preferences) -> io::Result<()> {
-    p.validate()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("설정 폴더가 없습니다"))?;
-    std::fs::create_dir_all(parent)?;
-    crate::output::write(
-        path,
-        true,
-        || false,
-        |writer| serde_json::to_writer(writer, p).map_err(crate::output::json_error),
-    )
+    crate::app_settings::save_quick(path, *p)
 }
 #[cfg(test)]
 mod tests {

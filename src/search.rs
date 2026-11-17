@@ -19,7 +19,7 @@ pub struct SearchInput {
     pub sort: SortField,
     pub descending: bool,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortField {
     Name,
     Path,
