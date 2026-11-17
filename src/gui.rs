@@ -21,6 +21,9 @@ use std::time::Duration;
 
 #[derive(Default)]
 pub struct DiskWeaveApp {
+    quick: crate::quick_search::QuickSearch,
+    quick_ui: crate::quick_ui::QuickUi,
+    desktop: crate::quick_native::Desktop,
     link_details: crate::link_details::Controller,
     preview_view: crate::scanner::preview::View,
     preview_location: Option<u64>,
@@ -909,14 +912,205 @@ impl DiskWeaveApp {
         }
         ui.small("처음에는 기준 스캔을 수행하며 Windows 권한 승인이 필요합니다.");
         ui.small("큰 폴더나 쓰기 중인 파일은 반영이 늦어질 수 있습니다.");
-        ui.small("앱을 닫으면 자동 추적은 종료됩니다. 다음 실행에서는 다시 시작하세요.");
+        ui.small("완전 종료하면 추적이 끝납니다. 트레이 상주 중에는 계속 갱신합니다.");
     }
     pub fn new() -> Self {
         Self::default()
     }
+    fn document_tick(&mut self) {
+        if self.results.poll() {
+            match &self.results.job.view {
+                crate::documents::View::Saved(record) => {
+                    let scan = Locations::from_saved(record);
+                    let explorer = Some(Explorer::new(&record.scan));
+                    self.saved_viewer = Some(Box::new(Self {
+                        scan,
+                        explorer,
+                        archive_record: Some(Arc::clone(record)),
+                        ..Default::default()
+                    }));
+                }
+                crate::documents::View::Comparison(_) => self.saved_viewer = None,
+                crate::documents::View::Live => {}
+            }
+        }
+    }
+    pub fn tick_background(&mut self, ctx: &egui::Context) {
+        if self.archive_record.is_none() {
+            if self.scan.is_running() {
+                self.tracking.stop();
+                self.tracking.location = None;
+            }
+            self.sync_scan();
+            if let Some(model) = self.scan.preview() {
+                if self.preview_location != self.scan.selected_id() {
+                    self.preview_view = Default::default();
+                    self.preview_location = self.scan.selected_id();
+                }
+                self.preview_view.sync(model);
+            }
+            self.sync_tracking();
+            self.file_tick();
+            self.close_windows(ctx);
+            if self.scan.is_running()
+                || self.tracking.running()
+                || self.file_job.working()
+                || self.file_refresh.busy()
+            {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+        }
+        self.file_open.poll();
+        if self.quick_ui.opening {
+            match self.file_open.status() {
+                OpenStatus::Failed(error) => {
+                    self.quick_ui.error = Some(error.clone());
+                    self.quick.open();
+                    self.quick_ui.opening = false;
+                }
+                OpenStatus::Submitted => {
+                    self.quick.hide();
+                    self.quick_ui.opening = false;
+                }
+                _ => ctx.request_repaint_after(Duration::from_millis(30)),
+            }
+        }
+        self.document_tick();
+    }
+    fn show_main(&mut self, ctx: &egui::Context) {
+        self.desktop.life.show();
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+    fn quick_logic(&mut self, ctx: &egui::Context) {
+        for event in self.desktop.poll(ctx) {
+            match event {
+                crate::quick_native::Event::Toggle => self.quick.toggle(self.quick_ui.focused),
+                crate::quick_native::Event::Show => self.show_main(ctx),
+                crate::quick_native::Event::Settings => {
+                    self.quick.open();
+                    self.quick_ui.open_settings(self.desktop.applied);
+                }
+                crate::quick_native::Event::Exit => {
+                    self.desktop.life.exit = true;
+                    self.file_close_requested = true;
+                    self.show_main(ctx);
+                }
+                crate::quick_native::Event::Applied { error, .. } => {
+                    self.quick_ui.error = error;
+                    if self.desktop.life.hidden
+                        && (!self.desktop.applied.stay || !self.desktop.tray_ready)
+                    {
+                        self.show_main(ctx);
+                    }
+                }
+                crate::quick_native::Event::Tray { error, .. } => {
+                    if let Some(error) = error {
+                        self.quick_ui.error = Some(error);
+                    }
+                    if !self.desktop.tray_ready {
+                        self.show_main(ctx);
+                    }
+                }
+                crate::quick_native::Event::Notice(error) => {
+                    self.input_error = Some(error.clone());
+                    self.quick_ui.error = Some(error);
+                }
+                crate::quick_native::Event::Failed(error) => {
+                    self.input_error = Some(error.clone());
+                    self.quick_ui.error = Some(error);
+                    self.show_main(ctx);
+                }
+            }
+        }
+        self.quick_ui.pending = self.desktop.busy;
+        self.quick.tick(&self.scan, std::time::Instant::now());
+        if self.quick.visible {
+            if self.desktop.life.hidden && self.quick.focus {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            }
+            if self.quick.pending() || self.quick_ui.opening || self.desktop.busy {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+        let busy = self.scan.is_running()
+            || self.tracking.running()
+            || self.file_job.working()
+            || self.file_refresh.busy()
+            || matches!(self.file_open.status(), OpenStatus::Running)
+            || self.results.busy()
+            || self.file_close_requested;
+        if let Err(e) = self.desktop.heartbeat(self.desktop.life.hidden && busy) {
+            self.quick_ui.error = Some(e.to_string());
+            self.show_main(ctx);
+        }
+    }
+    fn quick_window(&mut self, ctx: &egui::Context) {
+        let action = self
+            .quick_ui
+            .show(ctx, &mut self.quick, &self.scan, self.desktop.applied);
+        if let Some(action) = action {
+            let result = (|| -> std::io::Result<()> {
+                match action {
+                    crate::quick_ui::Action::ShowMain => {
+                        self.show_main(ctx);
+                        self.quick.hide();
+                    }
+                    crate::quick_ui::Action::Apply(p) => self.desktop.apply(ctx, p)?,
+                    crate::quick_ui::Action::Analyze((id, generation, item)) => {
+                        self.results.job.back();
+                        self.saved_viewer = None;
+                        self.analyze_at(id, generation, item);
+                        self.show_main(ctx);
+                        self.quick.hide();
+                    }
+                    crate::quick_ui::Action::Open(target, action) => {
+                        let (id, generation, item) = target;
+                        let entry = self
+                            .scan
+                            .get(id)
+                            .filter(|e| !e.stale && e.generation == generation)
+                            .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다"))?;
+                        let scan = &entry.scan.completed().unwrap().result;
+                        let request = OpenRequest::for_item(scan, item, action);
+                        self.file_open.start(request)?;
+                        self.quick_ui.opening = true;
+                    }
+                    crate::quick_ui::Action::Copy((id, generation, item)) => {
+                        let entry = self
+                            .scan
+                            .get(id)
+                            .filter(|e| !e.stale && e.generation == generation)
+                            .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다"))?;
+                        let path =
+                            crate::search::item_path(&entry.scan.completed().unwrap().result, item);
+                        crate::path_copy::copy_with(&[path], |text| {
+                            ctx.copy_text(text);
+                            Ok(())
+                        })?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.quick_ui.error = Some(e.to_string());
+            }
+        }
+    }
     fn close_windows(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested()) || self.file_close_requested;
         if !requested {
+            return;
+        }
+        if !self.file_close_requested
+            && self
+                .desktop
+                .life
+                .close(self.desktop.applied.stay, self.desktop.tray_ready)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.quick.hide();
             return;
         }
         self.file_close_requested = true;
@@ -1346,6 +1540,9 @@ impl DiskWeaveApp {
                 if crate::ui_style::title_control(ui, "최소화").clicked() {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                if self.archive_record.is_none() && ui.button("빠른 검색").clicked() {
+                    self.quick.open();
                 }
                 if self.archive_record.is_some() {
                     ui.small("조회 전용");
@@ -2523,7 +2720,16 @@ impl eframe::App for DiskWeaveApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.tracking.stop();
     }
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.archive_record.is_none() {
+            self.quick_logic(ctx);
+            self.tick_background(ctx);
+        }
+    }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.archive_record.is_none() {
+            self.quick_window(ui.ctx());
+        }
         let key = self
             .selection_target()
             .and_then(|(source, generation, item)| {
@@ -2550,45 +2756,8 @@ impl eframe::App for DiskWeaveApp {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
 
-        if self.archive_record.is_none() {
-            if self.scan.is_running() {
-                self.tracking.stop();
-                self.tracking.location = None;
-            }
-            self.sync_scan();
-            if let Some(model) = self.scan.preview() {
-                if self.preview_location != self.scan.selected_id() {
-                    self.preview_view = Default::default();
-                    self.preview_location = self.scan.selected_id();
-                }
-                self.preview_view.sync(model);
-            }
-            self.sync_tracking();
-            self.file_tick();
-            self.close_windows(ui.ctx());
-            if self.scan.is_running()
-                || self.tracking.running()
-                || self.file_job.working()
-                || self.file_refresh.busy()
-            {
-                ui.ctx().request_repaint_after(Duration::from_millis(30));
-            }
-        }
-        if self.results.poll() {
-            match &self.results.job.view {
-                crate::documents::View::Saved(record) => {
-                    let scan = Locations::from_saved(record);
-                    let explorer = Some(Explorer::new(&record.scan));
-                    self.saved_viewer = Some(Box::new(Self {
-                        scan,
-                        explorer,
-                        archive_record: Some(Arc::clone(record)),
-                        ..Default::default()
-                    }));
-                }
-                crate::documents::View::Comparison(_) => self.saved_viewer = None,
-                crate::documents::View::Live => {}
-            }
+        if self.archive_record.is_some() {
+            self.document_tick();
         }
         if let crate::documents::View::Comparison(report) = &self.results.job.view {
             let report = Arc::clone(report);
@@ -2630,8 +2799,8 @@ impl eframe::App for DiskWeaveApp {
                 self.map_collapsed = true;
             }
         }
-        self.file_open.poll();
         if self.archive_record.is_some() {
+            self.file_open.poll();
             self.sync_scan();
         }
         let dropped: Vec<_> = ui.ctx().input(|i| {
@@ -3012,5 +3181,83 @@ mod session_tests {
         drop(app);
         let reopened = DiskWeaveApp::new();
         assert!(reopened.active_locations().entries.is_empty());
+    }
+
+    #[test]
+    fn quick_search_reports_shell_failure_and_routes_analysis_to_its_source() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-quick-routing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.bin");
+        std::fs::write(&path, [1, 2, 3]).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let id = app.scan.add(&root).unwrap();
+        app.scan.start_selected(&[id]).unwrap();
+        let ctx = egui::Context::default();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.tick_background(&ctx);
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let source = app.scan.snapshots().pop().unwrap();
+        app.analyze_at(id, source.generation, Item::File(0));
+        assert_eq!(app.scan.selected_id(), Some(id));
+        assert_eq!(
+            app.detail_target,
+            Some((id, source.generation, Item::File(0)))
+        );
+        let request = OpenRequest::for_item(&source.scan, Item::File(0), OpenAction::OpenFile);
+        app.file_open
+            .start_with(request, move |r| {
+                assert_eq!(r.path(), path);
+                Err(std::io::Error::other("시험 Shell 실패"))
+            })
+            .unwrap();
+        app.quick_ui.opening = true;
+        while matches!(app.file_open.status(), OpenStatus::Running) {
+            app.tick_background(&ctx);
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert!(app.quick.visible);
+        assert!(app.quick_ui.error.is_some());
+        assert!(!app.quick_ui.opening);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hidden_main_keeps_scanning_and_explicit_exit_preserves_last_complete_result() {
+        let root = std::env::temp_dir().join(format!("diskweave-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sample.bin"), [1; 16]).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let id = app.scan.add(&root).unwrap();
+        app.scan.start_selected(&[id]).unwrap();
+        app.desktop.initialized = true;
+        app.desktop.life.hidden = true;
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.tick_background(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let result = app.scan.snapshots().pop().unwrap();
+        assert_eq!(result.scan.files.len(), 1);
+        app.scan.start_selected(&[id]).unwrap();
+        app.desktop.life.exit = true;
+        app.file_close_requested = true;
+        while app.scan.is_running() {
+            app.tick_background(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let retained = app.scan.snapshots().pop().unwrap();
+        assert_eq!(retained.scan.files.len(), 1);
+        assert!(app.desktop.life.exit);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
