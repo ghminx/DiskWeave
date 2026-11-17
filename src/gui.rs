@@ -21,6 +21,8 @@ use std::time::Duration;
 
 #[derive(Default)]
 pub struct DiskWeaveApp {
+    duplicates: crate::duplicate_job::Controller,
+    duplicate_view: crate::duplicate_ui::DuplicateUi,
     quick: crate::quick_search::QuickSearch,
     quick_ui: crate::quick_ui::QuickUi,
     desktop: crate::quick_native::Desktop,
@@ -524,7 +526,9 @@ impl DiskWeaveApp {
         ui.small("파일 목록·통계·할당 크기·공간 지도는 스캔 완료 후 확인할 수 있습니다.");
     }
     fn file_blocked(&self) -> bool {
-        self.file_ui.blocked(&self.file_job) || self.file_refresh.busy()
+        self.file_ui.blocked(&self.file_job)
+            || self.file_refresh.busy()
+            || self.duplicates.running()
     }
     fn copy_selection_paths(&self) -> Vec<PathBuf> {
         if self.locations_view.global_mode {
@@ -591,6 +595,8 @@ impl DiskWeaveApp {
             }
         }
         let mut writable = self.archive_record.is_none()
+            && self.tab != 4
+            && !self.duplicates.running()
             && !self.scan.is_running()
             && !self.file_job.busy()
             && !self.file_refresh.busy()
@@ -951,8 +957,10 @@ impl DiskWeaveApp {
             }
             self.sync_tracking();
             self.file_tick();
+            self.duplicates.poll(&self.scan.snapshots());
             self.close_windows(ctx);
             if self.scan.is_running()
+                || self.duplicates.running()
                 || self.tracking.running()
                 || self.file_job.working()
                 || self.file_refresh.busy()
@@ -1038,6 +1046,7 @@ impl DiskWeaveApp {
             }
         }
         let busy = self.scan.is_running()
+            || self.duplicates.running()
             || self.tracking.running()
             || self.file_job.working()
             || self.file_refresh.busy()
@@ -1124,6 +1133,7 @@ impl DiskWeaveApp {
         }
         self.file_close_requested = true;
         self.file_job.cancel();
+        self.duplicates.cancel();
         self.file_ui.dialog = None;
         self.file_refresh.cancel(&mut self.scan);
         self.scan.cancel();
@@ -1132,6 +1142,7 @@ impl DiskWeaveApp {
             self.results.job.cancel();
         }
         if self.file_job.working()
+            || self.duplicates.running()
             || self.scan.is_running()
             || self.file_refresh.busy()
             || self.results.busy()
@@ -1434,6 +1445,16 @@ impl DiskWeaveApp {
         self.map.poll();
     }
     fn status(&self) -> String {
+        if self.duplicates.running() {
+            let progress = self.duplicates.progress();
+            return format!(
+                "중복 파일 검사 · {} · 확인 {}개 · 읽은 용량 {} · {:.1}초",
+                progress.stage,
+                progress.files,
+                SizeDisplay::new(progress.bytes).text,
+                self.duplicates.elapsed()
+            );
+        }
         if self.file_job.working() {
             return format!(
                 "{} · {:.1}초",
@@ -2209,6 +2230,7 @@ impl DiskWeaveApp {
                                 (3, "검색 결과"),
                                 (1, "대용량 파일"),
                                 (2, "확장자"),
+                                (4, "중복 파일"),
                             ] {
                                 if tab == 3 && !self.search.input.is_active() {
                                     continue;
@@ -2256,6 +2278,37 @@ impl DiskWeaveApp {
                         });
                     });
             });
+        if self.tab == 4 {
+            let sources = self.scan.snapshots();
+            let context = crate::duplicate_ui::Context {
+                excluded: self.scan.entries.len().saturating_sub(sources.len()),
+                sources,
+                selected: self.scan.selected_id(),
+                folder: self.explorer.as_ref().map(Explorer::folder),
+                blocked: self.scan.is_running()
+                    || self.file_ui.blocked(&self.file_job)
+                    || self.file_refresh.busy()
+                    || self.results.busy()
+                    || self.tracking.running(),
+                archived: self.archive_record.is_some(),
+            };
+            let (open, analyze) = egui::Frame::new()
+                .inner_margin(12)
+                .show(ui, |ui| {
+                    self.duplicate_view.show(ui, &mut self.duplicates, &context)
+                })
+                .inner;
+            if let Some(target) = self.duplicate_view.picked {
+                self.detail_target = Some(target);
+            }
+            if let Some(open) = open {
+                self.start_open(open);
+            }
+            if let Some((id, generation, item)) = analyze {
+                self.analyze_at(id, generation, item);
+            }
+            return;
+        }
         if matches!(self.tab, 1 | 2) {
             self.statistics.large_files = self.tab == 1;
             if self.tab == 1 {
@@ -2837,6 +2890,10 @@ impl eframe::App for DiskWeaveApp {
             self.map_height,
             self.map_collapsed || self.show_preview(),
         );
+        if self.tab == 4 {
+            panels.body += panels.map;
+            panels.map = 0.0;
+        }
         if self.archive_record.is_some() {
             panels.body += panels.target - 48.0;
             panels.target = 48.0;
@@ -3023,16 +3080,18 @@ impl eframe::App for DiskWeaveApp {
                     }
                 });
             });
-        egui::Panel::bottom("map")
-            .exact_size(panels.map)
-            .frame(egui::Frame::new().fill(surface()).inner_margin(
-                if self.map_collapsed || self.show_preview() {
-                    4
-                } else {
-                    8
-                },
-            ))
-            .show(ui, |ui| self.map_panel(ui));
+        if self.tab != 4 {
+            egui::Panel::bottom("map")
+                .exact_size(panels.map)
+                .frame(egui::Frame::new().fill(surface()).inner_margin(
+                    if self.map_collapsed || self.show_preview() {
+                        4
+                    } else {
+                        8
+                    },
+                ))
+                .show(ui, |ui| self.map_panel(ui));
+        }
         egui::Panel::left("tree")
             .exact_size(panels.left)
             .resizable(false)
