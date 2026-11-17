@@ -256,10 +256,13 @@ mod native {
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     };
     const CONTROL: u32 = WM_APP + 31;
-    const TRAY: u32 = WM_APP + 32;
+    pub(super) const TRAY: u32 = WM_APP + 32;
+    const QUEUED_TRAY: u32 = WM_APP + 33;
+    const RECOVER_TRAY: u32 = WM_APP + 34;
     struct Wake {
         events: mpsc::Sender<Event>,
         ctx: eframe::egui::Context,
+        taskbar: u32,
     }
     unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Wake;
@@ -271,6 +274,21 @@ mod native {
         }
         if !pointer.is_null() {
             let state = unsafe { &*pointer };
+            // 직접 전달된 Shell 알림도 메시지 루프에서 한 번만 처리하도록 큐에 전달
+            if msg == TRAY || msg == state.taskbar {
+                let queued = if msg == TRAY {
+                    QUEUED_TRAY
+                } else {
+                    RECOVER_TRAY
+                };
+                if unsafe { PostMessageW(hwnd, queued, w, l) } == 0 {
+                    let _ = state
+                        .events
+                        .send(Event::Failed(io::Error::last_os_error().to_string()));
+                    state.ctx.request_repaint();
+                }
+                return 0;
+            }
             if msg == WM_HOTKEY {
                 let _ = state.events.send(Event::Toggle);
                 state.ctx.request_repaint();
@@ -428,6 +446,10 @@ mod native {
         ready: mpsc::SyncSender<io::Result<isize>>,
     ) -> io::Result<()> {
         unsafe {
+            let taskbar = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
+            if taskbar == 0 {
+                return Err(io::Error::last_os_error());
+            }
             let class = wide("DiskWeaveQuickSearchHost");
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(procedure),
@@ -462,10 +484,10 @@ mod native {
             let wake = Box::new(Wake {
                 events: events.clone(),
                 ctx: ctx.clone(),
+                taskbar,
             });
             // 콜백 포인터는 Windows 소유 창을 파괴할 때까지 같은 주소로 유지
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*wake as *const Wake) as isize);
-            let taskbar = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
             let mut os = Windows {
                 hwnd,
                 icon: null_mut(),
@@ -505,7 +527,7 @@ mod native {
                         Err(io::Error::last_os_error())
                     };
                 }
-                if taskbar != 0 && message.message == taskbar && registration.applied.stay {
+                if message.message == RECOVER_TRAY && registration.applied.stay {
                     registration.tray_ready = false;
                     let error = registration
                         .apply(registration.applied, &mut os)
@@ -517,7 +539,7 @@ mod native {
                     });
                     ctx.request_repaint();
                 }
-                if message.message == TRAY {
+                if message.message == QUEUED_TRAY {
                     let event = match message.lParam as u32 {
                         WM_RBUTTONUP => menu(hwnd),
                         WM_LBUTTONDBLCLK => Some(Event::Show),
@@ -537,6 +559,66 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sent_tray_double_click_reaches_the_main_window_event() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_LBUTTONDBLCLK};
+        let host = Host::start(eframe::egui::Context::default()).unwrap();
+        unsafe {
+            SendMessageW(host.hwnd as _, native::TRAY, 1, WM_LBUTTONDBLCLK as isize);
+        }
+        assert!(matches!(
+            host.events.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Event::Show)
+        ));
+        use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+        unsafe {
+            PostMessageW(host.hwnd as _, native::TRAY, 1, WM_LBUTTONDBLCLK as isize);
+        }
+        assert!(matches!(
+            host.events.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Event::Show)
+        ));
+        assert!(host.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn sent_taskbar_recreation_restores_only_the_owned_tray_icon() {
+        use windows_sys::Win32::UI::{Shell::*, WindowsAndMessaging::*};
+        let host = Host::start(eframe::egui::Context::default()).unwrap();
+        host.apply(Preferences {
+            stay: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            host.events.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Event::Applied {
+                tray_ready: true,
+                error: None,
+                ..
+            })
+        ));
+        let icon = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: host.hwnd as _,
+            uID: 1,
+            ..Default::default()
+        };
+        unsafe {
+            assert_ne!(Shell_NotifyIconW(NIM_DELETE, &icon), 0);
+            let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain(Some(0)).collect();
+            let message = RegisterWindowMessageW(name.as_ptr());
+            assert_ne!(message, 0);
+            SendMessageW(host.hwnd as _, message, 0, 0);
+        }
+        assert!(matches!(
+            host.events.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(Event::Tray {
+                ready: true,
+                error: None
+            })
+        ));
+    }
     #[derive(Default)]
     struct Adapter {
         keys: std::collections::HashMap<i32, Shortcut>,

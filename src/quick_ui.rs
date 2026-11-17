@@ -66,15 +66,26 @@ impl QuickUi {
         quick: &mut QuickSearch,
         locations: &Locations,
         applied: Preferences,
+        keep_alive: bool,
     ) -> Option<Action> {
         if !quick.visible {
             self.seen_focus = false;
-            return None;
+            if !keep_alive {
+                return None;
+            }
         }
         let mut action = None;
         let initial = Layout::new(720.0, 460.0);
+        let shown = quick.visible;
         let draw = |root: &mut egui::Ui, _: egui::ViewportClass| {
+            if !quick.visible {
+                return;
+            }
             let ctx = root.ctx().clone();
+            if quick.focus {
+                self.seen_focus = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
             self.focused = focused;
             if focused {
@@ -89,10 +100,6 @@ impl QuickUi {
                 self.seen_focus = false;
                 ctx.request_repaint();
                 return;
-            }
-            if quick.focus {
-                self.seen_focus = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             egui::CentralPanel::default()
                 .frame(
@@ -405,6 +412,8 @@ impl QuickUi {
             egui::ViewportId::from_hash_of("quick_search"),
             egui::ViewportBuilder::default()
                 .with_title("DiskWeave · 빠른 검색")
+                .with_visible(shown)
+                .with_active(false)
                 .with_inner_size([initial.width, initial.height])
                 .with_min_inner_size([480.0, 320.0]),
             draw,
@@ -415,6 +424,55 @@ impl QuickUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reopening_requests_focus_before_dismissing_for_old_focus_state() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(true);
+        let mut ui = QuickUi::default();
+        let mut quick = QuickSearch::default();
+        let locations = Locations::default();
+        quick.open();
+        for focused in [true, true] {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .focused = Some(focused);
+            let mut output = ctx.run_ui(input, |root| {
+                ui.show(
+                    root.ctx(),
+                    &mut quick,
+                    &locations,
+                    Preferences::default(),
+                    false,
+                );
+            });
+            output.textures_delta.clear();
+        }
+        quick.hide();
+        quick.open();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        let mut output = ctx.run_ui(input, |root| {
+            ui.show(
+                root.ctx(),
+                &mut quick,
+                &locations,
+                Preferences::default(),
+                false,
+            );
+        });
+        output.textures_delta.clear();
+        assert!(
+            quick.visible,
+            "재호출 시 이전 포커스 상태로 즉시 숨기지 않음"
+        );
+    }
     #[test]
     fn compact_search_layout_keeps_readable_rows() {
         for (w, h) in [

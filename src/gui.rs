@@ -979,6 +979,10 @@ impl DiskWeaveApp {
     }
     fn show_main(&mut self, ctx: &egui::Context) {
         self.desktop.life.show();
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
     }
@@ -1026,7 +1030,7 @@ impl DiskWeaveApp {
         self.quick_ui.pending = self.desktop.busy;
         self.quick.tick(&self.scan, std::time::Instant::now());
         if self.quick.visible {
-            if self.desktop.life.hidden && self.quick.focus {
+            if self.quick.focus {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
             }
             if self.quick.pending() || self.quick_ui.opening || self.desktop.busy {
@@ -1046,9 +1050,14 @@ impl DiskWeaveApp {
         }
     }
     fn quick_window(&mut self, ctx: &egui::Context) {
-        let action = self
-            .quick_ui
-            .show(ctx, &mut self.quick, &self.scan, self.desktop.applied);
+        // eframe 0.37의 숨긴 루트 렌더링에서 새 즉시 창 생성 시 패닉 방지를 위해 상주 중 창 유지
+        let action = self.quick_ui.show(
+            ctx,
+            &mut self.quick,
+            &self.scan,
+            self.desktop.applied,
+            self.desktop.applied.enabled || (self.desktop.applied.stay && self.desktop.tray_ready),
+        );
         if let Some(action) = action {
             let result = (|| -> std::io::Result<()> {
                 match action {
