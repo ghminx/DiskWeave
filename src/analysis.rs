@@ -26,6 +26,75 @@ pub struct Statistics {
     top: Vec<Hit>,
 }
 impl Statistics {
+    pub(crate) fn patch_local(
+        &mut self,
+        previous: &Snapshot,
+        current: &Snapshot,
+        folder: usize,
+    ) -> bool {
+        let Some(items) = current.scan.stable_changes_from(&previous.scan) else {
+            return false;
+        };
+        let root = &current.scan.folders[folder];
+        let files: Vec<_> = items
+            .iter()
+            .filter_map(|&item| {
+                let Item::File(row) = item else { return None };
+                let (old, new) = (&previous.scan.files[row], &current.scan.files[row]);
+                current.scan.folders[new.parent]
+                    .path
+                    .starts_with(&root.path)
+                    .then_some((item, old, new))
+            })
+            .collect();
+        // 할당량과 식별자가 유지되는 경우에만 Hard Link 집계 재사용.
+        if files.iter().any(|&(item, old, new)| {
+            old.extra.allocation != new.extra.allocation
+                || old.extra.identity != new.extra.identity
+                || (self.files > self.top.len() as u64
+                    && new.logical_bytes < old.logical_bytes
+                    && self.top.iter().any(|hit| hit.item == item))
+        }) {
+            return false;
+        }
+        let mut groups: HashMap<_, _> = self
+            .extensions
+            .iter()
+            .map(|g| (g.name.clone(), g.bytes))
+            .collect();
+        for &(_, old, _) in &files {
+            let Some(bytes) = groups.get_mut(&extension(&old.name)) else {
+                return false;
+            };
+            let Some(value) = bytes.checked_sub(old.logical_bytes) else {
+                return false;
+            };
+            *bytes = value;
+        }
+        for &(item, _, new) in &files {
+            *groups.get_mut(&extension(&new.name)).unwrap() += new.logical_bytes;
+            if !self.top.iter().any(|hit| hit.item == item) {
+                self.top.push(Hit { source: 0, item });
+            }
+        }
+        self.bytes = root.logical_bytes;
+        for group in &mut self.extensions {
+            group.bytes = groups[&group.name];
+        }
+        self.extensions
+            .sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+        self.top.sort_unstable_by(|a, b| {
+            crate::search::item_bytes(&current.scan, b.item)
+                .cmp(&crate::search::item_bytes(&current.scan, a.item))
+                .then_with(|| {
+                    crate::search::item_path(&current.scan, a.item)
+                        .cmp(&crate::search::item_path(&current.scan, b.item))
+                })
+        });
+        self.top.truncate(100);
+        true
+    }
+
     pub fn top(&self, count: usize) -> &[Hit] {
         &self.top[..count.min(self.top.len())]
     }
@@ -119,7 +188,7 @@ pub fn compute(
                 if cancelled() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "통계 취소"));
                 }
-                for &id in &scan.file_children[folder] {
+                for &id in scan.file_children[folder].iter() {
                     add(0, id)?;
                 }
                 pending.extend(scan.children[folder].iter().copied());

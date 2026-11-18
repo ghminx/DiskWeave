@@ -252,6 +252,7 @@ fn baseline(count: usize, width: usize) -> io::Result<SavedScan> {
     let root = PathBuf::from("C:\\DiskWeaveSynthetic");
     let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
     let mut scan = ScanResult {
+        partial: None,
         detailed: true,
         folders: vec![Folder {
             access: Default::default(),

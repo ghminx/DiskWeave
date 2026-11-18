@@ -1,7 +1,7 @@
 use crate::scanner::ScanResult;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Item {
     Folder(usize),
     File(usize),

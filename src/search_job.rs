@@ -18,6 +18,7 @@ struct Request {
     scan: Arc<ScanResult>,
     input: SearchInput,
     scope: usize,
+    previous: Option<(Arc<ScanResult>, SearchResults)>,
 }
 
 #[derive(Default)]
@@ -31,12 +32,34 @@ pub struct SearchController {
 
 impl SearchController {
     pub fn submit(&mut self, scan: Arc<ScanResult>, input: SearchInput, scope: usize) {
+        self.submit_with_previous(scan, input, scope, None);
+    }
+
+    pub(crate) fn submit_update(
+        &mut self,
+        scan: Arc<ScanResult>,
+        input: SearchInput,
+        scope: usize,
+        previous: Arc<ScanResult>,
+    ) {
+        let previous = self.results.take().map(|results| (previous, results));
+        self.submit_with_previous(scan, input, scope, previous);
+    }
+
+    fn submit_with_previous(
+        &mut self,
+        scan: Arc<ScanResult>,
+        input: SearchInput,
+        scope: usize,
+        previous: Option<(Arc<ScanResult>, SearchResults)>,
+    ) {
         let id = self.latest.fetch_add(1, Ordering::Relaxed) + 1;
         self.pending = Some(Request {
             id,
             scan,
             input,
             scope,
+            previous,
         });
         self.results = None;
         self.status = SearchStatus::Running;
@@ -54,9 +77,19 @@ impl SearchController {
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = request.input.compile(request.scope).and_then(|query| {
-                search(&request.scan, &query, || {
-                    latest.load(Ordering::Relaxed) != request.id
-                })
+                let cancelled = || latest.load(Ordering::Relaxed) != request.id;
+                if let Some((previous, results)) = request.previous {
+                    if let Some(results) = crate::search::refresh_matches(
+                        &previous,
+                        &request.scan,
+                        &query,
+                        results,
+                        cancelled,
+                    )? {
+                        return Ok(results);
+                    }
+                }
+                search(&request.scan, &query, cancelled)
             });
             let _ = sender.send((request.id, result));
         });

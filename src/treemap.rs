@@ -20,6 +20,70 @@ pub struct MapData {
     pub zero_count: usize,
     pub tiles: Vec<Tile>,
 }
+impl MapData {
+    pub(crate) fn patch_local(
+        &mut self,
+        previous: &Snapshot,
+        current: &Snapshot,
+        folder: usize,
+    ) -> bool {
+        let Some(items) = current.scan.stable_changes_from(&previous.scan) else {
+            return false;
+        };
+        if self.tiles.iter().any(|tile| tile.target.is_none()) {
+            return false;
+        }
+        let mut changes = std::collections::HashMap::new();
+        let mut zero_count = self.zero_count;
+        let mut count = self.tiles.len();
+        for &item in items {
+            let parent = match item {
+                Item::Folder(row) => current.scan.folders[row].parent,
+                Item::File(row) => Some(current.scan.files[row].parent),
+            };
+            if parent != Some(folder) {
+                continue;
+            }
+            let old = crate::search::item_bytes(&previous.scan, item);
+            let new = crate::search::item_bytes(&current.scan, item);
+            match (old == 0, new == 0) {
+                (true, false) => {
+                    zero_count -= 1;
+                    count += 1;
+                }
+                (false, true) => {
+                    zero_count += 1;
+                    count -= 1;
+                }
+                _ => {}
+            }
+            changes.insert(item, new);
+        }
+        if count > 2000 {
+            return false;
+        }
+        self.tiles
+            .retain(|tile| !changes.contains_key(&tile.target.unwrap().item));
+        self.tiles
+            .extend(changes.into_iter().filter_map(|(item, bytes)| {
+                (bytes != 0).then_some(Tile {
+                    target: Some(Hit { source: 0, item }),
+                    bytes,
+                    count: 1,
+                })
+            }));
+        self.tiles.sort_unstable_by_key(|tile| {
+            let (kind, row) = match tile.target.unwrap().item {
+                Item::Folder(row) => (0, row),
+                Item::File(row) => (1, row),
+            };
+            (Reverse(tile.bytes), kind, row)
+        });
+        self.zero_count = zero_count;
+        self.total = current.scan.folders[folder].logical_bytes;
+        true
+    }
+}
 pub struct Rect {
     pub x: f64,
     pub y: f64,
@@ -67,13 +131,13 @@ pub fn collect(
                     "지도 폴더 범위 오류",
                 ));
             }
-            for &id in &sources[0].scan.children[*folder] {
+            for &id in sources[0].scan.children[*folder].iter() {
                 add(Hit {
                     source: 0,
                     item: Item::Folder(id),
                 })?;
             }
-            for &id in &sources[0].scan.file_children[*folder] {
+            for &id in sources[0].scan.file_children[*folder].iter() {
                 add(Hit {
                     source: 0,
                     item: Item::File(id),

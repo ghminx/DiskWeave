@@ -15,6 +15,28 @@ pub struct PanelKey {
     pub folder: Option<usize>,
     pub query: Option<SearchInput>,
 }
+impl PanelKey {
+    pub(crate) fn same_local_source(&self, previous: &Snapshot, current: &Snapshot) -> bool {
+        self.query.is_none()
+            && self.folder.is_some()
+            && self.versions.as_slice() == [(previous.id, previous.generation)]
+            && current.id == previous.id
+    }
+
+    pub(crate) fn reuse_local(&mut self, sources: &mut [Snapshot], current: &Snapshot) -> bool {
+        let (Some(folder), [previous]) = (self.folder, sources) else {
+            return false;
+        };
+        if !self.same_local_source(previous, current)
+            || !current.scan.subtree_unchanged_from(&previous.scan, folder)
+        {
+            return false;
+        }
+        self.versions[0].1 = current.generation;
+        *previous = current.clone();
+        true
+    }
+}
 pub struct Output {
     pub sources: Vec<Snapshot>,
     pub stats: Statistics,
@@ -57,6 +79,26 @@ impl Default for AnalysisPanel {
     }
 }
 impl AnalysisPanel {
+    pub(crate) fn reuse_local(&mut self, current: &Snapshot) {
+        if let (Some(key), Some(output)) = (&mut self.key, &mut self.output) {
+            if key.reuse_local(&mut output.sources, current) {
+                self.picked = None;
+                return;
+            }
+            if let [previous] = &mut output.sources[..] {
+                if key.same_local_source(previous, current)
+                    && output
+                        .stats
+                        .patch_local(previous, current, key.folder.unwrap())
+                {
+                    key.versions[0].1 = current.generation;
+                    *previous = current.clone();
+                    self.picked = None;
+                    self.selected = None;
+                }
+            }
+        }
+    }
     pub fn needs(&self, key: &PanelKey) -> bool {
         self.key.as_ref() != Some(key)
     }

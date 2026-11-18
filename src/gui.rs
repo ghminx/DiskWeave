@@ -726,6 +726,13 @@ impl DiskWeaveApp {
         self.detail_context = None;
     }
 
+    fn reuse_local_panels(&mut self, source: &Snapshot) {
+        if !self.locations_view.global_mode {
+            self.statistics.reuse_local(source);
+            self.map.reuse_local(source);
+        }
+    }
+
     fn sync_tracking(&mut self) {
         let Some(id) = self.tracking.location else {
             return;
@@ -755,6 +762,9 @@ impl DiskWeaveApp {
                                 &record.scan,
                                 identities,
                             );
+                            if let Some(source) = self.source() {
+                                self.reuse_local_panels(&source);
+                            }
                         }
                     })
                 }
@@ -3642,6 +3652,80 @@ impl eframe::App for DiskWeaveApp {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    #[test]
+    fn unrelated_live_edit_preserves_completed_local_search_statistics_and_map() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::write(fixture.0.join("sample.bin"), [1, 2, 3]).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let id = app.scan.add(&fixture.0).unwrap();
+        app.scan.start_selected(&[id]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.search.input.text = "sample".into();
+        while app.search.job.results().is_none()
+            || app.statistics.output.is_none()
+            || app.map.output.is_none()
+        {
+            app.refresh_derived();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let old = app.source().unwrap();
+        let revision = app.map.revision;
+        let mut next = (*old.scan).clone();
+        next.partial = Some(Arc::new(crate::scanner::PartialUpdate {
+            previous: Arc::downgrade(&old.scan),
+            affected: Default::default(),
+            search: None,
+        }));
+        let next = Arc::new(next);
+        app.replace_live_result(Some(&old.scan), &next, None);
+        let current = Snapshot {
+            generation: old.generation + 1,
+            scan: next,
+            ..old
+        };
+        app.reuse_local_panels(&current);
+        assert!(app.search.job.results().is_some());
+        assert_eq!(app.map.revision, revision);
+        assert_eq!(
+            app.map.output.as_ref().unwrap().sources[0].generation,
+            current.generation
+        );
+        assert_eq!(
+            app.statistics.output.as_ref().unwrap().sources[0].generation,
+            current.generation
+        );
+        let mut resized = (*current.scan).clone();
+        resized.files[0].logical_bytes = 9;
+        resized.folders[0].logical_bytes = 9;
+        resized.partial = Some(Arc::new(crate::scanner::PartialUpdate {
+            previous: Arc::downgrade(&current.scan),
+            affected: [0].into(),
+            search: Some(crate::scanner::SearchDelta {
+                before: vec![Item::File(0)],
+                after: vec![Item::File(0)],
+                file_rows: None,
+            }),
+        }));
+        let resized = Snapshot {
+            generation: current.generation + 1,
+            scan: Arc::new(resized),
+            ..current
+        };
+        app.reuse_local_panels(&resized);
+        let stats = app.statistics.output.as_ref().unwrap();
+        let map = app.map.output.as_ref().unwrap();
+        assert_eq!(stats.stats.bytes, 9);
+        assert_eq!(stats.sources[0].generation, resized.generation);
+        assert_eq!(map.data.total, 9);
+        assert_eq!(map.sources[0].generation, resized.generation);
+    }
+
     #[test]
     fn navigation_api_restores_search_selection_and_scroll_without_persisting_paths() {
         let fixture = crate::duplicates::tests::Fixture::new();

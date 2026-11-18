@@ -1221,11 +1221,12 @@ impl Index {
         crate::output::check(cancelled)?;
         if self.scan.is_none() {
             let mut scan = ScanResult {
+                partial: None,
                 detailed: self.detailed,
                 metadata_error_count: 0,
                 metadata_issues: vec![],
                 folders: vec![],
-                files: vec![],
+                files: Default::default(),
                 children: vec![],
                 file_children: vec![],
                 error_count: 0,
@@ -2723,7 +2724,7 @@ mod tests {
             .snapshot(&|| false)
             .unwrap();
         let scan = Arc::get_mut(&mut saved.scan).unwrap();
-        scan.files.reverse();
+        scan.files = scan.files.iter().rev().cloned().collect();
         crate::scanner::finish(scan).unwrap();
         saved.tracking.as_mut().unwrap().files.reverse();
         saved.entries = None;

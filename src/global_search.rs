@@ -150,7 +150,8 @@ mod tests {
             .enumerate()
             .map(|(id, name)| {
                 let mut scan = crate::scanner::scan(&root.join(name), || false).unwrap();
-                for file in &mut scan.files {
+                for row in 0..scan.files.len() {
+                    let file = &mut scan.files[row];
                     file.modified = match file.name.to_str().unwrap() {
                         "alpha.bin" => {
                             Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))

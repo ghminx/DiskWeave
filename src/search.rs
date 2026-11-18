@@ -276,55 +276,11 @@ pub(crate) fn matching(
             if cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
             }
-            if matches!(
-                (query.kind, item),
-                (EntryKind::Files, Item::Folder(_)) | (EntryKind::Folders, Item::File(_))
-            ) {
-                continue;
+            match match_item(result, query, item)? {
+                Match::Yes => items.push(item),
+                Match::UnknownDate => unknown_dates += 1,
+                Match::No => {}
             }
-            if query.active
-                && matches!(item, Item::Folder(id) if result.folders[id].access.unreadable())
-            {
-                continue;
-            }
-            let bytes = item_bytes(result, item);
-            if query.min_size.is_some_and(|min| bytes < min)
-                || query.max_size.is_some_and(|max| bytes > max)
-            {
-                continue;
-            }
-            let name = item_name(result, item).to_string_lossy().to_lowercase();
-            if !query.extensions.is_empty()
-                && (!matches!(item, Item::File(_))
-                    || !query
-                        .extensions
-                        .iter()
-                        .any(|ext| name.ends_with(&format!(".{ext}"))))
-            {
-                continue;
-            }
-            let text = if query.mode == SearchMode::Path {
-                std::path::absolute(item_path(result, item))?
-                    .to_string_lossy()
-                    .to_lowercase()
-            } else {
-                name
-            };
-            if !text.contains(&query.text) {
-                continue;
-            }
-            if query.from.is_some() || query.to.is_some() {
-                let Some(modified) = item_modified(result, item) else {
-                    unknown_dates += 1;
-                    continue;
-                };
-                if query.from.is_some_and(|from| modified < from)
-                    || query.to.is_some_and(|to| modified >= to)
-                {
-                    continue;
-                }
-            }
-            items.push(item);
         }
         if query.recursive && query.active {
             pending.extend(result.children[folder].iter().copied());
@@ -334,6 +290,141 @@ pub(crate) fn matching(
         items,
         unknown_dates,
     })
+}
+
+enum Match {
+    Yes,
+    No,
+    UnknownDate,
+}
+
+fn match_item(result: &ScanResult, query: &Query, item: Item) -> io::Result<Match> {
+    if matches!(
+        (query.kind, item),
+        (EntryKind::Files, Item::Folder(_)) | (EntryKind::Folders, Item::File(_))
+    ) {
+        return Ok(Match::No);
+    }
+    if query.active && matches!(item, Item::Folder(id) if result.folders[id].access.unreadable()) {
+        return Ok(Match::No);
+    }
+    let bytes = item_bytes(result, item);
+    if query.min_size.is_some_and(|min| bytes < min)
+        || query.max_size.is_some_and(|max| bytes > max)
+    {
+        return Ok(Match::No);
+    }
+    let name = item_name(result, item).to_string_lossy().to_lowercase();
+    if !query.extensions.is_empty()
+        && (!matches!(item, Item::File(_))
+            || !query
+                .extensions
+                .iter()
+                .any(|ext| name.ends_with(&format!(".{ext}"))))
+    {
+        return Ok(Match::No);
+    }
+    let text = if query.mode == SearchMode::Path {
+        std::path::absolute(item_path(result, item))?
+            .to_string_lossy()
+            .to_lowercase()
+    } else {
+        name
+    };
+    if !text.contains(&query.text) {
+        return Ok(Match::No);
+    }
+    if query.from.is_some() || query.to.is_some() {
+        let Some(modified) = item_modified(result, item) else {
+            return Ok(Match::UnknownDate);
+        };
+        if query.from.is_some_and(|from| modified < from)
+            || query.to.is_some_and(|to| modified >= to)
+        {
+            return Ok(Match::No);
+        }
+    }
+    Ok(Match::Yes)
+}
+
+pub(crate) fn refresh_matches(
+    previous: &ScanResult,
+    current: &ScanResult,
+    query: &Query,
+    mut results: SearchResults,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Option<SearchResults>> {
+    let Some(delta) = current
+        .partial
+        .as_ref()
+        .filter(|delta| std::ptr::eq(delta.previous.as_ptr(), previous))
+        .and_then(|delta| delta.search.as_ref())
+        .filter(|delta| delta.before.len().max(delta.after.len()) <= 256)
+    else {
+        return Ok(None);
+    };
+    let in_scope = |scan: &ScanResult, item| {
+        let mut parent = match item {
+            Item::Folder(row) => scan.folders[row].parent,
+            Item::File(row) => Some(scan.files[row].parent),
+        };
+        while let Some(row) = parent {
+            if row == query.scope {
+                return true;
+            }
+            if !query.recursive || !query.active {
+                break;
+            }
+            parent = scan.folders[row].parent;
+        }
+        false
+    };
+    let mut changed = std::collections::HashSet::new();
+    for &item in &delta.before {
+        crate::output::check(&cancelled)?;
+        if !in_scope(previous, item) || !changed.insert(item) {
+            continue;
+        }
+        if matches!(match_item(previous, query, item)?, Match::UnknownDate) {
+            results.unknown_dates -= 1;
+        }
+    }
+    results.items.retain_mut(|item| {
+        if changed.contains(item) {
+            return false;
+        }
+        if let (Some(remap), Item::File(row)) = (&delta.file_rows, *item) {
+            if remap[row] == usize::MAX {
+                return false;
+            }
+            *item = Item::File(remap[row]);
+        }
+        true
+    });
+    let mut replacements = Vec::new();
+    for &item in &delta.after {
+        crate::output::check(&cancelled)?;
+        if !in_scope(current, item) {
+            continue;
+        }
+        match match_item(current, query, item)? {
+            Match::UnknownDate => results.unknown_dates += 1,
+            Match::Yes => replacements.push(item),
+            Match::No => {}
+        }
+    }
+    for item in replacements {
+        crate::output::check(&cancelled)?;
+        let key = SortKey::new(current, item, query.sort);
+        let at = results.items.partition_point(|&other| {
+            SortKey::new(current, other, query.sort)
+                .compare(&key, query.descending, !query.active)
+                .is_lt()
+        });
+        results.items.insert(at, item);
+    }
+    crate::output::check(&cancelled)?;
+    Ok(Some(results))
 }
 
 pub fn item_modified(result: &ScanResult, item: Item) -> Option<SystemTime> {

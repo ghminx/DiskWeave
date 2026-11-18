@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -36,6 +37,7 @@ impl FolderAccess {
     }
 }
 
+#[derive(Clone)]
 pub struct Folder {
     pub access: FolderAccess,
     pub allocation: crate::metadata::Allocation,
@@ -54,6 +56,32 @@ pub struct ScanIssue {
     pub error: io::Error,
 }
 
+impl Clone for ScanIssue {
+    fn clone(&self) -> Self {
+        let error = self.error.raw_os_error().map_or_else(
+            || io::Error::new(self.error.kind(), self.error.to_string()),
+            io::Error::from_raw_os_error,
+        );
+        Self {
+            path: self.path.clone(),
+            error,
+        }
+    }
+}
+
+pub(crate) struct PartialUpdate {
+    pub previous: std::sync::Weak<ScanResult>,
+    pub affected: std::collections::HashSet<usize>,
+    pub search: Option<SearchDelta>,
+}
+
+pub(crate) struct SearchDelta {
+    pub before: Vec<crate::explorer::Item>,
+    pub after: Vec<crate::explorer::Item>,
+    pub file_rows: Option<Vec<usize>>,
+}
+
+#[derive(Clone)]
 pub struct FileEntry {
     pub extra: crate::metadata::Extra,
     pub created: Option<SystemTime>,
@@ -65,26 +93,138 @@ pub struct FileEntry {
     pub modified: Option<SystemTime>,
 }
 
+// 이전 화면과 파일 묶음을 공유하고 수정이 필요한 묶음만 복사.
+#[derive(Clone, Default)]
+pub struct FileRows {
+    chunks: Vec<Arc<Vec<FileEntry>>>,
+    len: usize,
+}
+
+impl FileRows {
+    const CHUNK: usize = 256;
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn get(&self, index: usize) -> Option<&FileEntry> {
+        self.chunks
+            .get(index / Self::CHUNK)?
+            .get(index % Self::CHUNK)
+    }
+    pub fn push(&mut self, file: FileEntry) {
+        if self.len.is_multiple_of(Self::CHUNK) {
+            self.chunks.push(Arc::new(Vec::with_capacity(Self::CHUNK)));
+        }
+        Arc::make_mut(self.chunks.last_mut().unwrap()).push(file);
+        self.len += 1;
+    }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &FileEntry> {
+        self.into_iter()
+    }
+}
+
+impl std::ops::Index<usize> for FileRows {
+    type Output = FileEntry;
+    fn index(&self, index: usize) -> &FileEntry {
+        &self.chunks[index / Self::CHUNK][index % Self::CHUNK]
+    }
+}
+
+impl std::ops::IndexMut<usize> for FileRows {
+    fn index_mut(&mut self, index: usize) -> &mut FileEntry {
+        &mut Arc::make_mut(&mut self.chunks[index / Self::CHUNK])[index % Self::CHUNK]
+    }
+}
+
+impl<'a> IntoIterator for &'a FileRows {
+    type Item = &'a FileEntry;
+    type IntoIter = std::iter::FlatMap<
+        std::slice::Iter<'a, Arc<Vec<FileEntry>>>,
+        std::slice::Iter<'a, FileEntry>,
+        fn(&'a Arc<Vec<FileEntry>>) -> std::slice::Iter<'a, FileEntry>,
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+}
+
+impl FromIterator<FileEntry> for FileRows {
+    fn from_iter<T: IntoIterator<Item = FileEntry>>(iter: T) -> Self {
+        let mut files = Self::default();
+        for file in iter {
+            files.push(file);
+        }
+        files
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanProgress {
     pub folders_scanned: u64,
     pub files_scanned: u64,
 }
 
+#[derive(Clone)]
 pub struct ScanResult {
+    pub(crate) partial: Option<std::sync::Arc<PartialUpdate>>,
     pub detailed: bool,
     pub metadata_error_count: u64,
     pub metadata_issues: Vec<ScanIssue>,
     pub folders: Vec<Folder>,
-    pub files: Vec<FileEntry>,
-    pub children: Vec<Vec<usize>>,
-    pub file_children: Vec<Vec<usize>>,
+    pub files: FileRows,
+    pub children: Vec<Arc<Vec<usize>>>,
+    pub file_children: Vec<Arc<Vec<usize>>>,
     pub error_count: u64,
     pub issues: Vec<ScanIssue>,
     pub skipped_reparse_points: u64,
 }
 
 impl ScanResult {
+    pub(crate) fn copy_for_update(&self, keep_files: bool) -> Self {
+        Self {
+            partial: None,
+            detailed: self.detailed,
+            metadata_error_count: self.metadata_error_count,
+            metadata_issues: self.metadata_issues.clone(),
+            folders: self.folders.clone(),
+            files: if keep_files {
+                self.files.clone()
+            } else {
+                FileRows::default()
+            },
+            children: self.children.clone(),
+            file_children: self.file_children.clone(),
+            error_count: self.error_count,
+            issues: self.issues.clone(),
+            skipped_reparse_points: self.skipped_reparse_points,
+        }
+    }
+
+    pub(crate) fn stable_changes_from(&self, previous: &Self) -> Option<&[crate::explorer::Item]> {
+        let update = self.partial.as_ref()?;
+        let delta = update.search.as_ref()?;
+        (std::ptr::eq(update.previous.as_ptr(), previous) && delta.file_rows.is_none())
+            .then_some(delta.after.as_slice())
+    }
+
+    pub fn subtree_unchanged_from(&self, previous: &Self, folder: usize) -> bool {
+        self.partial.as_ref().is_some_and(|update| {
+            std::ptr::eq(update.previous.as_ptr(), previous)
+                && folder < self.folders.len()
+                && !update.affected.contains(&folder)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn has_partial_update_from(&self, previous: &Self) -> bool {
+        self.partial
+            .as_ref()
+            .is_some_and(|update| std::ptr::eq(update.previous.as_ptr(), previous))
+    }
+
     pub fn folder_index(&self, relative_path: &Path) -> io::Result<usize> {
         let mut index = 0;
         for component in relative_path.components() {
@@ -568,6 +708,7 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
     }
 
     let result = ScanResult {
+        partial: None,
         detailed,
         metadata_error_count: 0,
         metadata_issues: Vec::new(),
@@ -584,7 +725,7 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
             modified: metadata.modified().ok(),
         }],
         children: Vec::new(),
-        files: Vec::new(),
+        files: Default::default(),
         file_children: Vec::new(),
         error_count: 0,
         issues: Vec::new(),
@@ -621,13 +762,21 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
             folder.access = FolderAccess::Partial;
         }
     }
-    result.children = vec![Vec::new(); result.folders.len()];
-    result.file_children = vec![Vec::new(); result.folders.len()];
+    finish_lists(result);
+    Ok(())
+}
+
+pub(crate) fn finish_lists(result: &mut ScanResult) {
+    result.children = vec![Arc::default(); result.folders.len()];
+    result.file_children = vec![Arc::default(); result.folders.len()];
     for (index, file) in result.files.iter().enumerate() {
-        result.file_children[file.parent].push(index);
+        Arc::make_mut(&mut result.file_children[file.parent]).push(index);
     }
     for siblings in &mut result.file_children {
-        siblings.sort_unstable_by(|&a, &b| {
+        if siblings.len() < 2 {
+            continue;
+        }
+        Arc::make_mut(siblings).sort_unstable_by(|&a, &b| {
             result.files[b]
                 .logical_bytes
                 .cmp(&result.files[a].logical_bytes)
@@ -635,18 +784,20 @@ pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
         });
     }
     for (index, folder) in result.folders.iter().enumerate().skip(1) {
-        result.children[folder.parent.expect("루트 외 폴더의 부모")].push(index);
+        Arc::make_mut(&mut result.children[folder.parent.expect("루트 외 폴더의 부모")])
+            .push(index);
     }
     for siblings in &mut result.children {
-        siblings.sort_unstable_by(|&a, &b| {
+        if siblings.len() < 2 {
+            continue;
+        }
+        Arc::make_mut(siblings).sort_unstable_by(|&a, &b| {
             result.folders[b]
                 .logical_bytes
                 .cmp(&result.folders[a].logical_bytes)
                 .then_with(|| result.folders[a].path.cmp(&result.folders[b].path))
         });
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

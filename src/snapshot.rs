@@ -331,13 +331,14 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
         return Err(invalid());
     }
     let mut scan = ScanResult {
+        partial: None,
         detailed: a.detailed,
         metadata_error_count: a.metadata_error_count,
         metadata_issues: a.metadata_issues.into_iter().map(Issue::decode).collect(),
         folders: Vec::new(),
-        files: Vec::new(),
-        children: vec![Vec::new(); a.folders.len()],
-        file_children: vec![Vec::new(); a.folders.len()],
+        files: Default::default(),
+        children: vec![Arc::default(); a.folders.len()],
+        file_children: vec![Arc::default(); a.folders.len()],
         error_count: a.error_count,
         issues: a.issues.into_iter().map(Issue::decode).collect(),
         skipped_reparse_points: a.skipped_reparse_points,
@@ -360,7 +361,7 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
             if path.as_os_str().encode_wide().count() > 32767 {
                 return Err(invalid());
             }
-            scan.children[parent].push(index);
+            Arc::make_mut(&mut scan.children[parent]).push(index);
             path
         };
         scan.folders.push(Folder {
@@ -392,7 +393,7 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
             .ok_or_else(invalid)?;
         parent.file_count = parent.file_count.checked_add(1).ok_or_else(invalid)?;
         parent.allocation.add(f.extra.allocation)?;
-        scan.file_children[f.parent].push(scan.files.len());
+        Arc::make_mut(&mut scan.file_children[f.parent]).push(scan.files.len());
         scan.files.push(FileEntry {
             name,
             parent: f.parent,
@@ -424,7 +425,10 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
         parent.allocation.merge(child.allocation)?;
     }
     for siblings in &mut scan.children {
-        siblings.sort_unstable_by(|&a, &b| {
+        if siblings.len() < 2 {
+            continue;
+        }
+        Arc::make_mut(siblings).sort_unstable_by(|&a, &b| {
             scan.folders[b]
                 .logical_bytes
                 .cmp(&scan.folders[a].logical_bytes)
@@ -432,7 +436,10 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
         });
     }
     for siblings in &mut scan.file_children {
-        siblings.sort_unstable_by(|&a, &b| {
+        if siblings.len() < 2 {
+            continue;
+        }
+        Arc::make_mut(siblings).sort_unstable_by(|&a, &b| {
             scan.files[b]
                 .logical_bytes
                 .cmp(&scan.files[a].logical_bytes)

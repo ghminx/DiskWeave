@@ -55,6 +55,28 @@ pub struct MapController {
     pending: Option<Request>,
 }
 impl MapController {
+    pub(crate) fn reuse_local(&mut self, current: &Snapshot) {
+        if let (Some(key), Some(output)) = (&mut self.key, &mut self.output) {
+            if key.reuse_local(&mut output.sources, current) {
+                if let Some(selection) = &mut self.selected {
+                    selection.target.1 = current.generation;
+                }
+                return;
+            }
+            if let [previous] = &mut output.sources[..] {
+                if key.same_local_source(previous, current)
+                    && output
+                        .data
+                        .patch_local(previous, current, key.folder.unwrap())
+                {
+                    key.versions[0].1 = current.generation;
+                    *previous = current.clone();
+                    self.revision += 1;
+                    self.selected = None;
+                }
+            }
+        }
+    }
     pub fn needs(&self, key: &PanelKey) -> bool {
         self.key.as_ref() != Some(key)
     }

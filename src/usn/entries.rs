@@ -25,6 +25,13 @@ pub struct Projection {
     items: HashMap<u64, Item>,
 }
 impl Projection {
+    pub(super) fn has_file_key(&self, row: usize, key: u64) -> bool {
+        self.files.get(row) == Some(&key)
+    }
+    pub(super) fn folder_keys(&self) -> &[u64] {
+        &self.folders
+    }
+
     pub(super) fn matches_rows(&self, folders: &[u64], files: &[u64]) -> bool {
         self.folders == folders && self.files == files
     }
