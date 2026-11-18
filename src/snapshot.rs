@@ -335,7 +335,7 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
         detailed: a.detailed,
         metadata_error_count: a.metadata_error_count,
         metadata_issues: a.metadata_issues.into_iter().map(Issue::decode).collect(),
-        folders: Vec::new(),
+        folders: Default::default(),
         files: Default::default(),
         children: vec![Arc::default(); a.folders.len()],
         file_children: vec![Arc::default(); a.folders.len()],
@@ -406,23 +406,26 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
     }
     for id in (1..scan.folders.len()).rev() {
         crate::output::check(&cancelled)?;
-        let (before, after) = scan.folders.split_at_mut(id);
-        let child = &after[0];
-        let parent = &mut before[child.parent.unwrap()];
+        let child = &scan.folders[id];
+        let (parent, bytes, files, folders, allocation) = (
+            child.parent.unwrap(),
+            child.logical_bytes,
+            child.file_count,
+            child.folder_count,
+            child.allocation,
+        );
+        let parent = &mut scan.folders[parent];
         parent.logical_bytes = parent
             .logical_bytes
-            .checked_add(child.logical_bytes)
+            .checked_add(bytes)
             .ok_or_else(invalid)?;
-        parent.file_count = parent
-            .file_count
-            .checked_add(child.file_count)
-            .ok_or_else(invalid)?;
+        parent.file_count = parent.file_count.checked_add(files).ok_or_else(invalid)?;
         parent.folder_count = parent
             .folder_count
-            .checked_add(child.folder_count)
+            .checked_add(folders)
             .and_then(|n| n.checked_add(1))
             .ok_or_else(invalid)?;
-        parent.allocation.merge(child.allocation)?;
+        parent.allocation.merge(allocation)?;
     }
     for siblings in &mut scan.children {
         if siblings.len() < 2 {

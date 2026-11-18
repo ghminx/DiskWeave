@@ -74,6 +74,7 @@ pub struct Query {
     descending: bool,
 }
 pub struct SearchResults {
+    scope: usize,
     pub items: Vec<Item>,
     pub unknown_dates: usize,
 }
@@ -244,6 +245,7 @@ pub fn search(
     keyed.sort_unstable_by(|a, b| a.1.compare(&b.1, query.descending, !query.active));
     crate::output::check(&cancelled)?;
     Ok(SearchResults {
+        scope: query.scope,
         items: keyed.into_iter().map(|(item, _)| item).collect(),
         unknown_dates: result_items.unknown_dates,
     })
@@ -287,6 +289,7 @@ pub(crate) fn matching(
         }
     }
     Ok(SearchResults {
+        scope: query.scope,
         items,
         unknown_dates,
     })
@@ -363,13 +366,16 @@ pub(crate) fn refresh_matches(
     else {
         return Ok(None);
     };
-    let in_scope = |scan: &ScanResult, item| {
+    if delta.remap(Item::Folder(results.scope)) != Some(Item::Folder(query.scope)) {
+        return Ok(None);
+    }
+    let in_scope = |scan: &ScanResult, item, scope| {
         let mut parent = match item {
             Item::Folder(row) => scan.folders[row].parent,
             Item::File(row) => Some(scan.files[row].parent),
         };
         while let Some(row) = parent {
-            if row == query.scope {
+            if row == scope {
                 return true;
             }
             if !query.recursive || !query.active {
@@ -382,7 +388,7 @@ pub(crate) fn refresh_matches(
     let mut changed = std::collections::HashSet::new();
     for &item in &delta.before {
         crate::output::check(&cancelled)?;
-        if !in_scope(previous, item) || !changed.insert(item) {
+        if !in_scope(previous, item, results.scope) || !changed.insert(item) {
             continue;
         }
         if matches!(match_item(previous, query, item)?, Match::UnknownDate) {
@@ -393,18 +399,16 @@ pub(crate) fn refresh_matches(
         if changed.contains(item) {
             return false;
         }
-        if let (Some(remap), Item::File(row)) = (&delta.file_rows, *item) {
-            if remap[row] == usize::MAX {
-                return false;
-            }
-            *item = Item::File(remap[row]);
-        }
+        let Some(next) = delta.remap(*item) else {
+            return false;
+        };
+        *item = next;
         true
     });
     let mut replacements = Vec::new();
     for &item in &delta.after {
         crate::output::check(&cancelled)?;
-        if !in_scope(current, item) {
+        if !in_scope(current, item, query.scope) {
             continue;
         }
         match match_item(current, query, item)? {
@@ -424,6 +428,7 @@ pub(crate) fn refresh_matches(
         results.items.insert(at, item);
     }
     crate::output::check(&cancelled)?;
+    results.scope = query.scope;
     Ok(Some(results))
 }
 

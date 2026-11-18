@@ -404,10 +404,11 @@ fn patch_scan(
             .collect::<Vec<_>>()
     });
     let mut new_files = Vec::new();
-    let mut file_rows =
-        (structural && changes.len() <= 256).then(|| vec![usize::MAX; previous.files.len()]);
+
     let rows = if structural {
-        let mut files = crate::scanner::FileRows::default();
+        let mut files = RowProjection::new(&previous.files, |(path, parent, node)| {
+            file_entry(path, parent, node)
+        });
         let mut ids = Vec::with_capacity(previous.files.len());
         let mut keys = Vec::with_capacity(previous.files.len());
         let mut lists = vec![Vec::new(); result.folders.len()];
@@ -419,21 +420,21 @@ fn patch_scan(
             let Some(Item::Folder(parent)) = path.parent().and_then(find) else {
                 return Ok(None);
             };
-            let row = files.len();
+            let row = keys.len();
             if !projection.has_file_key(row, key) {
                 file_parents.insert(parent);
                 mark_ancestors(&result, &mut affected, parent);
             }
-            if let Some(remap) = &mut file_rows {
-                if let Some(Item::File(old)) = find(path) {
-                    remap[old] = row;
-                }
-                if changed_paths.contains(path) {
-                    new_files.push(Item::File(row));
-                }
+            if changed_paths.contains(path) {
+                new_files.push(Item::File(row));
             }
             lists[parent].push(row);
-            files.push(file_entry(path, parent, node));
+            files.push(
+                (path, parent, node),
+                projection.has_file_key(row, key)
+                    && previous.files[row].parent == parent
+                    && index.nodes.original(path) == Some(node),
+            );
             ids.push(node.id);
             keys.push(key);
         }
@@ -442,11 +443,14 @@ fn patch_scan(
                 result.file_children[parent] = Arc::new(list);
             }
         }
-        result.files = files;
+        result.files = files.finish();
         Some((
-            index
-                .nodes
-                .project(projection.folder_keys().to_vec(), keys, cancelled)?,
+            index.nodes.project_update(
+                projection.folder_keys().to_vec(),
+                keys,
+                projection,
+                cancelled,
+            )?,
             ids,
             None,
         ))
@@ -471,6 +475,17 @@ fn patch_scan(
                 .then_with(|| result.folders[a].path.cmp(&result.folders[b].path))
         });
     }
+    let file_rows = if let (Some(_), Some((next, _, _))) = (&search_folders, &rows) {
+        Some(remap_rows(
+            previous.files.len(),
+            Item::File,
+            projection,
+            next,
+            cancelled,
+        )?)
+    } else {
+        None
+    };
     let search = search_folders.map(|mut before| {
         let mut after = before.clone();
         before.extend(edits.iter().filter_map(|(item, _, old, _)| {
@@ -485,6 +500,7 @@ fn patch_scan(
             before,
             after,
             file_rows,
+            folder_rows: None,
         }
     });
     result.partial = Some(Arc::new(PartialUpdate {
@@ -544,35 +560,56 @@ fn patch_tree(
         .filter(|(_, _, n)| n.dir() && !n.excluded())
         .collect();
     dirs.sort_by_key(|(p, _, _)| p.components().count());
+    let mut folder_rows = RowProjection::new(
+        &previous.folders,
+        |(path, parent, n, before): (
+            &Path,
+            Option<usize>,
+            &super::Node,
+            Option<&crate::scanner::Folder>,
+        )| {
+            crate::scanner::Folder {
+                access: Default::default(),
+                path: index.root.join(path),
+                parent,
+                logical_bytes: before.map_or(0, |f| f.logical_bytes),
+                allocation: before.map_or(Allocation::default(), |f| f.allocation),
+                file_count: before.map_or(0, |f| f.file_count),
+                folder_count: before.map_or(0, |f| f.folder_count),
+                created: n.created,
+                modified: n.modified,
+                attributes: n.attributes,
+            }
+        },
+    );
     for (path, key, n) in dirs {
         crate::output::check(cancelled)?;
         let parent = path.parent().map(|p| paths[p]);
-        let before = projection
+        let old_row = projection
             .path_key(path)
             .and_then(|key| projection.item(key))
             .and_then(|item| {
                 if let Item::Folder(row) = item {
-                    Some(&previous.folders[row])
+                    Some(row)
                 } else {
                     None
                 }
             });
-        paths.insert(path.as_path(), scan.folders.len());
+        let before = old_row.map(|row| &previous.folders[row]);
+        let row = folder_keys.len();
+        paths.insert(path.as_path(), row);
         folder_keys.push(key);
         folder_ids.push(n.id);
-        scan.folders.push(crate::scanner::Folder {
-            access: Default::default(),
-            path: index.root.join(path),
-            parent,
-            logical_bytes: before.map_or(0, |f| f.logical_bytes),
-            allocation: before.map_or(Allocation::default(), |f| f.allocation),
-            file_count: before.map_or(0, |f| f.file_count),
-            folder_count: before.map_or(0, |f| f.folder_count),
-            created: n.created,
-            modified: n.modified,
-            attributes: n.attributes,
-        });
+        let same = old_row == Some(row)
+            && before.is_some_and(|f| {
+                f.parent == parent
+                    && f.attributes == n.attributes
+                    && f.created == n.created
+                    && f.modified == n.modified
+            });
+        folder_rows.push((path, parent, n, before), same);
     }
+    scan.folders = folder_rows.finish();
     for (&path, &row) in &paths {
         let unchanged_row = projection
             .path_key(path)
@@ -590,6 +627,14 @@ fn patch_tree(
     for add in [false, true] {
         for (path, old, new) in &delta {
             crate::output::check(cancelled)?;
+            if old.zip(*new).is_some_and(|(before, after)| {
+                before.dir() == after.dir()
+                    && (before.dir()
+                        || before.bytes == after.bytes
+                            && before.extra.allocation == after.extra.allocation)
+            }) {
+                continue;
+            }
             let Some(n) = (if add { new } else { old }) else {
                 continue;
             };
@@ -620,30 +665,112 @@ fn patch_tree(
     }
     let mut file_ids = Vec::with_capacity(previous.files.len());
     let mut file_keys = Vec::with_capacity(previous.files.len());
+    let mut files = RowProjection::new(&previous.files, |(path, parent, node)| {
+        file_entry(path, parent, node)
+    });
     for (path, key, n) in index.nodes.identified() {
         crate::output::check(cancelled)?;
         if n.dir() || n.excluded() {
             continue;
         }
         let parent = paths[path.parent().unwrap()];
-        if !projection.has_file_key(scan.files.len(), key) {
+        let row = file_keys.len();
+        let same_key = projection.has_file_key(row, key);
+        if !same_key {
             mark_ancestors(&scan, &mut affected, parent);
         }
-        scan.files.push(file_entry(path, parent, n));
+        files.push(
+            (path, parent, n),
+            same_key
+                && previous.files[row].parent == parent
+                && index.nodes.original(path) == Some(n),
+        );
         file_keys.push(key);
         file_ids.push(n.id);
     }
+    scan.files = files.finish();
     crate::scanner::finish_lists(&mut scan);
-    let projection = index.nodes.project(folder_keys, file_keys, cancelled)?;
+    let next = index
+        .nodes
+        .project_update(folder_keys, file_keys, projection, cancelled)?;
+    let search = if delta.len() <= 256 {
+        tree_search_delta(previous, projection, &next, &delta, cancelled)?
+    } else {
+        None
+    };
     scan.partial = Some(Arc::new(PartialUpdate {
         previous: Arc::downgrade(previous),
         affected,
-        search: None,
+        search,
     }));
     Ok(Some(ScanPatch {
         scan,
-        rows: Some((projection, file_ids, Some(folder_ids))),
+        rows: Some((next, file_ids, Some(folder_ids))),
     }))
+}
+
+type TreeChange<'a> = (PathBuf, Option<&'a super::Node>, Option<&'a super::Node>);
+
+fn tree_search_delta(
+    previous: &ScanResult,
+    before: &super::entries::Projection,
+    after: &super::entries::Projection,
+    delta: &[TreeChange<'_>],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Option<crate::scanner::SearchDelta>> {
+    let changed = |projection: &super::entries::Projection| {
+        delta
+            .iter()
+            .flat_map(|(path, _, _)| path.ancestors())
+            .filter_map(|path| {
+                projection
+                    .path_key(path)
+                    .and_then(|key| projection.item(key))
+            })
+            .collect::<HashSet<_>>()
+    };
+    let old_items = changed(before);
+    let new_items = changed(after);
+    if old_items.len().max(new_items.len()) > 256 {
+        return Ok(None);
+    }
+    Ok(Some(crate::scanner::SearchDelta {
+        before: old_items.into_iter().collect(),
+        after: new_items.into_iter().collect(),
+        file_rows: Some(remap_rows(
+            previous.files.len(),
+            Item::File,
+            before,
+            after,
+            cancelled,
+        )?),
+        folder_rows: Some(remap_rows(
+            previous.folders.len(),
+            Item::Folder,
+            before,
+            after,
+            cancelled,
+        )?),
+    }))
+}
+
+fn remap_rows(
+    len: usize,
+    make: fn(usize) -> Item,
+    before: &super::entries::Projection,
+    after: &super::entries::Projection,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<crate::scanner::RowRemap> {
+    let mut result = crate::scanner::RowRemap::default();
+    for row in 0..len {
+        crate::output::check(cancelled)?;
+        if let Some(Item::File(new) | Item::Folder(new)) =
+            before.key(make(row)).and_then(|key| after.item(key))
+        {
+            result.push_ordered(row, new);
+        }
+    }
+    Ok(result)
 }
 
 fn apply_file_total(
@@ -670,6 +797,54 @@ fn apply_file_total(
         folder.file_count -= 1;
     }
     Ok(())
+}
+
+// 행 번호와 내용이 그대로인 묶음은 이전 결과의 저장소를 그대로 재사용.
+struct RowProjection<'a, T, R, F> {
+    previous: &'a crate::scanner::Rows<T>,
+    output: crate::scanner::Rows<T>,
+    pending: Vec<R>,
+    build: F,
+    all_same: bool,
+}
+impl<'a, T: Clone, R, F: FnMut(R) -> T> RowProjection<'a, T, R, F> {
+    fn new(previous: &'a crate::scanner::Rows<T>, build: F) -> Self {
+        Self {
+            previous,
+            output: Default::default(),
+            pending: Vec::new(),
+            build,
+            all_same: true,
+        }
+    }
+    fn push(&mut self, row: R, same: bool) {
+        self.pending.push(row);
+        self.all_same &= same;
+        if self.pending.len() == crate::scanner::Rows::<T>::chunk_size() {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if self.all_same
+            && self
+                .output
+                .append_reused_chunk(self.previous, self.pending.len())
+        {
+            self.pending.clear();
+        } else {
+            for row in self.pending.drain(..) {
+                self.output.push((self.build)(row));
+            }
+        }
+        self.all_same = true;
+    }
+    fn finish(mut self) -> crate::scanner::Rows<T> {
+        self.flush();
+        self.output
+    }
 }
 
 fn file_entry(path: &Path, parent: usize, n: &super::Node) -> crate::scanner::FileEntry {

@@ -1225,7 +1225,7 @@ impl Index {
                 detailed: self.detailed,
                 metadata_error_count: 0,
                 metadata_issues: vec![],
-                folders: vec![],
+                folders: Default::default(),
                 files: Default::default(),
                 children: vec![],
                 file_children: vec![],

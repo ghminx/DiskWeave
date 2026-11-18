@@ -3710,6 +3710,7 @@ mod session_tests {
                 before: vec![Item::File(0)],
                 after: vec![Item::File(0)],
                 file_rows: None,
+                folder_rows: None,
             }),
         }));
         let resized = Snapshot {

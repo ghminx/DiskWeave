@@ -69,6 +69,11 @@ impl MapController {
                         .data
                         .patch_local(previous, current, key.folder.unwrap())
                 {
+                    let delta = current.scan.changes_from(&previous.scan).unwrap();
+                    if let Some(Item::Folder(row)) = delta.remap(Item::Folder(key.folder.unwrap()))
+                    {
+                        key.folder = Some(row);
+                    }
                     key.versions[0].1 = current.generation;
                     *previous = current.clone();
                     self.revision += 1;

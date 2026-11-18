@@ -254,7 +254,7 @@ fn baseline(count: usize, width: usize) -> io::Result<SavedScan> {
     let mut scan = ScanResult {
         partial: None,
         detailed: true,
-        folders: vec![Folder {
+        folders: [Folder {
             access: Default::default(),
             path: root,
             parent: None,
@@ -265,7 +265,7 @@ fn baseline(count: usize, width: usize) -> io::Result<SavedScan> {
             created: Some(time),
             modified: Some(time),
             attributes: 16,
-        }],
+        }].into_iter().collect(),
         files: (0..count)
             .map(|i| FileEntry {
                 name: name(i, width).into(),

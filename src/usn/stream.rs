@@ -709,7 +709,7 @@ fn validate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::usn::{Checkpoint, Index};
     use std::{
@@ -1078,6 +1078,10 @@ mod tests {
             std::fs::create_dir(root.join(folder)).unwrap();
         }
         std::fs::write(root.join("z/stable"), b"123").unwrap();
+        // 구조 갱신 뒤에도 앞쪽의 논리 행과 저장소가 그대로 유지되는 자료.
+        for i in 0..260 {
+            std::fs::write(root.join(format!("{i:04}.bin")), []).unwrap();
+        }
         let saved = record(root);
         let state = saved.tracking.as_ref().unwrap();
         let mut source = Source {
@@ -1124,6 +1128,7 @@ mod tests {
             }
             tick(&mut source, &mut index, &mut sender, &mut receiver);
             let current = receiver.snapshot(&|| false).unwrap();
+            assert!(current.scan.files.shares_row_with(&previous.scan.files, 0));
             assert!(current.scan.has_partial_update_from(&previous.scan));
             assert_eq!(
                 current.scan.subtree_unchanged_from(&previous.scan, z),
@@ -1474,6 +1479,57 @@ mod tests {
         source.journal.next += 8;
         id
     }
+    pub(crate) fn folder_move_snapshots() -> (crate::locations::Snapshot, crate::locations::Snapshot)
+    {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        for row in 0..520 {
+            std::fs::create_dir(root.join(format!("{row:04}"))).unwrap();
+        }
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("z")).unwrap();
+        std::fs::write(root.join("a/moved.bin"), b"12345").unwrap();
+        std::fs::write(root.join("z/pinned.bin"), b"123").unwrap();
+        let saved = record(root);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            events: vec![],
+            journal: super::super::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = vec![];
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let previous = receiver.snapshot(&|| false).unwrap();
+        let from = root.join("a");
+        let to = root.join("z/a");
+        let folder = previous.scan.folder_index(Path::new("z")).unwrap();
+        let target = previous.tracking.as_ref().unwrap().folders[folder];
+        event(&mut source, &from, state.root, 0x80001000);
+        std::fs::rename(&from, &to).unwrap();
+        event(&mut source, &to, target, 0x80002000);
+        tick(&mut source, &mut index, &mut sender, &mut receiver);
+        let current = receiver.snapshot(&|| false).unwrap();
+        let snapshot =
+            |record: crate::snapshot::SavedScan, generation| crate::locations::Snapshot {
+                id: 1,
+                generation,
+                scan: record.scan,
+                entries: record.entries,
+            };
+        (snapshot(previous, 1), snapshot(current, 2))
+    }
+
     #[test]
     fn directory_moves_locked_file_recovery_and_removal_match_all_original_fields() {
         let fixture = Fixture::new();
@@ -1509,6 +1565,26 @@ mod tests {
             after_move.scan.folders[0].folder_count,
             before_move.scan.folders[0].folder_count
         );
+        for text in ["sub", "renamed", ""] {
+            let query = crate::search::SearchInput {
+                text: text.into(),
+                ..Default::default()
+            }
+            .compile(0)
+            .unwrap();
+            let original = crate::search::search(&before_move.scan, &query, || false).unwrap();
+            let updated = crate::search::refresh_matches(
+                &before_move.scan,
+                &after_move.scan,
+                &query,
+                original,
+                || false,
+            )
+            .unwrap()
+            .expect("폴더 이동 검색의 증분 반영");
+            let expected = crate::search::search(&after_move.scan, &query, || false).unwrap();
+            assert_eq!(updated.items, expected.items);
+        }
         let file = fixture.0.join("renamed/file");
         event(&mut source, &file, sub, 0x80000001);
         source.blocked = Some(file.clone());

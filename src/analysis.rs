@@ -3,7 +3,7 @@ use crate::global_search::Hit;
 use crate::locations::Snapshot;
 use crate::metadata::{Allocation, Field, Identity, Missing};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io;
 
 pub enum StatsScope {
@@ -24,7 +24,91 @@ pub struct Statistics {
     pub files: u64,
     pub extensions: Vec<ExtensionTotal>,
     top: Vec<Hit>,
+    local: Option<LocalRanking>,
 }
+type RankKey = (u64, Reverse<std::path::PathBuf>);
+
+#[derive(Default)]
+struct LocalRanking {
+    ranked: BTreeMap<RankKey, usize>,
+    links: HashMap<Identity, LinkAllocations>,
+}
+
+#[derive(Default)]
+struct LinkAllocations {
+    first: Option<(Field<u64>, usize)>,
+    additional: Vec<(Field<u64>, usize)>,
+}
+impl LinkAllocations {
+    fn add(&mut self, field: Field<u64>) {
+        if let Some((_, count)) = self
+            .first
+            .iter_mut()
+            .chain(&mut self.additional)
+            .find(|(value, _)| *value == field)
+        {
+            *count += 1;
+        } else if self.first.is_none() {
+            self.first = Some((field, 1));
+        } else {
+            self.additional.push((field, 1));
+        }
+    }
+    fn remove(&mut self, field: Field<u64>) {
+        if let Some((_, count)) = self.first.as_mut().filter(|(value, _)| *value == field) {
+            *count -= 1;
+            if *count == 0 {
+                self.first = self.additional.pop();
+            }
+        } else if let Some(at) = self
+            .additional
+            .iter()
+            .position(|(value, _)| *value == field)
+        {
+            self.additional[at].1 -= 1;
+            if self.additional[at].1 == 0 {
+                self.additional.swap_remove(at);
+            }
+        }
+    }
+    fn total(&self) -> Option<(Field<u64>, bool)> {
+        let mut known = None;
+        let mut missing = Missing::NotCollected;
+        for (field, _) in self.first.iter().chain(&self.additional) {
+            match field {
+                Field::Value(value) => {
+                    if known.replace(*value).is_some_and(|old| old != *value) {
+                        return Some((Field::Missing(Missing::Failed), true));
+                    }
+                }
+                Field::Missing(reason) => missing = stronger_missing(missing, *reason),
+            }
+        }
+        self.first
+            .map(|_| (known.map_or(Field::Missing(missing), Field::Value), false))
+    }
+}
+
+fn stronger_missing(a: Missing, b: Missing) -> Missing {
+    match (a, b) {
+        (Missing::Failed, _) | (_, Missing::Failed) => Missing::Failed,
+        (Missing::Unsupported, _) | (_, Missing::Unsupported) => Missing::Unsupported,
+        _ => Missing::NotCollected,
+    }
+}
+
+fn remove_allocation(total: &mut Allocation, value: Field<u64>) {
+    match value {
+        Field::Value(bytes) => {
+            total.bytes -= bytes;
+            total.known -= 1;
+        }
+        Field::Missing(Missing::Failed) => total.failed -= 1,
+        Field::Missing(Missing::Unsupported) => total.unsupported -= 1,
+        Field::Missing(Missing::NotCollected) => total.not_collected -= 1,
+    }
+}
+
 impl Statistics {
     pub(crate) fn patch_local(
         &mut self,
@@ -32,66 +116,133 @@ impl Statistics {
         current: &Snapshot,
         folder: usize,
     ) -> bool {
-        let Some(items) = current.scan.stable_changes_from(&previous.scan) else {
+        let Some(delta) = current.scan.changes_from(&previous.scan) else {
             return false;
         };
-        let root = &current.scan.folders[folder];
-        let files: Vec<_> = items
-            .iter()
-            .filter_map(|&item| {
-                let Item::File(row) = item else { return None };
-                let (old, new) = (&previous.scan.files[row], &current.scan.files[row]);
-                current.scan.folders[new.parent]
-                    .path
-                    .starts_with(&root.path)
-                    .then_some((item, old, new))
-            })
-            .collect();
-        // 할당량과 식별자가 유지되는 경우에만 Hard Link 집계 재사용.
-        if files.iter().any(|&(item, old, new)| {
-            old.extra.allocation != new.extra.allocation
-                || old.extra.identity != new.extra.identity
-                || (self.files > self.top.len() as u64
-                    && new.logical_bytes < old.logical_bytes
-                    && self.top.iter().any(|hit| hit.item == item))
-        }) {
+        let Some(Item::Folder(new_folder)) = delta.remap(Item::Folder(folder)) else {
             return false;
+        };
+        if (delta.file_rows.is_some() || delta.folder_rows.is_some()) && current.entries.is_none() {
+            return false;
+        }
+        let Some(local) = &mut self.local else {
+            return false;
+        };
+        let scope = |scan: &crate::scanner::ScanResult, item, folder: usize| matches!(item, Item::File(row) if scan.folders[scan.files[row].parent].path.starts_with(&scan.folders[folder].path));
+        let old = delta
+            .before
+            .iter()
+            .copied()
+            .filter(|&item| scope(&previous.scan, item, folder));
+        let new = delta
+            .after
+            .iter()
+            .copied()
+            .filter(|&item| scope(&current.scan, item, new_folder));
+        let mut identities = HashSet::new();
+        for (scan, items) in [
+            (&previous.scan, old.clone().collect::<Vec<_>>()),
+            (&current.scan, new.clone().collect()),
+        ] {
+            for item in items {
+                let Item::File(row) = item else {
+                    unreachable!()
+                };
+                if let Field::Value(id) = scan.files[row].extra.identity {
+                    identities.insert(id);
+                }
+            }
+        }
+        for id in &identities {
+            if let Some((allocation, conflict)) =
+                local.links.get(id).and_then(LinkAllocations::total)
+            {
+                remove_allocation(&mut self.unique_allocation, allocation);
+                self.identity_conflicts -= usize::from(conflict);
+            }
         }
         let mut groups: HashMap<_, _> = self
             .extensions
             .iter()
-            .map(|g| (g.name.clone(), g.bytes))
+            .map(|g| (g.name.clone(), (g.bytes, g.files)))
             .collect();
-        for &(_, old, _) in &files {
-            let Some(bytes) = groups.get_mut(&extension(&old.name)) else {
-                return false;
-            };
-            let Some(value) = bytes.checked_sub(old.logical_bytes) else {
-                return false;
-            };
-            *bytes = value;
-        }
-        for &(item, _, new) in &files {
-            *groups.get_mut(&extension(&new.name)).unwrap() += new.logical_bytes;
-            if !self.top.iter().any(|hit| hit.item == item) {
-                self.top.push(Hit { source: 0, item });
+        for (add, scan, items) in [
+            (false, &previous.scan, old.collect::<Vec<_>>()),
+            (true, &current.scan, new.collect()),
+        ] {
+            for item in items {
+                let Item::File(row) = item else {
+                    unreachable!()
+                };
+                let file = &scan.files[row];
+                let key = (
+                    file.logical_bytes,
+                    Reverse(crate::search::item_path(scan, item)),
+                );
+                let group = groups.entry(extension(&file.name)).or_default();
+                if add {
+                    local.ranked.insert(key, row);
+                    group.0 += file.logical_bytes;
+                    group.1 += 1;
+                    if let Field::Missing(reason) = file.extra.identity {
+                        self.unique_allocation
+                            .add(Field::Missing(reason))
+                            .expect("파일 개수 범위");
+                    } else if let Field::Value(id) = file.extra.identity {
+                        local
+                            .links
+                            .entry(id)
+                            .or_default()
+                            .add(file.extra.allocation);
+                    }
+                } else {
+                    local.ranked.remove(&key);
+                    group.0 -= file.logical_bytes;
+                    group.1 -= 1;
+                    match file.extra.identity {
+                        Field::Missing(reason) => {
+                            remove_allocation(&mut self.unique_allocation, Field::Missing(reason))
+                        }
+                        Field::Value(id) => local
+                            .links
+                            .get_mut(&id)
+                            .unwrap()
+                            .remove(file.extra.allocation),
+                    }
+                }
             }
         }
-        self.bytes = root.logical_bytes;
-        for group in &mut self.extensions {
-            group.bytes = groups[&group.name];
+        for id in identities {
+            if let Some((allocation, conflict)) =
+                local.links.get(&id).and_then(LinkAllocations::total)
+            {
+                self.unique_allocation
+                    .add(allocation)
+                    .expect("폴더 할당량 범위");
+                self.identity_conflicts += usize::from(conflict);
+            } else {
+                local.links.remove(&id);
+            }
         }
-        self.extensions
-            .sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
-        self.top.sort_unstable_by(|a, b| {
-            crate::search::item_bytes(&current.scan, b.item)
-                .cmp(&crate::search::item_bytes(&current.scan, a.item))
-                .then_with(|| {
-                    crate::search::item_path(&current.scan, a.item)
-                        .cmp(&crate::search::item_path(&current.scan, b.item))
-                })
-        });
-        self.top.truncate(100);
+        let root = &current.scan.folders[new_folder];
+        self.bytes = root.logical_bytes;
+        self.files = root.file_count;
+        self.allocation = root.allocation;
+        self.extensions = sorted_extensions(groups);
+        self.top = local
+            .ranked
+            .iter()
+            .rev()
+            .take(100)
+            .map(|((_, Reverse(path)), &row)| {
+                let item = if current.entries.is_some() {
+                    current.item_at_path(path).expect("현재 통계 항목 경로")
+                } else {
+                    Item::File(row)
+                };
+                Hit { source: 0, item }
+            })
+            .collect();
         true
     }
 
@@ -113,6 +264,16 @@ pub fn extension(name: &std::ffi::OsStr) -> String {
     }
 }
 
+fn sorted_extensions(groups: HashMap<String, (u64, u64)>) -> Vec<ExtensionTotal> {
+    let mut extensions: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, (_, files))| *files > 0)
+        .map(|(name, (bytes, files))| ExtensionTotal { name, bytes, files })
+        .collect();
+    extensions.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    extensions
+}
+
 pub fn compute(
     sources: &[Snapshot],
     scope: &StatsScope,
@@ -127,7 +288,8 @@ pub fn compute(
     let mut heap = BinaryHeap::new();
     let mut allocation = Allocation::default();
     let mut unique_allocation = Allocation::default();
-    let mut unique: HashMap<Identity, (Field<u64>, bool)> = HashMap::new();
+    let mut unique: HashMap<Identity, LinkAllocations> = HashMap::new();
+    let mut local = matches!(scope, StatsScope::Subtree(_)).then(LocalRanking::default);
     let mut add = |source: usize, id: usize| -> io::Result<()> {
         if cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "통계 취소"));
@@ -138,20 +300,8 @@ pub fn compute(
             Field::Value(identity) => {
                 unique
                     .entry(identity)
-                    .and_modify(|old| {
-                        if !old.1 {
-                            match (old.0, file.extra.allocation) {
-                                (Field::Value(a), Field::Value(b)) if a != b => {
-                                    *old = (Field::Missing(Missing::Failed), true);
-                                }
-                                (Field::Missing(_), Field::Value(value)) => {
-                                    old.0 = Field::Value(value)
-                                }
-                                _ => {}
-                            }
-                        }
-                    })
-                    .or_insert((file.extra.allocation, false));
+                    .or_default()
+                    .add(file.extra.allocation);
             }
             Field::Missing(reason) => unique_allocation.add(Field::Missing(reason))?,
         }
@@ -168,9 +318,13 @@ pub fn compute(
         let path = sources[source].scan.folders[file.parent]
             .path
             .join(&file.name);
-        heap.push(Reverse((file.logical_bytes, Reverse(path), source, id)));
-        if heap.len() > 100 {
-            heap.pop();
+        if let Some(local) = &mut local {
+            local.ranked.insert((file.logical_bytes, Reverse(path)), id);
+        } else {
+            heap.push(Reverse((file.logical_bytes, Reverse(path), source, id)));
+            if heap.len() > 100 {
+                heap.pop();
+            }
         }
         Ok(())
     };
@@ -222,7 +376,7 @@ pub fn compute(
         }
     }
     let mut identity_conflicts = 0;
-    for (value, conflict) in unique.into_values() {
+    for (value, conflict) in unique.values().filter_map(LinkAllocations::total) {
         if cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "통계 취소"));
         }
@@ -231,11 +385,7 @@ pub fn compute(
         }
         unique_allocation.add(value)?;
     }
-    let mut extensions: Vec<_> = groups
-        .into_iter()
-        .map(|(name, (bytes, files))| ExtensionTotal { name, bytes, files })
-        .collect();
-    extensions.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+    let extensions = sorted_extensions(groups);
     let mut top: Vec<_> = heap
         .into_iter()
         .map(|Reverse((_, _, source, id))| Hit {
@@ -251,6 +401,19 @@ pub fn compute(
                     .cmp(&crate::search::item_path(&sources[b.source].scan, b.item))
             })
     });
+    if let Some(local) = &mut local {
+        top = local
+            .ranked
+            .values()
+            .rev()
+            .take(100)
+            .map(|&row| Hit {
+                source: 0,
+                item: Item::File(row),
+            })
+            .collect();
+        local.links = unique;
+    }
     Ok(Statistics {
         allocation,
         unique_allocation,
@@ -259,6 +422,7 @@ pub fn compute(
         files,
         extensions,
         top,
+        local,
     })
 }
 
@@ -266,6 +430,155 @@ pub fn compute(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn moved_subtree_reconnects_search_statistics_and_map_in_shifted_scope() {
+        use crate::search::{refresh_matches, search, SearchInput};
+        use crate::treemap::{collect, MapScope};
+        let (old, new) = crate::usn::stream::tests::folder_move_snapshots();
+        let old_folder = old.scan.folder_index(std::path::Path::new("z")).unwrap();
+        let new_folder = new.scan.folder_index(std::path::Path::new("z")).unwrap();
+        assert!(new.scan.folders.shares_row_with(&old.scan.folders, 256));
+        assert_ne!(old_folder, new_folder);
+        let input = SearchInput {
+            text: ".bin".into(),
+            ..Default::default()
+        };
+        let old_hits = search(&old.scan, &input.compile(old_folder).unwrap(), || false).unwrap();
+        let query = input.compile(new_folder).unwrap();
+        let matches = refresh_matches(&old.scan, &new.scan, &query, old_hits, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            matches.items,
+            search(&new.scan, &query, || false).unwrap().items
+        );
+        let mut old_stats = compute(
+            std::slice::from_ref(&old),
+            &StatsScope::Subtree(old_folder),
+            || false,
+        )
+        .unwrap();
+        assert!(old_stats.patch_local(&old, &new, old_folder));
+        let new_stats = compute(
+            std::slice::from_ref(&new),
+            &StatsScope::Subtree(new_folder),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                old_stats.bytes,
+                old_stats.files,
+                old_stats.unique_allocation
+            ),
+            (
+                new_stats.bytes,
+                new_stats.files,
+                new_stats.unique_allocation
+            )
+        );
+        assert_eq!(
+            old_stats
+                .top(100)
+                .iter()
+                .map(|h| h.item)
+                .collect::<Vec<_>>(),
+            new_stats
+                .top(100)
+                .iter()
+                .map(|h| h.item)
+                .collect::<Vec<_>>()
+        );
+        let mut old_map = collect(
+            std::slice::from_ref(&old),
+            &MapScope::Folder(old_folder),
+            || false,
+        )
+        .unwrap();
+        assert!(old_map.patch_local(&old, &new, old_folder));
+        let new_map = collect(
+            std::slice::from_ref(&new),
+            &MapScope::Folder(new_folder),
+            || false,
+        )
+        .unwrap();
+        let tiles = |map: &crate::treemap::MapData| {
+            map.tiles
+                .iter()
+                .map(|t| (t.target.map(|h| h.item), t.bytes, t.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tiles(&old_map), tiles(&new_map));
+    }
+    #[test]
+    fn local_delta_replaces_a_ranked_file_and_updates_hard_link_allocation() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        for n in 0..101 {
+            std::fs::write(fixture.0.join(format!("{n:03}")), vec![0; n + 1]).unwrap();
+        }
+        std::fs::hard_link(fixture.0.join("100"), fixture.0.join("alias")).unwrap();
+        let old = Snapshot {
+            id: 1,
+            generation: 1,
+            entries: None,
+            scan: Arc::new(
+                crate::scanner::scan_unified(
+                    &fixture.0,
+                    Default::default(),
+                    || false,
+                    |_| {},
+                    None,
+                )
+                .unwrap(),
+            ),
+        };
+        let mut stats = compute(std::slice::from_ref(&old), &StatsScope::Subtree(0), || {
+            false
+        })
+        .unwrap();
+        let mut result = (*old.scan).clone();
+        let row = result
+            .files
+            .iter()
+            .position(|file| file.name == "100")
+            .unwrap();
+        let file = &mut result.files[row];
+        result.folders[0].logical_bytes -= file.logical_bytes;
+        file.logical_bytes = 0;
+        let allocation = file.extra.allocation;
+        file.extra.allocation = Field::Value(0);
+        remove_allocation(&mut result.folders[0].allocation, allocation);
+        result.folders[0].allocation.add(Field::Value(0)).unwrap();
+        let item = Item::File(row);
+        result.partial = Some(Arc::new(crate::scanner::PartialUpdate {
+            previous: Arc::downgrade(&old.scan),
+            affected: [0].into_iter().collect(),
+            search: Some(crate::scanner::SearchDelta {
+                before: vec![item],
+                after: vec![item],
+                file_rows: None,
+                folder_rows: None,
+            }),
+        }));
+        let new = Snapshot {
+            scan: Arc::new(result),
+            generation: 2,
+            ..old.clone()
+        };
+        assert!(stats.patch_local(&old, &new, 0));
+        let rebuilt = compute(std::slice::from_ref(&new), &StatsScope::Subtree(0), || {
+            false
+        })
+        .unwrap();
+        assert_eq!((stats.bytes, stats.files), (rebuilt.bytes, rebuilt.files));
+        assert_eq!(stats.allocation, rebuilt.allocation);
+        assert_eq!(stats.unique_allocation, rebuilt.unique_allocation);
+        assert_eq!(stats.identity_conflicts, rebuilt.identity_conflicts);
+        assert_eq!(
+            stats.top(100).iter().map(|h| h.item).collect::<Vec<_>>(),
+            rebuilt.top(100).iter().map(|h| h.item).collect::<Vec<_>>()
+        );
+    }
     #[test]
     fn allocation_conflicts_and_missing_ids_do_not_become_complete_unique_totals() {
         let root = std::env::temp_dir().join(format!(

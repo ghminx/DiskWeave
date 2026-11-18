@@ -19,10 +19,35 @@ pub struct Key {
 /// 같은 추적 수명의 항목 ID와 화면용 배열 번호 대응.
 pub struct Projection {
     scope: u64,
-    paths: Arc<BTreeMap<PathBuf, u64>>,
+    paths: Arc<PathIndex>,
     folders: Vec<u64>,
     files: Vec<u64>,
     items: HashMap<u64, Item>,
+}
+// 완료 화면이 같은 경로표를 공유하고 바뀐 경로만 별도로 보관.
+enum PathIndex {
+    Full(BTreeMap<PathBuf, u64>),
+    Changes {
+        parent: Arc<PathIndex>,
+        depth: usize,
+        paths: BTreeMap<PathBuf, Option<u64>>,
+    },
+}
+impl PathIndex {
+    fn get(&self, path: &Path) -> Option<u64> {
+        match self {
+            Self::Full(paths) => paths.get(path).copied(),
+            Self::Changes { parent, paths, .. } => {
+                paths.get(path).copied().unwrap_or_else(|| parent.get(path))
+            }
+        }
+    }
+    fn depth(&self) -> usize {
+        match self {
+            Self::Full(_) => 0,
+            Self::Changes { depth, .. } => *depth,
+        }
+    }
 }
 impl Projection {
     pub(super) fn has_file_key(&self, row: usize, key: u64) -> bool {
@@ -54,7 +79,7 @@ impl Projection {
             .flatten()
     }
     pub fn path_key(&self, relative: &Path) -> Option<Key> {
-        let number = *self.paths.get(relative)?;
+        let number = self.paths.get(relative)?;
         self.items.contains_key(&number).then_some(Key {
             scope: self.scope,
             number,
@@ -275,6 +300,26 @@ impl Entries {
         files: Vec<u64>,
         cancelled: &impl Fn() -> bool,
     ) -> std::io::Result<Projection> {
+        self.project_rows(folders, files, None, cancelled)
+    }
+
+    pub(super) fn project_update(
+        &self,
+        folders: Vec<u64>,
+        files: Vec<u64>,
+        previous: &Projection,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Projection> {
+        self.project_rows(folders, files, Some(previous), cancelled)
+    }
+
+    fn project_rows(
+        &self,
+        folders: Vec<u64>,
+        files: Vec<u64>,
+        previous: Option<&Projection>,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Projection> {
         let mut items = HashMap::with_capacity(folders.len() + files.len());
         for (number, item) in folders
             .iter()
@@ -290,17 +335,41 @@ impl Entries {
             crate::output::check(cancelled)?;
             items.insert(number, item);
         }
-        Ok(Projection {
-            scope: self.scope,
-            paths: Arc::new(
+        let paths = if let Some((previous, undo)) = previous
+            .zip(self.undo.as_ref())
+            .filter(|(previous, _)| previous.paths.depth() < 8)
+        {
+            let mut paths = BTreeMap::new();
+            for (path, old) in &undo.before {
+                crate::output::check(cancelled)?;
+                let next = self.paths.get(path).copied();
+                if next != old.as_ref().map(|(number, _)| *number) {
+                    paths.insert(path.clone(), next);
+                }
+            }
+            if paths.is_empty() {
+                Arc::clone(&previous.paths)
+            } else {
+                Arc::new(PathIndex::Changes {
+                    parent: Arc::clone(&previous.paths),
+                    depth: previous.paths.depth() + 1,
+                    paths,
+                })
+            }
+        } else {
+            Arc::new(PathIndex::Full(
                 self.paths
                     .iter()
                     .map(|(path, number)| {
                         crate::output::check(cancelled)?;
                         Ok((path.clone(), *number))
                     })
-                    .collect::<io::Result<BTreeMap<_, _>>>()?,
-            ),
+                    .collect::<io::Result<_>>()?,
+            ))
+        };
+        Ok(Projection {
+            scope: self.scope,
+            paths,
             folders,
             files,
             items,

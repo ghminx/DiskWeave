@@ -24,6 +24,15 @@ pub struct Snapshot {
     pub generation: u64,
     pub scan: Arc<ScanResult>,
 }
+
+impl Snapshot {
+    pub(crate) fn item_at_path(&self, path: &Path) -> Option<crate::explorer::Item> {
+        let entries = self.entries.as_ref()?;
+        let relative = path.strip_prefix(&self.scan.folders[0].path).ok()?;
+        entries.item(entries.path_key(relative)?)
+    }
+}
+
 impl Snapshot {
     pub fn analyze(&self, item: crate::explorer::Item) -> crate::explorer::Explorer {
         let folder = match item {

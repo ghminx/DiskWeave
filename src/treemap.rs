@@ -2,7 +2,7 @@ use crate::explorer::Item;
 use crate::global_search::Hit;
 use crate::locations::Snapshot;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::io;
 
 pub enum MapScope {
@@ -15,10 +15,65 @@ pub struct Tile {
     pub bytes: u64,
     pub count: usize,
 }
+type Rank = (u64, Reverse<(usize, u8, usize)>);
+
+fn rank(hit: Hit, bytes: u64) -> Rank {
+    let (kind, row) = match hit.item {
+        Item::Folder(row) => (0, row),
+        Item::File(row) => (1, row),
+    };
+    (bytes, Reverse((hit.source, kind, row)))
+}
+
+fn unrank((bytes, Reverse((source, kind, row))): Rank) -> (u64, Hit) {
+    (
+        bytes,
+        Hit {
+            source,
+            item: if kind == 0 {
+                Item::Folder(row)
+            } else {
+                Item::File(row)
+            },
+        },
+    )
+}
+
+type LocalRank = (u64, Reverse<(bool, std::path::PathBuf)>);
+
+fn local_rank(scan: &crate::scanner::ScanResult, item: Item, bytes: u64) -> LocalRank {
+    (
+        bytes,
+        Reverse((
+            matches!(item, Item::File(_)),
+            crate::search::item_path(scan, item),
+        )),
+    )
+}
+
+fn display_tiles(entries: impl Iterator<Item = (u64, Hit)>, count: usize, total: u64) -> Vec<Tile> {
+    let mut tiles: Vec<_> = entries
+        .take(if count > 2000 { 1999 } else { 2000 })
+        .map(|(bytes, hit)| Tile {
+            target: Some(hit),
+            bytes,
+            count: 1,
+        })
+        .collect();
+    if count > 2000 {
+        tiles.push(Tile {
+            target: None,
+            bytes: total - tiles.iter().map(|tile| tile.bytes).sum::<u64>(),
+            count: count - tiles.len(),
+        });
+    }
+    tiles
+}
 pub struct MapData {
     pub total: u64,
     pub zero_count: usize,
     pub tiles: Vec<Tile>,
+    ranking: Option<BTreeMap<LocalRank, Item>>,
 }
 impl MapData {
     pub(crate) fn patch_local(
@@ -27,60 +82,59 @@ impl MapData {
         current: &Snapshot,
         folder: usize,
     ) -> bool {
-        let Some(items) = current.scan.stable_changes_from(&previous.scan) else {
+        let Some(delta) = current.scan.changes_from(&previous.scan) else {
             return false;
         };
-        if self.tiles.iter().any(|tile| tile.target.is_none()) {
+        let Some(Item::Folder(new_folder)) = delta.remap(Item::Folder(folder)) else {
+            return false;
+        };
+        if (delta.file_rows.is_some() || delta.folder_rows.is_some()) && current.entries.is_none() {
             return false;
         }
-        let mut changes = std::collections::HashMap::new();
-        let mut zero_count = self.zero_count;
-        let mut count = self.tiles.len();
-        for &item in items {
-            let parent = match item {
-                Item::Folder(row) => current.scan.folders[row].parent,
-                Item::File(row) => Some(current.scan.files[row].parent),
-            };
-            if parent != Some(folder) {
+        let Some(ranking) = &mut self.ranking else {
+            return false;
+        };
+        let in_folder = |scan: &crate::scanner::ScanResult, item, folder| {
+            (match item {
+                Item::Folder(row) => scan.folders[row].parent,
+                Item::File(row) => Some(scan.files[row].parent),
+            }) == Some(folder)
+        };
+        for &item in &delta.before {
+            if !in_folder(&previous.scan, item, folder) {
                 continue;
             }
             let old = crate::search::item_bytes(&previous.scan, item);
-            let new = crate::search::item_bytes(&current.scan, item);
-            match (old == 0, new == 0) {
-                (true, false) => {
-                    zero_count -= 1;
-                    count += 1;
-                }
-                (false, true) => {
-                    zero_count += 1;
-                    count -= 1;
-                }
-                _ => {}
+            if old == 0 {
+                self.zero_count -= 1;
+            } else {
+                ranking.remove(&local_rank(&previous.scan, item, old));
             }
-            changes.insert(item, new);
         }
-        if count > 2000 {
-            return false;
+        for &item in &delta.after {
+            if !in_folder(&current.scan, item, new_folder) {
+                continue;
+            }
+            let new = crate::search::item_bytes(&current.scan, item);
+            if new == 0 {
+                self.zero_count += 1;
+            } else {
+                ranking.insert(local_rank(&current.scan, item, new), item);
+            }
         }
-        self.tiles
-            .retain(|tile| !changes.contains_key(&tile.target.unwrap().item));
-        self.tiles
-            .extend(changes.into_iter().filter_map(|(item, bytes)| {
-                (bytes != 0).then_some(Tile {
-                    target: Some(Hit { source: 0, item }),
-                    bytes,
-                    count: 1,
-                })
-            }));
-        self.tiles.sort_unstable_by_key(|tile| {
-            let (kind, row) = match tile.target.unwrap().item {
-                Item::Folder(row) => (0, row),
-                Item::File(row) => (1, row),
-            };
-            (Reverse(tile.bytes), kind, row)
-        });
-        self.zero_count = zero_count;
-        self.total = current.scan.folders[folder].logical_bytes;
+        self.total = current.scan.folders[new_folder].logical_bytes;
+        let entries = ranking
+            .iter()
+            .rev()
+            .map(|((bytes, Reverse((_, path))), &fallback)| {
+                let item = if current.entries.is_some() {
+                    current.item_at_path(path).expect("현재 지도 항목 경로")
+                } else {
+                    fallback
+                };
+                (*bytes, Hit { source: 0, item })
+            });
+        self.tiles = display_tiles(entries, ranking.len(), self.total);
         true
     }
 }
@@ -97,6 +151,7 @@ pub fn collect(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<MapData> {
     let mut heap = BinaryHeap::new();
+    let mut ranking = matches!(scope, MapScope::Folder(_)).then(BTreeMap::new);
     let mut zero_count = 0;
     let mut total = 0u64;
     let mut count = 0usize;
@@ -113,13 +168,17 @@ pub fn collect(
             .checked_add(bytes)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "지도 크기 합계 초과"))?;
         count += 1;
-        let key = match hit.item {
-            Item::Folder(id) => (hit.source, 0u8, id),
-            Item::File(id) => (hit.source, 1u8, id),
-        };
-        heap.push(Reverse((bytes, Reverse(key))));
-        if heap.len() > 2000 {
-            heap.pop();
+        let value = rank(hit, bytes);
+        if let Some(ranking) = &mut ranking {
+            ranking.insert(
+                local_rank(&sources[hit.source].scan, hit.item, bytes),
+                hit.item,
+            );
+        } else {
+            heap.push(Reverse(value));
+            if heap.len() > 2000 {
+                heap.pop();
+            }
         }
         Ok(())
     };
@@ -175,38 +234,25 @@ pub fn collect(
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "지도 구성 취소"));
     }
-    if count > 2000 {
-        heap.pop();
-    }
-    let mut entries: Vec<_> = heap.into_iter().map(|Reverse(entry)| entry).collect();
-    entries.sort_by(|a, b| b.cmp(a));
-    let mut tiles: Vec<_> = entries
-        .into_iter()
-        .map(|(bytes, Reverse((source, kind, id)))| Tile {
-            bytes,
-            count: 1,
-            target: Some(Hit {
-                source,
-                item: if kind == 0 {
-                    Item::Folder(id)
-                } else {
-                    Item::File(id)
-                },
-            }),
-        })
-        .collect();
-    if count > 2000 {
-        let bytes = total - tiles.iter().map(|t| t.bytes).sum::<u64>();
-        tiles.push(Tile {
-            target: None,
-            bytes,
-            count: count - tiles.len(),
-        });
-    }
+    let tiles = if let Some(ranking) = &ranking {
+        display_tiles(
+            ranking
+                .iter()
+                .rev()
+                .map(|((bytes, _), &item)| (*bytes, Hit { source: 0, item })),
+            count,
+            total,
+        )
+    } else {
+        let mut entries: Vec<_> = heap.into_iter().map(|Reverse(entry)| entry).collect();
+        entries.sort_unstable_by(|a, b| b.cmp(a));
+        display_tiles(entries.into_iter().map(unrank), count, total)
+    };
     Ok(MapData {
         total,
         zero_count,
         tiles,
+        ranking,
     })
 }
 
@@ -434,11 +480,43 @@ mod tests {
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
         }];
-        let map = collect(&sources, &MapScope::Folder(0), || false).unwrap();
+        let mut map = collect(&sources, &MapScope::Folder(0), || false).unwrap();
         assert_eq!((map.total, map.tiles.len()), (2005, 2000));
         let group = map.tiles.iter().find(|t| t.target.is_none()).unwrap();
         assert_eq!((group.bytes, group.count), (6, 6));
         assert_eq!(map.tiles.iter().map(|t| t.bytes).sum::<u64>(), 2005);
+        let old = &sources[0];
+        let mut scan = (*old.scan).clone();
+        scan.files[0].logical_bytes = 0;
+        scan.folders[0].logical_bytes -= 1;
+        scan.partial = Some(Arc::new(crate::scanner::PartialUpdate {
+            previous: Arc::downgrade(&old.scan),
+            affected: [0].into_iter().collect(),
+            search: Some(crate::scanner::SearchDelta {
+                before: vec![Item::File(0)],
+                after: vec![Item::File(0)],
+                file_rows: None,
+                folder_rows: None,
+            }),
+        }));
+        let new = Snapshot {
+            scan: Arc::new(scan),
+            generation: 2,
+            ..old.clone()
+        };
+        assert!(map.patch_local(old, &new, 0));
+        let rebuilt = collect(&[new], &MapScope::Folder(0), || false).unwrap();
+        let tiles = |map: &MapData| {
+            map.tiles
+                .iter()
+                .map(|t| (t.target.map(|h| h.item), t.bytes, t.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tiles(&map), tiles(&rebuilt));
+        assert_eq!(
+            (map.total, map.zero_count),
+            (rebuilt.total, rebuilt.zero_count)
+        );
         let mut job = crate::map_job::MapController::default();
         job.submit(
             crate::analysis_panel::PanelKey {

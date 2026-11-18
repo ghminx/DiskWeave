@@ -153,22 +153,25 @@ impl SearchView {
         )>,
     ) {
         let scope = if self.whole_scan { 0 } else { folder };
-        let same_query = self.job.results().is_some()
-            && self.live_selection.is_none()
-            && self.last_request.as_ref() == Some(&(self.input.clone(), scope, self.whole_scan));
-        if same_query && new.subtree_unchanged_from(old, scope) {
+        let old_scope = self
+            .last_request
+            .as_ref()
+            .and_then(|(input, old_scope, whole)| {
+                (self.job.results().is_some()
+                    && self.live_selection.is_none()
+                    && input == &self.input
+                    && *whole == self.whole_scan)
+                    .then_some(*old_scope)
+            });
+        if old_scope == Some(scope) && new.subtree_unchanged_from(old, scope) {
             return;
         }
-        let partial = if same_query {
-            new.partial
-                .as_ref()
-                .filter(|delta| {
-                    delta.search.is_some() && std::ptr::eq(delta.previous.as_ptr(), old)
-                })
-                .and_then(|delta| delta.previous.upgrade())
-        } else {
-            None
-        };
+        let partial = old_scope.and_then(|old_scope| {
+            let delta = new.changes_from(old)?;
+            (delta.remap(Item::Folder(old_scope)) == Some(Item::Folder(scope)))
+                .then(|| new.partial.as_ref()?.previous.upgrade())
+                .flatten()
+        });
         let mut paths = if let Some(pending) = self.live_selection.take() {
             pending.4
         } else {
@@ -198,6 +201,7 @@ impl SearchView {
             self.selection.clear();
             self.reveal_row = None;
             self.focus_after_analysis = None;
+            self.last_request = Some((self.input.clone(), scope, self.whole_scan));
             self.job
                 .submit_update(Arc::clone(new), self.input.clone(), scope, previous);
         } else {

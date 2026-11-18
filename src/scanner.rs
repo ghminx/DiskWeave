@@ -78,7 +78,49 @@ pub(crate) struct PartialUpdate {
 pub(crate) struct SearchDelta {
     pub before: Vec<crate::explorer::Item>,
     pub after: Vec<crate::explorer::Item>,
-    pub file_rows: Option<Vec<usize>>,
+    pub file_rows: Option<RowRemap>,
+    pub folder_rows: Option<RowRemap>,
+}
+
+impl SearchDelta {
+    pub(crate) fn remap(&self, item: crate::explorer::Item) -> Option<crate::explorer::Item> {
+        use crate::explorer::Item;
+        match item {
+            Item::File(row) => self
+                .file_rows
+                .as_ref()
+                .map_or(Some(item), |rows| rows.get(row).map(Item::File)),
+            Item::Folder(row) => self
+                .folder_rows
+                .as_ref()
+                .map_or(Some(item), |rows| rows.get(row).map(Item::Folder)),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RowRemap {
+    runs: Vec<(usize, usize, usize)>,
+}
+impl RowRemap {
+    pub(crate) fn push_ordered(&mut self, old: usize, new: usize) {
+        if let Some((start, end, first)) = self.runs.last_mut() {
+            if old == *end && new == *first + (old - *start) {
+                *end += 1;
+                return;
+            }
+        }
+        self.runs.push((old, old + 1, new));
+    }
+
+    pub(crate) fn get(&self, old: usize) -> Option<usize> {
+        let at = self
+            .runs
+            .partition_point(|&(start, _, _)| start <= old)
+            .checked_sub(1)?;
+        let (start, end, first) = self.runs[at];
+        (old < end).then(|| first + old - start)
+    }
 }
 
 #[derive(Clone)]
@@ -93,14 +135,23 @@ pub struct FileEntry {
     pub modified: Option<SystemTime>,
 }
 
-// 이전 화면과 파일 묶음을 공유하고 수정이 필요한 묶음만 복사.
-#[derive(Clone, Default)]
-pub struct FileRows {
-    chunks: Vec<Arc<Vec<FileEntry>>>,
+// 이전 화면과 행 묶음을 공유하고 수정이 필요한 묶음만 복사.
+#[derive(Clone)]
+pub struct Rows<T> {
+    chunks: Vec<Arc<Vec<T>>>,
     len: usize,
 }
 
-impl FileRows {
+impl<T> Default for Rows<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T> Rows<T> {
     const CHUNK: usize = 256;
 
     pub fn len(&self) -> usize {
@@ -109,50 +160,84 @@ impl FileRows {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub fn get(&self, index: usize) -> Option<&FileEntry> {
+    pub fn get(&self, index: usize) -> Option<&T> {
         self.chunks
             .get(index / Self::CHUNK)?
             .get(index % Self::CHUNK)
     }
-    pub fn push(&mut self, file: FileEntry) {
+    pub fn push(&mut self, file: T)
+    where
+        T: Clone,
+    {
         if self.len.is_multiple_of(Self::CHUNK) {
             self.chunks.push(Arc::new(Vec::with_capacity(Self::CHUNK)));
         }
         Arc::make_mut(self.chunks.last_mut().unwrap()).push(file);
         self.len += 1;
     }
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &FileEntry> {
+    pub fn first(&self) -> Option<&T> {
+        self.get(0)
+    }
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+    pub(crate) fn append_reused_chunk(&mut self, previous: &Self, len: usize) -> bool {
+        if !self.len.is_multiple_of(Self::CHUNK) {
+            return false;
+        }
+        let Some(chunk) = previous
+            .chunks
+            .get(self.len / Self::CHUNK)
+            .filter(|chunk| chunk.len() == len)
+        else {
+            return false;
+        };
+        self.chunks.push(Arc::clone(chunk));
+        self.len += len;
+        true
+    }
+    #[cfg(test)]
+    pub(crate) fn shares_row_with(&self, previous: &Self, row: usize) -> bool {
+        self.chunks
+            .get(row / Self::CHUNK)
+            .zip(previous.chunks.get(row / Self::CHUNK))
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    }
+    pub(crate) const fn chunk_size() -> usize {
+        Self::CHUNK
+    }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         self.into_iter()
     }
 }
 
-impl std::ops::Index<usize> for FileRows {
-    type Output = FileEntry;
-    fn index(&self, index: usize) -> &FileEntry {
+impl<T> std::ops::Index<usize> for Rows<T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &T {
         &self.chunks[index / Self::CHUNK][index % Self::CHUNK]
     }
 }
 
-impl std::ops::IndexMut<usize> for FileRows {
-    fn index_mut(&mut self, index: usize) -> &mut FileEntry {
+impl<T: Clone> std::ops::IndexMut<usize> for Rows<T> {
+    fn index_mut(&mut self, index: usize) -> &mut T {
         &mut Arc::make_mut(&mut self.chunks[index / Self::CHUNK])[index % Self::CHUNK]
     }
 }
 
-impl<'a> IntoIterator for &'a FileRows {
-    type Item = &'a FileEntry;
+impl<'a, T> IntoIterator for &'a Rows<T> {
+    type Item = &'a T;
     type IntoIter = std::iter::FlatMap<
-        std::slice::Iter<'a, Arc<Vec<FileEntry>>>,
-        std::slice::Iter<'a, FileEntry>,
-        fn(&'a Arc<Vec<FileEntry>>) -> std::slice::Iter<'a, FileEntry>,
+        std::slice::Iter<'a, Arc<Vec<T>>>,
+        std::slice::Iter<'a, T>,
+        fn(&'a Arc<Vec<T>>) -> std::slice::Iter<'a, T>,
     >;
     fn into_iter(self) -> Self::IntoIter {
         self.chunks.iter().flat_map(|chunk| chunk.iter())
     }
 }
 
-impl FromIterator<FileEntry> for FileRows {
-    fn from_iter<T: IntoIterator<Item = FileEntry>>(iter: T) -> Self {
+impl<T: Clone> FromIterator<T> for Rows<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut files = Self::default();
         for file in iter {
             files.push(file);
@@ -173,8 +258,8 @@ pub struct ScanResult {
     pub detailed: bool,
     pub metadata_error_count: u64,
     pub metadata_issues: Vec<ScanIssue>,
-    pub folders: Vec<Folder>,
-    pub files: FileRows,
+    pub folders: Rows<Folder>,
+    pub files: Rows<FileEntry>,
     pub children: Vec<Arc<Vec<usize>>>,
     pub file_children: Vec<Arc<Vec<usize>>>,
     pub error_count: u64,
@@ -193,7 +278,7 @@ impl ScanResult {
             files: if keep_files {
                 self.files.clone()
             } else {
-                FileRows::default()
+                Rows::default()
             },
             children: self.children.clone(),
             file_children: self.file_children.clone(),
@@ -203,11 +288,12 @@ impl ScanResult {
         }
     }
 
-    pub(crate) fn stable_changes_from(&self, previous: &Self) -> Option<&[crate::explorer::Item]> {
+    pub(crate) fn changes_from(&self, previous: &Self) -> Option<&SearchDelta> {
         let update = self.partial.as_ref()?;
-        let delta = update.search.as_ref()?;
-        (std::ptr::eq(update.previous.as_ptr(), previous) && delta.file_rows.is_none())
-            .then_some(delta.after.as_slice())
+        if !std::ptr::eq(update.previous.as_ptr(), previous) {
+            return None;
+        }
+        update.search.as_ref()
     }
 
     pub fn subtree_unchanged_from(&self, previous: &Self, folder: usize) -> bool {
@@ -712,7 +798,7 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
         detailed,
         metadata_error_count: 0,
         metadata_issues: Vec::new(),
-        folders: vec![Folder {
+        folders: [Folder {
             access: Default::default(),
             allocation: Default::default(),
             created: metadata.created().ok(),
@@ -723,7 +809,9 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
             file_count: 0,
             folder_count: 0,
             modified: metadata.modified().ok(),
-        }],
+        }]
+        .into_iter()
+        .collect(),
         children: Vec::new(),
         files: Default::default(),
         file_children: Vec::new(),
@@ -737,27 +825,32 @@ fn empty_result(root: &Path, detailed: bool) -> io::Result<ScanResult> {
 /// 기본·NTFS 수집 결과에 동일한 누적 집계와 정렬 기준 적용.
 pub(crate) fn finish(result: &mut ScanResult) -> io::Result<()> {
     for child_index in (1..result.folders.len()).rev() {
-        let (parents, child_and_later) = result.folders.split_at_mut(child_index);
-        let child = &child_and_later[0];
-        let parent = &mut parents[child.parent.expect("루트 외 폴더의 부모")];
-        if child.access != FolderAccess::Complete {
+        let child = &result.folders[child_index];
+        let (parent, access, allocation, bytes, files, folders) = (
+            child.parent.expect("루트 외 폴더의 부모"),
+            child.access,
+            child.allocation,
+            child.logical_bytes,
+            child.file_count,
+            child.folder_count,
+        );
+        let parent = &mut result.folders[parent];
+        if access != FolderAccess::Complete {
             parent.access = FolderAccess::Partial;
         }
-        parent.allocation.merge(child.allocation)?;
-        parent.logical_bytes = parent
-            .logical_bytes
-            .checked_add(child.logical_bytes)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "논리 크기 합계가 표현 범위를 넘습니다",
-                )
-            })?;
-        parent.file_count += child.file_count;
-        parent.folder_count += child.folder_count + 1;
+        parent.allocation.merge(allocation)?;
+        parent.logical_bytes = parent.logical_bytes.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "논리 크기 합계가 표현 범위를 넘습니다",
+            )
+        })?;
+        parent.file_count += files;
+        parent.folder_count += folders + 1;
     }
 
-    for folder in &mut result.folders {
+    for row in 0..result.folders.len() {
+        let folder = &mut result.folders[row];
         if folder.access.unreadable() && (folder.file_count > 0 || folder.folder_count > 0) {
             folder.access = FolderAccess::Partial;
         }
