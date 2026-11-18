@@ -101,23 +101,37 @@ impl Issues {
         Self::record(&mut self.undo, path, self.values.get(path))?;
         Ok(self.values.remove(path))
     }
-    pub fn retain(
-        &mut self,
-        mut keep: impl FnMut(&PathBuf, &Unavailable) -> bool,
-    ) -> io::Result<()> {
-        let undo = &mut self.undo;
-        let mut failure = None;
-        self.values.retain(|path, value| {
-            if failure.is_some() || keep(path, value) {
-                return true;
+    pub fn subtree_keys<'a>(&'a self, root: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+        self.values
+            .range::<Path, _>((std::ops::Bound::Included(root), std::ops::Bound::Unbounded))
+            .map(|(path, _)| path)
+            .take_while(move |path| path.starts_with(root))
+    }
+
+    pub fn remove_subtree(&mut self, root: &Path, cancelled: &impl Fn() -> bool) -> io::Result<()> {
+        let _sample = super::cost::measure(super::cost::Stage::SubtreeRemoval);
+        loop {
+            let batch: Vec<_> = self.subtree_keys(root).take(256).cloned().collect();
+            if batch.is_empty() {
+                return Ok(());
             }
-            if let Err(error) = Self::record(undo, path, Some(value)) {
-                failure = Some(error);
-                return true;
+            for path in batch {
+                crate::output::check(cancelled)?;
+                self.remove(&path)?;
             }
-            false
-        });
-        failure.map_or(Ok(()), Err)
+        }
+    }
+    fn budget_change(&self) -> i128 {
+        self.undo
+            .iter()
+            .flat_map(|undo| &undo.before)
+            .map(|(path, before)| {
+                let cost = |item: Option<&Unavailable>| {
+                    item.map_or(0, |e| i128::from(super::stream::unavailable_cost(path, e)))
+                };
+                cost(self.values.get(path)) - cost(before.as_ref())
+            })
+            .sum()
     }
     pub fn changes(&self) -> impl Iterator<Item = Change> + '_ {
         self.undo
@@ -235,7 +249,12 @@ impl<'a> Edit<'a> {
         } else {
             None
         };
+        let budget_change = emit_changes
+            .then(|| self.index.nodes.budget_change() + self.index.unavailable.budget_change());
         crate::output::check(cancelled)?;
+        if let Some(change) = budget_change {
+            self.index.budget_change = change;
+        }
         self.index.nodes.finish_edit();
         self.index.unavailable.undo = None;
         self.index.changes = if emit_changes { changes } else { vec![] };

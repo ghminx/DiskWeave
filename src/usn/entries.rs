@@ -199,22 +199,47 @@ impl Entries {
         self.paths.remove(path);
         Ok(self.values.remove(&number))
     }
-    pub fn retain(&mut self, mut keep: impl FnMut(&PathBuf, &Node) -> bool) -> io::Result<()> {
-        let values = &mut self.values;
-        let undo = &mut self.undo;
-        let mut failure = None;
-        self.paths.retain(|path, number| {
-            if failure.is_some() || keep(path, &values[number]) {
-                return true;
+    pub fn subtree_keys<'a>(&'a self, root: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+        self.paths
+            .range::<Path, _>((std::ops::Bound::Included(root), std::ops::Bound::Unbounded))
+            .map(|(path, _)| path)
+            .take_while(move |path| path.starts_with(root))
+    }
+
+    pub fn remove_subtree(
+        &mut self,
+        root: &Path,
+        keep_root: bool,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        let _sample = super::cost::measure(super::cost::Stage::SubtreeRemoval);
+        loop {
+            let batch: Vec<_> = self
+                .subtree_keys(root)
+                .filter(|path| !keep_root || path.as_path() != root)
+                .take(256)
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                return Ok(());
             }
-            if let Err(error) = Self::record(undo, path, Some((*number, &values[number]))) {
-                failure = Some(error);
-                return true;
+            for path in batch {
+                crate::output::check(cancelled)?;
+                self.remove(&path)?;
             }
-            values.remove(number);
-            false
-        });
-        failure.map_or(Ok(()), Err)
+        }
+    }
+    pub fn budget_change(&self) -> i128 {
+        self.undo
+            .iter()
+            .flat_map(|undo| &undo.before)
+            .map(|(path, before)| {
+                let cost = |node: Option<&Node>| {
+                    node.map_or(0, |n| i128::from(super::stream::node_cost(path, n)))
+                };
+                cost(self.get(path)) - cost(before.as_ref().map(|(_, n)| n))
+            })
+            .sum()
     }
     pub fn mapping_changed(&self) -> bool {
         self.undo.as_ref().is_some_and(|undo| {
@@ -266,9 +291,6 @@ impl Entries {
     }
     pub fn values(&self) -> impl Iterator<Item = &Node> {
         self.values.values()
-    }
-    pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
-        self.paths.keys()
     }
     pub fn identified(&self) -> impl Iterator<Item = (&PathBuf, u64, &Node)> {
         self.paths

@@ -6,6 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 #[path = "usn/buffered.rs"]
 pub mod buffered;
+#[path = "usn/cost.rs"]
+pub mod cost;
 #[path = "usn/edit.rs"]
 pub mod edit;
 #[path = "usn/entries.rs"]
@@ -332,6 +334,7 @@ pub struct Index {
     started: SystemTime,
     changes: Vec<stream::Change>,
     last_edit: edit::Stats,
+    budget_change: i128,
 }
 struct RefreshPlan {
     root: Node,
@@ -538,6 +541,7 @@ impl Index {
             started,
             changes: vec![],
             last_edit: edit::Stats::default(),
+            budget_change: 0,
         };
         index.refresh(source, cancelled)?;
         Ok(index)
@@ -549,6 +553,7 @@ impl Index {
         now: SystemTime,
         nodes: &mut entries::Entries,
         unavailable: &mut edit::Issues,
+        cancelled: &impl Fn() -> bool,
     ) -> io::Result<()> {
         if relative.as_os_str().is_empty() {
             return Err(context(relative, reason.error()));
@@ -578,9 +583,9 @@ impl Index {
             Some(node) if !node.dir() => {
                 nodes.remove(relative)?;
             }
-            Some(_) => nodes.retain(|p, _| !p.starts_with(relative) || listing && p == relative)?,
+            Some(_) => nodes.remove_subtree(relative, listing, cancelled)?,
         }
-        unavailable.retain(|p, _| !p.starts_with(relative))?;
+        unavailable.remove_subtree(relative, cancelled)?;
         unavailable.insert(relative.to_owned(), value)?;
         Ok(())
     }
@@ -607,6 +612,7 @@ impl Index {
                         source.now(),
                         nodes,
                         unavailable,
+                        cancelled,
                     )?;
                     continue;
                 }
@@ -632,6 +638,7 @@ impl Index {
                             source.now(),
                             nodes,
                             unavailable,
+                            cancelled,
                         )?;
                         continue;
                     }
@@ -749,6 +756,7 @@ impl Index {
             started: record.started,
             changes: vec![],
             last_edit: edit::Stats::default(),
+            budget_change: 0,
         })
     }
     fn verify(&self, j: &Journal) -> io::Result<()> {
@@ -810,19 +818,33 @@ impl Index {
             self.checkpoint.confirmed_after = Some(confirmed_after);
             return Ok(false);
         }
-        let mut by_id: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        let lookup_cost = cost::measure(cost::Stage::ReverseLookup);
+        // 폴더 ID 충돌 검사는 범위 전체에 유지하고 파일 경로는 필요한 ID만 모음.
+        let mut needed: HashSet<_> = self
+            .nodes
+            .values()
+            .filter(|node| node.dir() && !node.excluded())
+            .map(|node| node.id)
+            .collect();
+        needed.extend(events.iter().flat_map(|event| [event.id, event.parent]));
+        needed.extend(self.checkpoint.pending.iter().copied());
+        let mut by_id: HashMap<u64, Vec<&PathBuf>> = HashMap::new();
         let mut directories = HashSet::new();
         for (path, n) in &self.nodes {
+            crate::output::check(cancelled)?;
+            if !needed.contains(&n.id) {
+                continue;
+            }
             let paths = by_id.entry(n.id).or_default();
             if n.dir() && !n.excluded() && !paths.is_empty() {
-                for p in paths.iter().chain(std::iter::once(path)) {
+                for &p in paths.iter().chain(std::iter::once(&path)) {
                     let parent = p
                         .parent()
                         .ok_or_else(|| invalid("추적 루트와 중복된 폴더 ID"))?;
                     directories.insert(parent.to_owned());
                 }
             }
-            paths.push(path.clone());
+            paths.push(path);
         }
         let mut files = HashSet::new();
         let mut pending: HashSet<_> = self.checkpoint.pending.iter().copied().collect();
@@ -842,7 +864,7 @@ impl Index {
             }
             let structural = e.reason & 0x00373300 != 0;
             if let Some(paths) = by_id.get(&e.id) {
-                for p in paths {
+                for &p in paths {
                     let n = &self.nodes[p];
                     if p.as_os_str().is_empty() {
                         continue;
@@ -855,7 +877,7 @@ impl Index {
                 }
             }
             if let Some(paths) = by_id.get(&e.parent) {
-                for p in paths {
+                for &p in paths {
                     if self.nodes[p].dir()
                         && !self.nodes[p].excluded()
                         && (structural || !by_id.contains_key(&e.id))
@@ -874,13 +896,14 @@ impl Index {
         }
         for id in &pending {
             if let Some(paths) = by_id.get(id) {
-                for p in paths {
+                for &p in paths {
                     if !self.nodes[p].dir() {
                         files.insert(p.clone());
                     }
                 }
             }
         }
+        drop(lookup_cost);
         let plan = RefreshPlan {
             root,
             directories,
@@ -897,16 +920,21 @@ impl Index {
         let final_journal = source.journal()?;
         edit.verify_at(&final_journal, journal.next)?;
         crate::output::check(cancelled)?;
-        let file_ids: HashSet<_> = edit
-            .nodes
-            .values()
-            .filter(|n| !n.dir() && !n.excluded())
-            .map(|n| n.id)
-            .collect();
-        let mut pending: Vec<_> = pending
-            .into_iter()
-            .filter(|id| file_ids.contains(id))
-            .collect();
+        let mut pending: Vec<_> = if pending.is_empty() {
+            Vec::new()
+        } else {
+            let mut found = HashSet::new();
+            for n in edit.nodes.values() {
+                crate::output::check(cancelled)?;
+                if !n.dir() && !n.excluded() && pending.contains(&n.id) {
+                    found.insert(n.id);
+                    if found.len() == pending.len() {
+                        break;
+                    }
+                }
+            }
+            found.into_iter().collect()
+        };
         pending.sort_unstable();
         let changed = edit.commit(cancelled, true)?;
         self.checkpoint.next = journal.next;
@@ -980,12 +1008,13 @@ impl Index {
                             now,
                             next,
                             unavailable,
+                            cancelled,
                         )?;
                         continue;
                     }
                     Ok(None) => {
-                        next.retain(|p, _| !p.starts_with(&directory))?;
-                        unavailable.retain(|p, _| !p.starts_with(&directory))?;
+                        next.remove_subtree(&directory, false, cancelled)?;
+                        unavailable.remove_subtree(&directory, cancelled)?;
                         continue;
                     }
                     Err(e) => return Err(context(&absolute, e)),
@@ -1016,6 +1045,7 @@ impl Index {
                             now,
                             next,
                             unavailable,
+                            cancelled,
                         )?;
                         continue;
                     }
@@ -1039,6 +1069,7 @@ impl Index {
                             now,
                             next,
                             unavailable,
+                            cancelled,
                         )?;
                         continue;
                     }
@@ -1085,6 +1116,7 @@ impl Index {
                                 now,
                                 next,
                                 unavailable,
+                                cancelled,
                             )?;
                             continue;
                         }
@@ -1106,6 +1138,7 @@ impl Index {
                             now,
                             next,
                             unavailable,
+                            cancelled,
                         )?;
                         continue;
                     }
@@ -1116,9 +1149,9 @@ impl Index {
                     if replaced {
                         // 새 경로에는 기존 하위 노드가 없으므로 전체 목록 순회 생략.
                         if next.contains_key(&rel) {
-                            next.retain(|p, _| !p.starts_with(&rel))?;
+                            next.remove_subtree(&rel, false, cancelled)?;
                         }
-                        unavailable.retain(|p, _| !p.starts_with(&rel))?;
+                        unavailable.remove_subtree(&rel, cancelled)?;
                     }
                     let descend = (replaced || recovered) && node.dir() && !node.excluded();
                     next.insert(rel.clone(), node)?;
@@ -1135,14 +1168,14 @@ impl Index {
                     }
                 }
                 let removed: Vec<_> = next
-                    .keys()
-                    .chain(unavailable.keys())
+                    .subtree_keys(&directory)
+                    .chain(unavailable.subtree_keys(&directory))
                     .filter(|p| p.parent() == Some(directory.as_path()) && !seen.contains(*p))
                     .cloned()
                     .collect();
                 for p in removed {
-                    next.retain(|key, _| !key.starts_with(&p))?;
-                    unavailable.retain(|key, _| !key.starts_with(&p))?;
+                    next.remove_subtree(&p, false, cancelled)?;
+                    unavailable.remove_subtree(&p, cancelled)?;
                 }
             }
             if rechecking {
@@ -1169,12 +1202,13 @@ impl Index {
                                 now,
                                 next,
                                 unavailable,
+                                cancelled,
                             )?;
                             continue;
                         }
                         Ok(None) => {
-                            next.retain(|p, _| !p.starts_with(&path))?;
-                            unavailable.retain(|p, _| !p.starts_with(&path))?;
+                            next.remove_subtree(&path, false, cancelled)?;
+                            unavailable.remove_subtree(&path, cancelled)?;
                             continue;
                         }
                         Err(e) => return Err(context(&absolute, e)),
@@ -2140,6 +2174,8 @@ mod tests {
         fs::create_dir(&folder).unwrap();
         let file = folder.join("data.bin");
         fs::write(&file, b"123").unwrap();
+        fs::create_dir(scope.join("sub-other")).unwrap();
+        fs::write(scope.join("sub-other/keep.bin"), b"12345678").unwrap();
         let root_id = f.id(&scope);
         let folder_id = f.id(&folder);
         let file_id = f.id(&file);
@@ -2152,9 +2188,10 @@ mod tests {
         f.event(folder_id, outside_parent, 0x80002000);
         assert!(index.refresh(&mut f, &|| false).unwrap());
         let record = index.snapshot(&|| false).unwrap();
-        assert_eq!(record.scan.folders[0].logical_bytes, 0);
-        assert_eq!(record.scan.folders.len(), 1);
-        assert!(record.scan.files.is_empty());
+        assert_eq!(record.scan.folders[0].logical_bytes, 8);
+        assert_eq!(record.scan.folders.len(), 2);
+        assert_eq!(record.scan.files.len(), 1);
+        assert_eq!(record.scan.files[0].name, "keep.bin");
         record
             .tracking
             .as_ref()

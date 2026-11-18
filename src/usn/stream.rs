@@ -152,20 +152,24 @@ pub(super) fn unavailable_cost(path: &Path, item: &Unavailable) -> u64 {
         + path.as_os_str().len() as u64 * 4
         + item.path.len() as u64 * 2
 }
-fn estimate(index: &Index) -> u64 {
-    index
-        .nodes
-        .iter()
-        .map(|(p, n)| node_cost(p, n))
-        .sum::<u64>()
-        + index
+fn estimate(index: &Index, cancelled: &impl Fn() -> bool) -> io::Result<u64> {
+    let mut cost = 0u64;
+    for value in index.nodes.iter().map(|(p, n)| node_cost(p, n)).chain(
+        index
             .unavailable
             .iter()
-            .map(|(p, n)| unavailable_cost(p, n))
-            .sum::<u64>()
+            .map(|(p, e)| unavailable_cost(p, e)),
+    ) {
+        crate::output::check(cancelled)?;
+        cost = cost
+            .checked_add(value)
+            .ok_or_else(|| invalid("갱신 목록이 메모리 예산을 초과했습니다"))?;
+    }
+    Ok(cost)
 }
 
 pub struct Sender {
+    units: u64,
     session: u64,
     revision: u64,
     limits: Limits,
@@ -173,6 +177,7 @@ pub struct Sender {
 impl Sender {
     pub fn new(session: u64, limits: Limits) -> Self {
         Self {
+            units: 0,
             session,
             revision: 0,
             limits,
@@ -187,14 +192,28 @@ impl Sender {
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<Stats> {
         crate::output::check(cancelled)?;
-        let quiet = self.revision != 0 && index.changes.is_empty();
-        if self.session == 0
-            || index.nodes.len() + index.unavailable.len() > self.limits.entries
-            || !quiet && estimate(index) > self.limits.state_bytes / 2
-        {
-            return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
-        }
         let baseline = self.revision == 0;
+        let quiet = !baseline && index.changes.is_empty();
+        let units = {
+            let _sample = super::cost::measure(super::cost::Stage::SendBudget);
+            if self.session == 0
+                || index.nodes.len() + index.unavailable.len() > self.limits.entries
+            {
+                return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
+            }
+            let units = if baseline {
+                estimate(index, cancelled)?
+            } else if quiet {
+                self.units
+            } else {
+                u64::try_from(i128::from(self.units) + index.budget_change)
+                    .map_err(|_| invalid("갱신 목록의 메모리 예산 합계 오류"))?
+            };
+            if units > self.limits.state_bytes / 2 {
+                return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
+            }
+            units
+        };
         let revision = self
             .revision
             .checked_add(1)
@@ -277,10 +296,27 @@ impl Sender {
         emit(writer, &end, self.limits, &mut digest, &mut stats)?;
         writer.flush()?;
         self.revision = revision;
+        self.units = units;
         index.changes.clear();
+        index.budget_change = 0;
         Ok(stats)
     }
 }
+#[derive(Default)]
+struct Validated {
+    ids: HashSet<u64>,
+    logical: u64,
+    allocation: u64,
+}
+
+fn file_sizes(node: &Node) -> (u64, u64) {
+    if node.dir() || node.excluded() {
+        (0, 0)
+    } else {
+        (node.bytes, node.extra.allocation.value().unwrap_or(0))
+    }
+}
+
 pub struct Receiver {
     root: PathBuf,
     detailed: bool,
@@ -290,7 +326,7 @@ pub struct Receiver {
     revision: u64,
     units: u64,
     finished: SystemTime,
-    ids: HashSet<u64>,
+    validation: Validated,
     dirty: bool,
     published: bool,
 }
@@ -305,7 +341,7 @@ impl Receiver {
             revision: 0,
             units: 0,
             finished: SystemTime::now(),
-            ids: HashSet::new(),
+            validation: Validated::default(),
             dirty: false,
             published: false,
         }
@@ -376,7 +412,7 @@ impl Receiver {
                 match read_frame(reader, self.limits, &mut digest)? {
                     Frame::Pending(ids) => {
                         for id in ids {
-                            if !self.ids.contains(&id)
+                            if !self.validation.ids.contains(&id)
                                 || !seen.insert(id)
                                 || pending.len() >= self.limits.entries
                             {
@@ -439,6 +475,7 @@ impl Receiver {
             started: header.started,
             changes: vec![],
             last_edit: Default::default(),
+            budget_change: 0,
         });
         let index = if baseline {
             fresh.as_mut().unwrap()
@@ -450,6 +487,9 @@ impl Receiver {
         let mut units = self.units;
         let mut frames = 1;
         let mut seen = HashSet::new();
+        let mut metadata_only = !baseline;
+        let mut logical = i128::from(self.validation.logical);
+        let mut allocation = i128::from(self.validation.allocation);
         let mut pending_seen = HashSet::new();
         loop {
             crate::output::check(cancelled)?;
@@ -482,6 +522,23 @@ impl Receiver {
                             {
                                 return Err(invalid("갱신 대상 파일 ID 불일치"));
                             }
+                            if metadata_only {
+                                if let Some((old, new)) =
+                                    candidate.nodes.get(&p).zip(value.as_ref()).filter(
+                                        |(old, new)| {
+                                            old.id == new.id
+                                                && old.attributes & 0x410 == new.attributes & 0x410
+                                        },
+                                    )
+                                {
+                                    let (old_bytes, old_alloc) = file_sizes(old);
+                                    let (new_bytes, new_alloc) = file_sizes(new);
+                                    logical += i128::from(new_bytes) - i128::from(old_bytes);
+                                    allocation += i128::from(new_alloc) - i128::from(old_alloc);
+                                } else {
+                                    metadata_only = false;
+                                }
+                            }
                             if let Some(old) = candidate.nodes.get(&p) {
                                 units -= node_cost(&p, old);
                             }
@@ -498,6 +555,7 @@ impl Receiver {
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
+                            metadata_only = false;
                             if candidate.unavailable.contains_key(&p) != present
                                 || baseline && present
                             {
@@ -542,7 +600,25 @@ impl Receiver {
                 return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
             }
         }
-        let ids = validate(&candidate, &pending, cancelled)?;
+        let (full_validation, logical, allocation) = {
+            let _sample = super::cost::measure(super::cost::Stage::ReceiveValidation);
+            if metadata_only {
+                for id in &pending {
+                    crate::output::check(cancelled)?;
+                    if !self.validation.ids.contains(id) {
+                        return Err(invalid("등록되지 않은 대기 파일 ID"));
+                    }
+                }
+                (
+                    None,
+                    u64::try_from(logical).map_err(|_| invalid("논리 크기 합계 초과"))?,
+                    u64::try_from(allocation).map_err(|_| invalid("할당 크기 합계 초과"))?,
+                )
+            } else {
+                let validated = validate(&candidate, &pending, cancelled)?;
+                (Some(validated.ids), validated.logical, validated.allocation)
+            }
+        };
         let changed = candidate.commit(cancelled, false)?;
         let index = if baseline {
             fresh.as_mut().unwrap()
@@ -565,7 +641,11 @@ impl Receiver {
         self.revision = revision;
         self.units = units;
         self.finished = header.finished;
-        self.ids = ids;
+        if let Some(ids) = full_validation {
+            self.validation.ids = ids;
+        }
+        self.validation.logical = logical;
+        self.validation.allocation = allocation;
         self.dirty |= changed;
         Ok(changed)
     }
@@ -606,6 +686,7 @@ impl Receiver {
             .ok_or_else(|| invalid("기준 목록 없음"))?;
         let mut record = index.snapshot(cancelled)?;
         record.finished = self.finished;
+        let _sample = super::cost::measure(super::cost::Stage::SnapshotValidation);
         record.tracking.as_ref().unwrap().validate(&record.scan)?;
         Ok(record)
     }
@@ -629,7 +710,7 @@ fn validate(
     index: &Index,
     pending: &[u64],
     cancelled: &impl Fn() -> bool,
-) -> io::Result<HashSet<u64>> {
+) -> io::Result<Validated> {
     let root = index
         .nodes
         .get(Path::new(""))
@@ -705,7 +786,11 @@ fn validate(
     if dirs.keys().any(|id| files.contains(id)) || pending.iter().any(|id| !files.contains(id)) {
         return Err(invalid("등록되지 않은 대기 파일 ID"));
     }
-    Ok(files)
+    Ok(Validated {
+        ids: files,
+        logical: bytes,
+        allocation,
+    })
 }
 
 #[cfg(test)]
@@ -898,6 +983,9 @@ pub(crate) mod tests {
         std::fs::write(branch.join("other"), b"12345").unwrap();
         let path = branch.join("file");
         std::fs::write(&path, b"123").unwrap();
+        for i in 0..128 {
+            std::fs::write(sibling.join(format!("unrelated-{i}")), []).unwrap();
+        }
         let saved = record(&fixture.0);
         let state = saved.tracking.as_ref().unwrap();
         let mut source = Source {
@@ -945,7 +1033,34 @@ pub(crate) mod tests {
         ));
         assert_eq!(before.tracking, kept.tracking);
         assert!(receiver.receive(&mut delta.as_slice(), &|| true).is_err());
-        receiver.receive(&mut delta.as_slice(), &|| false).unwrap();
+        for logical in [true, false] {
+            let overflow = rewrite(&delta, |frame| {
+                if let Frame::Change(Change::Node {
+                    value: Some(node), ..
+                }) = frame
+                {
+                    if node.bytes == 7 {
+                        if logical {
+                            node.bytes = u64::MAX;
+                        } else {
+                            node.extra.allocation = crate::metadata::Field::Value(u64::MAX);
+                        }
+                    }
+                }
+            });
+            let error = receiver
+                .receive(&mut overflow.as_slice(), &|| false)
+                .unwrap_err();
+            assert!(error.to_string().contains("합계 초과"), "{error}");
+            assert_eq!(receiver.advance().unwrap().next, state.next);
+        }
+        let checks = std::cell::Cell::new(0);
+        receiver
+            .receive(&mut delta.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 64
+            })
+            .expect("변경 없는 항목은 수신 재검증 범위에서 제외");
         let after = receiver.snapshot(&|| false).unwrap();
         assert_eq!(
             after
@@ -969,7 +1084,7 @@ pub(crate) mod tests {
         assert!(!after.scan.subtree_unchanged_from(&before.scan, branch_row));
         assert_eq!(after.scan.folders[0].logical_bytes, 18);
         assert_eq!(after.scan.folders[branch_row].logical_bytes, 12);
-        assert_eq!(after.scan.folders[0].file_count, 3);
+        assert_eq!(after.scan.folders[0].file_count, 131);
         assert_eq!(after.scan.children[0][0], branch_row);
         let first = after.scan.file_children[branch_row][0];
         assert_eq!(after.scan.files[first].name, "file");
@@ -1163,6 +1278,56 @@ pub(crate) mod tests {
             }
             previous = current;
         }
+    }
+
+    #[test]
+    fn sender_budget_tracks_path_growth_without_consuming_a_failed_revision() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("file");
+        std::fs::write(&path, b"123").unwrap();
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            events: vec![],
+            journal: super::super::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let baseline_cost = estimate(&index, &|| false).unwrap();
+        let mut sender = Sender::new(
+            17,
+            Limits {
+                state_bytes: baseline_cost * 2,
+                ..Default::default()
+            },
+        );
+        let mut receiver = Receiver::new(fixture.0.clone(), true, Default::default());
+        let mut baseline = Vec::new();
+        sender.write(&mut baseline, &mut index, &|| false).unwrap();
+        receiver
+            .receive(&mut baseline.as_slice(), &|| false)
+            .unwrap();
+        let moved = fixture.0.join("longer-name-for-budget.bin");
+        std::fs::rename(&path, &moved).unwrap();
+        event(&mut source, &moved, state.root, 0x80003000);
+        assert!(index.refresh(&mut source, &|| false).unwrap());
+        let mut wire = vec![];
+        assert!(sender.write(&mut wire, &mut index, &|| false).is_err());
+        assert!(wire.is_empty());
+        sender.limits = Default::default();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        assert!(receiver.receive(&mut wire.as_slice(), &|| false).unwrap());
+        assert_eq!(
+            receiver.snapshot(&|| false).unwrap().scan.files[0].name,
+            "longer-name-for-budget.bin"
+        );
     }
 
     #[test]

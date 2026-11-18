@@ -265,7 +265,9 @@ fn baseline(count: usize, width: usize) -> io::Result<SavedScan> {
             created: Some(time),
             modified: Some(time),
             attributes: 16,
-        }].into_iter().collect(),
+        }]
+        .into_iter()
+        .collect(),
         files: (0..count)
             .map(|i| FileEntry {
                 name: name(i, width).into(),
@@ -350,6 +352,91 @@ impl Source for Synthetic {
         Err(io::Error::other("변경 파일만 조회해야 하는 합성 시험"))
     }
 }
+struct DirectoryRemoval {
+    root: PathBuf,
+    count: usize,
+    removed: bool,
+}
+impl Source for DirectoryRemoval {
+    fn journal(&mut self) -> io::Result<Journal> {
+        Ok(Journal {
+            volume: "synthetic".into(),
+            id: 7,
+            first: 0,
+            lowest: 0,
+            next: if self.removed { 108 } else { 100 },
+        })
+    }
+    fn read(&mut self, start: i64, _: i64) -> io::Result<Vec<Event>> {
+        Ok(if self.removed && start == 100 {
+            vec![Event {
+                usn: 100,
+                id: 3,
+                parent: 2,
+                reason: 0x80000200,
+            }]
+        } else {
+            vec![]
+        })
+    }
+    fn inspect(&mut self, path: &Path, _: bool) -> io::Result<crate::ntfs::Info> {
+        let relative = path.strip_prefix(&self.root).unwrap();
+        let (id, directory) = match relative.to_str().unwrap() {
+            "" => (1, true),
+            "holder" => (2, true),
+            "holder\\drop" => (3, true),
+            "holder\\drop\\one" => (4, false),
+            name => (name.parse::<u64>().unwrap() + 5, false),
+        };
+        Ok(crate::ntfs::Info {
+            resolved: Some(path.to_owned()),
+            reference: Some(crate::ntfs::Id::V2(id)),
+            bytes: if directory { 0 } else { 8 },
+            attributes: if directory { 16 } else { 32 },
+            created: None,
+            modified: None,
+            extra: crate::metadata::Report {
+                values: Default::default(),
+                issue: None,
+            },
+        })
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        if path == self.root {
+            return Ok((0..self.count)
+                .map(|i| path.join(i.to_string()))
+                .chain(std::iter::once(path.join("holder")))
+                .collect());
+        }
+        Ok(
+            match path.strip_prefix(&self.root).unwrap().to_str().unwrap() {
+                "holder" if !self.removed => vec![path.join("drop")],
+                "holder\\drop" if !self.removed => vec![path.join("one")],
+                _ => vec![],
+            },
+        )
+    }
+}
+
+fn removal_cost(count: usize, root: &Path) -> io::Result<serde_json::Value> {
+    let mut source = DirectoryRemoval {
+        root: root.to_owned(),
+        count,
+        removed: false,
+    };
+    let mut index = Index::begin(root, false, &mut source, &|| false)?;
+    source.removed = true;
+    crate::usn::cost::start();
+    let started = Instant::now();
+    assert!(index.refresh(&mut source, &|| false)?);
+    let refresh = started.elapsed().as_secs_f64();
+    let stages = crate::usn::cost::finish();
+    let saved = index.snapshot(&|| false)?;
+    assert_eq!(saved.scan.folders.len(), 2);
+    assert_eq!(saved.scan.files.len(), count);
+    Ok(serde_json::json!({"refresh_seconds":refresh,"stage_ns":stages}))
+}
+
 pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
     let count: usize = count
         .parse()
@@ -402,6 +489,7 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
             name: name(0, width),
             time: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
         };
+        crate::usn::cost::start();
         let changed = Instant::now();
         index.refresh(&mut source, &|| false)?;
         let refresh = changed.elapsed().as_secs_f64();
@@ -420,6 +508,7 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
             }
         }
         let (delta_bytes, delta_cost) = new_update.unwrap();
+        let stage_ns = crate::usn::cost::finish();
         let result = receiver.snapshot(&|| false)?;
         assert_eq!(
             result
@@ -440,7 +529,8 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
         assert_eq!(result.scan.folders[0].logical_bytes, count as u64 * 8 + 9);
         result.tracking.as_ref().unwrap().validate(&result.scan)?;
         let (bytes, cost) = new.unwrap();
-        results.push(serde_json::json!({"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
+        let removal = removal_cost(count, &root)?;
+        results.push(serde_json::json!({"subtree":removal,"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"stage_ns":stage_ns,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
     }
     let cancel_ms = cancellation(&mut Index::restore(&record)?, &root)?;
     let report = serde_json::json!({"count":count,"name_width":width,"bounded_channel_bytes":4*BUFFER,"frame_limit_bytes":1024*1024,"cancel_ms":cancel_ms,"note":"같은 프로세스의 제한된 채널에서 전송과 부모 결과 구성을 측정함. CPU는 프로세스 시간 차이, RAM은 해당 단계에서 이미 유지 중인 원본/인덱스/이전 결과를 포함한 25ms 간격 working set 표본 최대값임. 실제 관리자 IPC/UAC·OS 수집·GUI 게시 시간은 포함하지 않음. 재구성·원본 수집의 전체 메모리 상한을 의미하지 않음.","results":results});
