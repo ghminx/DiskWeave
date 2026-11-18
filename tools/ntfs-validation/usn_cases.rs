@@ -388,7 +388,7 @@ pub fn run(root: &Path, target: &crate::ntfs_native::Target) -> io::Result<()> {
                 ready: &|| true,
             },
             |update| {
-                if let crate::usn::WatchUpdate::Record(record) = update {
+                if let crate::usn::WatchUpdate::Record(record) = update.into_update() {
                     *worker_output.lock().unwrap() = Some(*record);
                 }
                 Ok(())

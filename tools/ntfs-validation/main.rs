@@ -95,8 +95,8 @@ fn run() -> io::Result<()> {
     if args.first().is_some_and(|a| a == "--ntfs-worker") {
         return ntfs_helper::worker(&args[1..]);
     }
-    if args.len() == 2 && args[0] == "--system-watch" {
-        return system_watch::run(Path::new(&args[1]));
+    if args.len() == 2 && (args[0] == "--system-watch" || args[0] == "--system-watch-profile") {
+        return system_watch::run(Path::new(&args[1]), args[0] == "--system-watch-profile");
     }
     if args.len() == 3 && args[0] == "--identity-pair" {
         return identity_cases::run(Path::new(&args[1]), Path::new(&args[2]));

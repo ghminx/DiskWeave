@@ -356,6 +356,7 @@ struct DirectoryRemoval {
     root: PathBuf,
     count: usize,
     removed: bool,
+    file_only: bool,
 }
 impl Source for DirectoryRemoval {
     fn journal(&mut self) -> io::Result<Journal> {
@@ -371,8 +372,8 @@ impl Source for DirectoryRemoval {
         Ok(if self.removed && start == 100 {
             vec![Event {
                 usn: 100,
-                id: 3,
-                parent: 2,
+                id: if self.file_only { 4 } else { 3 },
+                parent: if self.file_only { 3 } else { 2 },
                 reason: 0x80000200,
             }]
         } else {
@@ -410,7 +411,7 @@ impl Source for DirectoryRemoval {
         }
         Ok(
             match path.strip_prefix(&self.root).unwrap().to_str().unwrap() {
-                "holder" if !self.removed => vec![path.join("drop")],
+                "holder" if !self.removed || self.file_only => vec![path.join("drop")],
                 "holder\\drop" if !self.removed => vec![path.join("one")],
                 _ => vec![],
             },
@@ -418,23 +419,39 @@ impl Source for DirectoryRemoval {
     }
 }
 
-fn removal_cost(count: usize, root: &Path) -> io::Result<serde_json::Value> {
+fn removal_cost(count: usize, root: &Path, file_only: bool) -> io::Result<serde_json::Value> {
     let mut source = DirectoryRemoval {
         root: root.to_owned(),
         count,
         removed: false,
+        file_only,
     };
     let mut index = Index::begin(root, false, &mut source, &|| false)?;
+    let mut sender = crate::usn::stream::Sender::new(21, Default::default());
+    let mut receiver =
+        crate::usn::stream::Receiver::new(root.to_owned(), false, Default::default());
+    transfer(&mut sender, &mut index, &mut receiver)?;
     source.removed = true;
     crate::usn::cost::start();
     let started = Instant::now();
     assert!(index.refresh(&mut source, &|| false)?);
     let refresh = started.elapsed().as_secs_f64();
+    let (wire_bytes, delta) = transfer(&mut sender, &mut index, &mut receiver)?;
     let stages = crate::usn::cost::finish();
-    let saved = index.snapshot(&|| false)?;
-    assert_eq!(saved.scan.folders.len(), 2);
+    let saved = receiver.snapshot(&|| false)?;
+    assert_eq!(saved.scan.folders.len(), if file_only { 3 } else { 2 });
     assert_eq!(saved.scan.files.len(), count);
-    Ok(serde_json::json!({"refresh_seconds":refresh,"stage_ns":stages}))
+    assert_eq!(saved.scan.folders[0].logical_bytes, count as u64 * 8);
+    assert_eq!(
+        saved.scan.folder_index(Path::new("holder/drop")).is_ok(),
+        file_only
+    );
+    Ok(serde_json::json!({
+        "refresh_seconds": refresh,
+        "wire_bytes": wire_bytes,
+        "delta": delta,
+        "stage_ns": stages,
+    }))
 }
 
 pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
@@ -529,8 +546,9 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
         assert_eq!(result.scan.folders[0].logical_bytes, count as u64 * 8 + 9);
         result.tracking.as_ref().unwrap().validate(&result.scan)?;
         let (bytes, cost) = new.unwrap();
-        let removal = removal_cost(count, &root)?;
-        results.push(serde_json::json!({"subtree":removal,"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"stage_ns":stage_ns,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
+        let removal = removal_cost(count, &root, false)?;
+        let file_removal = removal_cost(count, &root, true)?;
+        results.push(serde_json::json!({"subtree":removal,"file_removal":file_removal,"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"stage_ns":stage_ns,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
     }
     let cancel_ms = cancellation(&mut Index::restore(&record)?, &root)?;
     let report = serde_json::json!({"count":count,"name_width":width,"bounded_channel_bytes":4*BUFFER,"frame_limit_bytes":1024*1024,"cancel_ms":cancel_ms,"note":"같은 프로세스의 제한된 채널에서 전송과 부모 결과 구성을 측정함. CPU는 프로세스 시간 차이, RAM은 해당 단계에서 이미 유지 중인 원본/인덱스/이전 결과를 포함한 25ms 간격 working set 표본 최대값임. 실제 관리자 IPC/UAC·OS 수집·GUI 게시 시간은 포함하지 않음. 재구성·원본 수집의 전체 메모리 상한을 의미하지 않음.","results":results});

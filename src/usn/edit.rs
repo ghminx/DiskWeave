@@ -1,4 +1,4 @@
-use super::{stream::Change, Index, Unavailable};
+use super::{stream, Index, Node, Unavailable};
 use crate::{
     explorer::Item,
     metadata::Allocation,
@@ -9,13 +9,56 @@ use std::{
     collections::BTreeMap,
     io,
     ops::{Deref, DerefMut},
-    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
+
+pub(super) enum Change {
+    Node {
+        path: PathBuf,
+        expected: Option<u64>,
+        value: Option<Node>,
+        old_cost: u64,
+    },
+    Unavailable {
+        path: PathBuf,
+        present: bool,
+        value: Option<Unavailable>,
+        old_cost: u64,
+    },
+}
+impl Change {
+    pub fn budget_delta(&self) -> i128 {
+        let (before, after) = match self {
+            Self::Node {
+                path,
+                value,
+                old_cost,
+                ..
+            } => (
+                *old_cost,
+                value
+                    .as_ref()
+                    .map_or(0, |node| stream::node_cost(path, node)),
+            ),
+            Self::Unavailable {
+                path,
+                value,
+                old_cost,
+                ..
+            } => (
+                *old_cost,
+                value
+                    .as_ref()
+                    .map_or(0, |entry| stream::unavailable_cost(path, entry)),
+            ),
+        };
+        i128::from(after) - i128::from(before)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Stats {
@@ -121,18 +164,6 @@ impl Issues {
             }
         }
     }
-    fn budget_change(&self) -> i128 {
-        self.undo
-            .iter()
-            .flat_map(|undo| &undo.before)
-            .map(|(path, before)| {
-                let cost = |item: Option<&Unavailable>| {
-                    item.map_or(0, |e| i128::from(super::stream::unavailable_cost(path, e)))
-                };
-                cost(self.values.get(path)) - cost(before.as_ref())
-            })
-            .sum()
-    }
     pub fn changes(&self) -> impl Iterator<Item = Change> + '_ {
         self.undo
             .as_ref()
@@ -141,7 +172,10 @@ impl Issues {
             .filter_map(|(path, old)| {
                 let new = self.values.get(path);
                 (old.as_ref() != new).then(|| Change::Unavailable {
-                    path: path.as_os_str().encode_wide().collect(),
+                    path: path.clone(),
+                    old_cost: old
+                        .as_ref()
+                        .map_or(0, |entry| stream::unavailable_cost(path, entry)),
                     present: old.is_some(),
                     value: new.cloned(),
                 })
@@ -221,6 +255,7 @@ impl<'a> Edit<'a> {
         crate::output::check(cancelled)?;
         let mut changes = Vec::new();
         let mut changed_entries = 0;
+        let mut budget_change = 0;
         for change in self
             .index
             .nodes
@@ -229,6 +264,9 @@ impl<'a> Edit<'a> {
         {
             crate::output::check(cancelled)?;
             changed_entries += 1;
+            if emit_changes {
+                budget_change += change.budget_delta();
+            }
             changes.push(change);
         }
         crate::output::check(cancelled)?;
@@ -249,11 +287,9 @@ impl<'a> Edit<'a> {
         } else {
             None
         };
-        let budget_change = emit_changes
-            .then(|| self.index.nodes.budget_change() + self.index.unavailable.budget_change());
         crate::output::check(cancelled)?;
-        if let Some(change) = budget_change {
-            self.index.budget_change = change;
+        if emit_changes {
+            self.index.budget_change = budget_change;
         }
         self.index.nodes.finish_edit();
         self.index.unavailable.undo = None;
@@ -324,8 +360,8 @@ fn patch_scan(
         let Change::Node { path, value, .. } = change else {
             return Ok(None);
         };
-        let relative = PathBuf::from(std::ffi::OsString::from_wide(path));
-        let old = index.nodes.original(&relative);
+        let relative = path.as_path();
+        let old = index.nodes.original(relative);
         let new = value.as_ref();
         if old.and_then(|n| n.issue.as_ref()) != new.and_then(|n| n.issue.as_ref()) {
             return Ok(None);
@@ -340,7 +376,7 @@ fn patch_scan(
             if old.is_some_and(super::Node::excluded) {
                 continue;
             }
-            let Some(Item::Folder(row)) = find(&relative) else {
+            let Some(Item::Folder(row)) = find(relative) else {
                 return Ok(None);
             };
             edits.push((Some(Item::Folder(row)), row, old, new));
@@ -348,9 +384,9 @@ fn patch_scan(
             let Some(Item::Folder(parent)) = relative.parent().and_then(find) else {
                 return Ok(None);
             };
-            let item = find(&relative);
+            let item = find(relative);
             if structural && new.is_some() && changes.len() <= 256 {
-                changed_paths.insert(relative);
+                changed_paths.insert(relative.to_owned());
             }
             edits.push((item, parent, old, new));
         }
@@ -556,15 +592,14 @@ fn patch_tree(
         let Change::Node { path, value, .. } = change else {
             return Ok(None);
         };
-        let path = PathBuf::from(std::ffi::OsString::from_wide(path));
-        let old = index.nodes.original(&path);
+        let old = index.nodes.original(path);
         let new = value.as_ref();
         if old.into_iter().chain(new).any(|n| n.excluded())
             || old.and_then(|n| n.issue.as_ref()) != new.and_then(|n| n.issue.as_ref())
         {
             return Ok(None);
         }
-        delta.push((path, old, new));
+        delta.push((path.as_path(), old, new));
     }
 
     let mut scan = previous.copy_for_update(false);
@@ -728,7 +763,7 @@ fn patch_tree(
     }))
 }
 
-type TreeChange<'a> = (PathBuf, Option<&'a super::Node>, Option<&'a super::Node>);
+type TreeChange<'a> = (&'a Path, Option<&'a super::Node>, Option<&'a super::Node>);
 
 fn tree_search_delta(
     previous: &ScanResult,

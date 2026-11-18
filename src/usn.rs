@@ -332,7 +332,7 @@ pub struct Index {
     scan: Option<Arc<ScanResult>>,
     projection: Option<Arc<entries::Projection>>,
     started: SystemTime,
-    changes: Vec<stream::Change>,
+    changes: Vec<edit::Change>,
     last_edit: edit::Stats,
     budget_change: i128,
 }
@@ -1048,6 +1048,20 @@ impl Index {
                             cancelled,
                         )?;
                         continue;
+                    }
+                    Err(e)
+                        if !directory.as_os_str().is_empty()
+                            && e.kind() == io::ErrorKind::NotFound =>
+                    {
+                        attempted.remove(&directory);
+                        recheck_directory_parent(
+                            &directory,
+                            &mut directory_rechecks,
+                            &mut directories,
+                        )?;
+                        directories.extend(batch);
+                        rechecking = true;
+                        break;
                     }
                     Err(e) => return Err(context(&absolute, e)),
                 };

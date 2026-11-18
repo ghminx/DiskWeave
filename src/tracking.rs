@@ -1,5 +1,6 @@
 use crate::snapshot::SavedScan;
-use crate::usn::{Advance, WatchUpdate};
+use crate::usn::{stream::Publication, Advance, WatchUpdate};
+#[cfg(test)]
 use std::collections::HashSet;
 use std::{
     io,
@@ -43,13 +44,22 @@ impl Confirmation {
         Ok(())
     }
 }
+/// 대상과 기준점이 검증된 완료 결과.
+pub struct PublishedRecord(Box<SavedScan>);
+impl std::ops::Deref for PublishedRecord {
+    type Target = SavedScan;
+
+    fn deref(&self) -> &SavedScan {
+        &self.0
+    }
+}
+
 pub enum Update {
-    Record(Box<SavedScan>),
+    Record(PublishedRecord),
     Cursor(Confirmation),
 }
 struct Current {
     scan: Arc<crate::scanner::ScanResult>,
-    ids: HashSet<u64>,
     next: i64,
 }
 #[derive(Default)]
@@ -91,7 +101,7 @@ impl Controller {
         let ready = Arc::clone(&self.publication_ready);
         let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
         let worker_progress = Arc::clone(&progress);
-        self.start_with(
+        self.start_verified_with(
             id,
             root,
             detailed,
@@ -115,6 +125,7 @@ impl Controller {
         self.progress = progress;
         Ok(())
     }
+    #[cfg(test)]
     pub fn start_with(
         &mut self,
         id: u64,
@@ -127,6 +138,60 @@ impl Controller {
                 Option<Arc<SavedScan>>,
                 &dyn Fn() -> bool,
                 &mut dyn FnMut(WatchUpdate) -> io::Result<()>,
+            ) -> io::Result<()>
+            + Send
+            + 'static,
+    ) -> io::Result<()> {
+        self.start_verified_with(
+            id,
+            root,
+            detailed,
+            resume,
+            move |path, detailed, resume, cancel, publish| {
+                let mut ids = HashSet::new();
+                run(path, detailed, resume, cancel, &mut |response| {
+                    crate::output::check(&cancel)?;
+                    match &response {
+                        WatchUpdate::Record(record) => {
+                            let checkpoint = record
+                                .tracking
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("변경 추적 기준점 누락"))?;
+                            checkpoint.validate(&record.scan)?;
+                            ids = checkpoint.files.iter().copied().collect();
+                        }
+                        WatchUpdate::Cursor(advance) => {
+                            let mut pending = HashSet::new();
+                            if advance.pending.len() > ids.len()
+                                || advance
+                                    .pending
+                                    .iter()
+                                    .any(|id| !ids.contains(id) || !pending.insert(*id))
+                            {
+                                return Err(io::Error::other(
+                                    "확인 응답의 변경 위치·대기 파일 ID 오류",
+                                ));
+                            }
+                        }
+                    }
+                    publish(Publication::validated_fixture(response))
+                })
+            },
+        )
+    }
+
+    pub(crate) fn start_verified_with(
+        &mut self,
+        id: u64,
+        root: PathBuf,
+        detailed: bool,
+        resume: Option<Arc<SavedScan>>,
+        run: impl FnOnce(
+                &Path,
+                bool,
+                Option<Arc<SavedScan>>,
+                &dyn Fn() -> bool,
+                &mut dyn FnMut(Publication) -> io::Result<()>,
             ) -> io::Result<()>
             + Send
             + 'static,
@@ -149,7 +214,7 @@ impl Controller {
             let mut current: Option<Current> = None;
             let result = run(&path, detailed, resume, &stopped, &mut |update| {
                 crate::output::check(&stopped)?;
-                let checked = match update {
+                let checked = match update.into_update() {
                     WatchUpdate::Record(record) => {
                         if record.scan.folders.first().is_none_or(|f| f.path != path)
                             || record.scan.detailed != detailed
@@ -160,26 +225,17 @@ impl Controller {
                             .tracking
                             .as_ref()
                             .ok_or_else(|| io::Error::other("변경 추적 기준점 누락"))?;
-                        checkpoint.validate(&record.scan)?;
                         current = Some(Current {
                             scan: Arc::clone(&record.scan),
-                            ids: checkpoint.files.iter().copied().collect(),
                             next: checkpoint.next,
                         });
-                        Update::Record(record)
+                        Update::Record(PublishedRecord(record))
                     }
                     WatchUpdate::Cursor(advance) => {
                         let current = current
                             .as_mut()
                             .ok_or_else(|| io::Error::other("기준 결과 없는 확인 응답"))?;
-                        let mut pending = HashSet::new();
-                        if advance.next < current.next
-                            || advance.pending.len() > current.ids.len()
-                            || advance
-                                .pending
-                                .iter()
-                                .any(|id| !current.ids.contains(id) || !pending.insert(*id))
-                        {
+                        if advance.next < current.next {
                             return Err(io::Error::other(
                                 "확인 응답의 변경 위치·대기 파일 ID 오류",
                             ));
@@ -197,11 +253,11 @@ impl Controller {
                     Update::Cursor(cursor) => {
                         if let Some(Update::Record(record)) = output.update.as_mut() {
                             // 미수신 완료 결과를 유지하면서 같은 기준의 최신 확인만 병합.
-                            let c = record.tracking.as_mut().unwrap();
+                            let c = record.0.tracking.as_mut().unwrap();
                             c.next = cursor.advance.next;
                             c.pending = cursor.advance.pending;
                             c.confirmed_after = cursor.advance.confirmed_after;
-                            record.finished = cursor.advance.finished;
+                            record.0.finished = cursor.advance.finished;
                         } else {
                             output.update = Some(Update::Cursor(cursor));
                         }

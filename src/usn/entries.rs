@@ -1,5 +1,6 @@
-use super::{edit::Budget, stream::Change, Node};
+use super::{edit::Budget, edit::Change, Node};
 use crate::{explorer::Item, scanner::ScanResult};
+use std::io;
 use std::{
     collections::{btree_map, BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -8,7 +9,6 @@ use std::{
         Arc,
     },
 };
-use std::{io, os::windows::ffi::OsStrExt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -229,18 +229,6 @@ impl Entries {
             }
         }
     }
-    pub fn budget_change(&self) -> i128 {
-        self.undo
-            .iter()
-            .flat_map(|undo| &undo.before)
-            .map(|(path, before)| {
-                let cost = |node: Option<&Node>| {
-                    node.map_or(0, |n| i128::from(super::stream::node_cost(path, n)))
-                };
-                cost(self.get(path)) - cost(before.as_ref().map(|(_, n)| n))
-            })
-            .sum()
-    }
     pub fn mapping_changed(&self) -> bool {
         self.undo.as_ref().is_some_and(|undo| {
             undo.before
@@ -260,7 +248,8 @@ impl Entries {
                 let old = previous.as_ref().map(|(_, node)| node);
                 let new = self.get(path);
                 (old != new).then(|| Change::Node {
-                    path: path.as_os_str().encode_wide().collect(),
+                    path: path.clone(),
+                    old_cost: old.map_or(0, |node| super::stream::node_cost(path, node)),
                     expected: old.map(|node| node.id),
                     value: new.cloned(),
                 })

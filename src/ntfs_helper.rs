@@ -356,7 +356,7 @@ fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
 pub fn read_completed(reader: impl Read, root: &Path, detailed: bool) -> io::Result<ScanResult> {
     validate_response(read_record_from(reader)?, root, detailed)
 }
-use crate::usn::WatchUpdate;
+use crate::usn::stream::Publication;
 pub struct WatchControl<'a> {
     pub cancelled: &'a dyn Fn() -> bool,
     pub ready: &'a dyn Fn() -> bool,
@@ -367,7 +367,7 @@ pub fn watch(
     detailed: bool,
     resume: Option<Arc<SavedScan>>,
     control: WatchControl<'_>,
-    mut publish: impl FnMut(WatchUpdate) -> io::Result<()>,
+    mut publish: impl FnMut(Publication) -> io::Result<()>,
     mut progress: impl FnMut(Progress),
 ) -> io::Result<()> {
     let target = crate::usn_native::target(root)?;

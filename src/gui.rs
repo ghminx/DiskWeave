@@ -751,7 +751,7 @@ impl DiskWeaveApp {
                         .get(id)
                         .and_then(|e| e.scan.completed())
                         .map(|c| (Arc::clone(&c.result), c.entries.clone()));
-                    self.scan.accept_tracking(id, &record).map(|changed| {
+                    self.scan.accept_published(id, &record).map(|changed| {
                         if changed && self.scan.selected_id() == Some(id) {
                             let identities = old
                                 .as_ref()

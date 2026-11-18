@@ -120,11 +120,27 @@ impl Locations {
         Ok(true)
     }
     /// 검증된 추적 결과와 기준점을 함께 교체하고 화면 변경 시에만 세대 갱신.
+    #[cfg(test)]
     pub fn accept_tracking(
         &mut self,
         id: u64,
         record: &crate::snapshot::SavedScan,
     ) -> io::Result<bool> {
+        record
+            .tracking
+            .as_ref()
+            .ok_or_else(|| io::Error::other("변경 추적 기준점이 없습니다"))?
+            .validate(&record.scan)?;
+        self.apply_tracking(id, record)
+    }
+    pub fn accept_published(
+        &mut self,
+        id: u64,
+        record: &crate::tracking::PublishedRecord,
+    ) -> io::Result<bool> {
+        self.apply_tracking(id, record)
+    }
+    fn apply_tracking(&mut self, id: u64, record: &crate::snapshot::SavedScan) -> io::Result<bool> {
         let entry = self
             .entries
             .iter_mut()
@@ -135,16 +151,17 @@ impl Locations {
                     "추적 위치가 목록에서 제거되었습니다",
                 )
             })?;
-        if entry.scan.is_running() || record.scan.folders[0].path != entry.path {
+        if entry.scan.is_running()
+            || record
+                .scan
+                .folders
+                .first()
+                .is_none_or(|folder| folder.path != entry.path)
+        {
             return Err(io::Error::other(
                 "현재 스캔과 추적 대상이 일치하지 않습니다",
             ));
         }
-        record
-            .tracking
-            .as_ref()
-            .ok_or_else(|| io::Error::other("변경 추적 기준점이 없습니다"))?
-            .validate(&record.scan)?;
         let changed = entry
             .scan
             .completed()

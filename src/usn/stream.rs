@@ -274,8 +274,35 @@ impl Sender {
                 })?;
             }
         } else {
-            for change in &index.changes {
-                send(change.clone())?;
+            // 새 항목 전송 전에 기존 항목 감소분을 반영하여 수신 예산 유지.
+            for growing in [false, true] {
+                for change in &index.changes {
+                    crate::output::check(cancelled)?;
+                    if (change.budget_delta() > 0) == growing {
+                        send(match change {
+                            super::edit::Change::Node {
+                                path,
+                                expected,
+                                value,
+                                ..
+                            } => Change::Node {
+                                path: wide(path),
+                                expected: *expected,
+                                value: value.clone(),
+                            },
+                            super::edit::Change::Unavailable {
+                                path,
+                                present,
+                                value,
+                                ..
+                            } => Change::Unavailable {
+                                path: wide(path),
+                                present: *present,
+                                value: value.clone(),
+                            },
+                        })?;
+                    }
+                }
             }
         }
         for pending in index.checkpoint.pending.chunks(8192) {
@@ -304,7 +331,8 @@ impl Sender {
 }
 #[derive(Default)]
 struct Validated {
-    ids: HashSet<u64>,
+    // 폴더 ID는 0, 파일 ID는 현재 분석 범위의 경로 개수로 보관.
+    identities: HashMap<u64, i64>,
     logical: u64,
     allocation: u64,
 }
@@ -314,6 +342,19 @@ fn file_sizes(node: &Node) -> (u64, u64) {
         (0, 0)
     } else {
         (node.bytes, node.extra.allocation.value().unwrap_or(0))
+    }
+}
+
+/// 현재 스트림과 수신 검증을 통과한 발행 응답.
+pub struct Publication(super::WatchUpdate);
+impl Publication {
+    #[cfg(test)]
+    pub(crate) fn validated_fixture(update: super::WatchUpdate) -> Self {
+        Self(update)
+    }
+
+    pub fn into_update(self) -> super::WatchUpdate {
+        self.0
     }
 }
 
@@ -412,7 +453,11 @@ impl Receiver {
                 match read_frame(reader, self.limits, &mut digest)? {
                     Frame::Pending(ids) => {
                         for id in ids {
-                            if !self.validation.ids.contains(&id)
+                            if self
+                                .validation
+                                .identities
+                                .get(&id)
+                                .is_none_or(|count| *count == 0)
                                 || !seen.insert(id)
                                 || pending.len() >= self.limits.entries
                             {
@@ -487,7 +532,8 @@ impl Receiver {
         let mut units = self.units;
         let mut frames = 1;
         let mut seen = HashSet::new();
-        let mut metadata_only = !baseline;
+        let mut local_validation = !baseline;
+        let mut link_changes = HashMap::<u64, i64>::new();
         let mut logical = i128::from(self.validation.logical);
         let mut allocation = i128::from(self.validation.allocation);
         let mut pending_seen = HashSet::new();
@@ -522,21 +568,43 @@ impl Receiver {
                             {
                                 return Err(invalid("갱신 대상 파일 ID 불일치"));
                             }
-                            if metadata_only {
-                                if let Some((old, new)) =
-                                    candidate.nodes.get(&p).zip(value.as_ref()).filter(
-                                        |(old, new)| {
-                                            old.id == new.id
-                                                && old.attributes & 0x410 == new.attributes & 0x410
-                                        },
-                                    )
-                                {
-                                    let (old_bytes, old_alloc) = file_sizes(old);
-                                    let (new_bytes, new_alloc) = file_sizes(new);
+                            if local_validation {
+                                let old = candidate.nodes.get(&p);
+                                let new = value.as_ref();
+                                let same_identity = old.zip(new).is_some_and(|(old, new)| {
+                                    old.id == new.id
+                                        && old.attributes & 0x410 == new.attributes & 0x410
+                                });
+                                local_validation = same_identity
+                                    || old
+                                        .into_iter()
+                                        .chain(new)
+                                        .all(|n| !n.dir() && !n.excluded())
+                                        && new.is_none_or(|_| {
+                                            p.parent().is_some_and(|parent| {
+                                                candidate
+                                                    .nodes
+                                                    .get(parent)
+                                                    .is_some_and(|n| n.dir() && !n.excluded())
+                                                    && !candidate
+                                                        .unavailable
+                                                        .get(parent)
+                                                        .is_some_and(|entry| entry.listing)
+                                            }) && !candidate.unavailable.contains_key(&p)
+                                        });
+                                if local_validation {
+                                    let (old_bytes, old_alloc) = old.map_or((0, 0), file_sizes);
+                                    let (new_bytes, new_alloc) = new.map_or((0, 0), file_sizes);
                                     logical += i128::from(new_bytes) - i128::from(old_bytes);
                                     allocation += i128::from(new_alloc) - i128::from(old_alloc);
-                                } else {
-                                    metadata_only = false;
+                                    if !same_identity {
+                                        if let Some(old) = old {
+                                            *link_changes.entry(old.id).or_default() -= 1;
+                                        }
+                                        if let Some(new) = new {
+                                            *link_changes.entry(new.id).or_default() += 1;
+                                        }
+                                    }
                                 }
                             }
                             if let Some(old) = candidate.nodes.get(&p) {
@@ -555,7 +623,7 @@ impl Receiver {
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
-                            metadata_only = false;
+                            local_validation = false;
                             if candidate.unavailable.contains_key(&p) != present
                                 || baseline && present
                             {
@@ -602,10 +670,24 @@ impl Receiver {
         }
         let (full_validation, logical, allocation) = {
             let _sample = super::cost::measure(super::cost::Stage::ReceiveValidation);
-            if metadata_only {
+            if local_validation {
+                for (&id, difference) in &mut link_changes {
+                    crate::output::check(cancelled)?;
+                    let previous = self.validation.identities.get(&id).copied();
+                    if previous == Some(0) {
+                        return Err(invalid("파일 ID와 폴더 ID가 겹칩니다"));
+                    }
+                    *difference += previous.unwrap_or(0);
+                    if *difference < 0 {
+                        return Err(invalid("갱신 파일 경로 개수 오류"));
+                    }
+                }
                 for id in &pending {
                     crate::output::check(cancelled)?;
-                    if !self.validation.ids.contains(id) {
+                    let count = link_changes
+                        .get(id)
+                        .or_else(|| self.validation.identities.get(id));
+                    if count.is_none_or(|count| *count == 0) {
                         return Err(invalid("등록되지 않은 대기 파일 ID"));
                     }
                 }
@@ -616,7 +698,11 @@ impl Receiver {
                 )
             } else {
                 let validated = validate(&candidate, &pending, cancelled)?;
-                (Some(validated.ids), validated.logical, validated.allocation)
+                (
+                    Some(validated.identities),
+                    validated.logical,
+                    validated.allocation,
+                )
             }
         };
         let changed = candidate.commit(cancelled, false)?;
@@ -641,11 +727,19 @@ impl Receiver {
         self.revision = revision;
         self.units = units;
         self.finished = header.finished;
-        if let Some(ids) = full_validation {
-            self.validation.ids = ids;
-        }
         self.validation.logical = logical;
         self.validation.allocation = allocation;
+        if let Some(identities) = full_validation {
+            self.validation.identities = identities;
+        } else {
+            for (id, count) in link_changes {
+                if count == 0 {
+                    self.validation.identities.remove(&id);
+                } else {
+                    self.validation.identities.insert(id, count);
+                }
+            }
+        }
         self.dirty |= changed;
         Ok(changed)
     }
@@ -663,7 +757,7 @@ impl Receiver {
         &mut self,
         ready: bool,
         cancelled: &impl Fn() -> bool,
-    ) -> io::Result<Option<super::WatchUpdate>> {
+    ) -> io::Result<Option<Publication>> {
         if self.dirty {
             if !ready && self.published {
                 return Ok(None);
@@ -671,9 +765,13 @@ impl Receiver {
             let record = self.snapshot(cancelled)?;
             self.dirty = false;
             self.published = true;
-            Ok(Some(super::WatchUpdate::Record(Box::new(record))))
+            Ok(Some(Publication(super::WatchUpdate::Record(Box::new(
+                record,
+            )))))
         } else {
-            Ok(Some(super::WatchUpdate::Cursor(self.advance()?)))
+            Ok(Some(Publication(super::WatchUpdate::Cursor(
+                self.advance()?,
+            ))))
         }
     }
     pub fn snapshot(
@@ -719,7 +817,7 @@ fn validate(
         return Err(invalid("추적 루트 불일치"));
     }
     let mut dirs = HashMap::new();
-    let mut files = HashSet::new();
+    let mut files = HashMap::<u64, i64>::new();
     let mut bytes = 0u64;
     let mut allocation = 0u64;
     for (p, n) in &index.nodes {
@@ -749,7 +847,7 @@ fn validate(
                 )));
             }
         } else {
-            files.insert(n.id);
+            *files.entry(n.id).or_default() += 1;
             bytes = bytes
                 .checked_add(n.bytes)
                 .ok_or_else(|| invalid("논리 크기 합계 초과"))?;
@@ -783,11 +881,14 @@ fn validate(
             return Err(invalid("확인 불가 항목 부모·상태 오류"));
         }
     }
-    if dirs.keys().any(|id| files.contains(id)) || pending.iter().any(|id| !files.contains(id)) {
+    if dirs.keys().any(|id| files.contains_key(id))
+        || pending.iter().any(|id| !files.contains_key(id))
+    {
         return Err(invalid("등록되지 않은 대기 파일 ID"));
     }
+    files.extend(dirs.into_keys().map(|id| (id, 0)));
     Ok(Validated {
-        ids: files,
+        identities: files,
         logical: bytes,
         allocation,
     })
@@ -1114,6 +1215,97 @@ pub(crate) mod tests {
             assert_eq!(folder(&after.scan), folder(&independent.scan));
         }
     }
+    #[test]
+    fn single_file_deletion_does_not_revalidate_unrelated_paths() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("delete-here");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("probe");
+        std::fs::write(&path, b"abc").unwrap();
+        std::fs::hard_link(&path, fixture.0.join("alias")).unwrap();
+        let unrelated = fixture.0.join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        for i in 0..128 {
+            std::fs::write(unrelated.join(format!("keep-{i}")), []).unwrap();
+        }
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let parent = state.folders[saved.scan.folder_index(Path::new("delete-here")).unwrap()];
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            events: vec![],
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(fixture.0.clone(), true, Default::default());
+        let mut wire = vec![];
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+
+        let id = event(&mut source, &path, parent, 0x80000200);
+        std::fs::remove_file(&path).unwrap();
+        let alias = fixture.0.join("alias");
+        assert_eq!(event(&mut source, &alias, state.root, 1), id);
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        assert!(receiver.receive(&mut wire.as_slice(), &|| true).is_err());
+        assert_eq!(receiver.advance().unwrap().next, state.next);
+        let checks = std::cell::Cell::new(0);
+        receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 64
+            })
+            .expect("파일 한 경로 삭제에 무관한 전체 항목 검사 불필요");
+        assert_eq!(receiver.advance().unwrap().pending, vec![id]);
+        let after = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 3);
+        assert_eq!(after.scan.files.len(), 129);
+        assert_eq!(
+            after
+                .scan
+                .files
+                .iter()
+                .filter(|file| file.name == "alias")
+                .count(),
+            1
+        );
+
+        let unrelated_id = state.folders[saved.scan.folder_index(Path::new("unrelated")).unwrap()];
+        let keep_id = event(&mut source, &unrelated.join("keep-0"), unrelated_id, 1);
+        assert_eq!(event(&mut source, &alias, state.root, 0x80000200), id);
+        std::fs::remove_file(&alias).unwrap();
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let invalid_pending = rewrite(&wire, |frame| {
+            if let Frame::Pending(ids) = frame {
+                assert_eq!(*ids, vec![keep_id]);
+                *ids = vec![id];
+            }
+        });
+        let error = receiver
+            .receive(&mut invalid_pending.as_slice(), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("대기 파일 ID"), "{error}");
+        let retained = receiver.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&after.scan, &retained.scan));
+        assert_eq!(after.tracking, retained.tracking);
+        assert!(receiver.receive(&mut wire.as_slice(), &|| false).unwrap());
+        let final_record = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(final_record.scan.folders[0].logical_bytes, 0);
+        assert_eq!(final_record.scan.files.len(), 128);
+    }
+
     #[test]
     fn structural_delta_budget_failure_rolls_back_deleted_paths_and_can_retry_the_same_revision() {
         let fixture = Fixture::new();
@@ -1598,6 +1790,202 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn disappearing_child_folder_is_removed_or_recollected_without_stopping_tracking() {
+        struct Vanishes {
+            inner: Source,
+            folder: Option<PathBuf>,
+            replacement: bool,
+        }
+        impl crate::usn::Source for Vanishes {
+            fn journal(&mut self) -> io::Result<crate::usn::Journal> {
+                self.inner.journal()
+            }
+            fn read(&mut self, start: i64, end: i64) -> io::Result<Vec<crate::usn::Event>> {
+                self.inner.read(start, end)
+            }
+            fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
+                self.inner.inspect(path, detailed)
+            }
+            fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+                if Some(path) != self.folder.as_deref() {
+                    return self.inner.list(path);
+                }
+                self.folder = None;
+                std::fs::remove_file(path.join("probe")).unwrap();
+                std::fs::remove_dir(path).unwrap();
+                let missing = self.inner.list(path);
+                if self.replacement {
+                    std::fs::create_dir(path).unwrap();
+                    std::fs::write(path.join("new"), b"1234567").unwrap();
+                }
+                missing
+            }
+        }
+        for replacement in [false, true] {
+            let fixture = Fixture::new();
+            let folder = fixture.0.join("child");
+            std::fs::create_dir(&folder).unwrap();
+            let path = folder.join("probe");
+            std::fs::write(&path, b"abc").unwrap();
+            std::fs::write(fixture.0.join("keep"), b"12345").unwrap();
+            let saved = record(&fixture.0);
+            let state = saved.tracking.as_ref().unwrap();
+            let mut source = Source {
+                clock: SystemTime::now(),
+                blocked: None,
+                journal: crate::usn::Journal {
+                    volume: state.volume.clone(),
+                    id: state.journal,
+                    first: 0,
+                    lowest: 0,
+                    next: state.next,
+                },
+                events: vec![],
+            };
+            let parent = state.folders[saved.scan.folder_index(Path::new("child")).unwrap()];
+            event(&mut source, &path, parent, 0x80000200);
+            let next = source.journal.next;
+            let mut index = Index::restore(&saved).unwrap();
+            assert!(index
+                .refresh(
+                    &mut Vanishes {
+                        inner: source,
+                        folder: Some(folder),
+                        replacement,
+                    },
+                    &|| false
+                )
+                .unwrap());
+            let after = index.snapshot(&|| false).unwrap();
+            assert_eq!(after.tracking.as_ref().unwrap().next, next);
+            assert_eq!(after.scan.folders.len(), if replacement { 2 } else { 1 });
+            assert_eq!(
+                after.scan.folders[0].logical_bytes,
+                if replacement { 12 } else { 5 }
+            );
+        }
+    }
+
+    #[test]
+    fn rename_at_the_entry_limit_preserves_the_final_count_and_accepts_both_directions() {
+        let fixture = Fixture::new();
+        let a = fixture.0.join("a.txt");
+        let z = fixture.0.join("z.txt");
+        std::fs::write(&z, b"abc").unwrap();
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: state.journal,
+                first: 0,
+                lowest: 0,
+                next: state.next,
+            },
+            events: vec![],
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let limits = Limits {
+            entries: 2,
+            ..Limits::default()
+        };
+        let mut sender = Sender::new(17, limits);
+        let mut receiver = Receiver::new(fixture.0.clone(), saved.scan.detailed, limits);
+        let mut wire = vec![];
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        for (old, new) in [(&z, &a), (&a, &z)] {
+            event(&mut source, old, state.root, 0x80001000);
+            std::fs::rename(old, new).unwrap();
+            event(&mut source, new, state.root, 0x80002000);
+            assert!(index.refresh(&mut source, &|| false).unwrap());
+            wire.clear();
+            sender.write(&mut wire, &mut index, &|| false).unwrap();
+            let previous = receiver.advance().unwrap().next;
+            let attempts = std::cell::Cell::new(0);
+            assert!(receiver
+                .receive(&mut wire.as_slice(), &|| {
+                    attempts.set(attempts.get() + 1);
+                    attempts.get() > 2
+                })
+                .is_err());
+            assert_eq!(receiver.advance().unwrap().next, previous);
+            assert!(receiver.receive(&mut wire.as_slice(), &|| false).unwrap());
+            let updated = receiver.snapshot(&|| false).unwrap();
+            assert_eq!(updated.scan.files.len(), 1);
+            assert_eq!(&updated.scan.files[0].name, new.file_name().unwrap());
+            assert_eq!(updated.scan.folders[0].logical_bytes, 3);
+        }
+        let extra = fixture.0.join("extra");
+        std::fs::write(&extra, b"x").unwrap();
+        event(&mut source, &extra, state.root, 0x80000100);
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        assert!(sender.write(&mut wire, &mut index, &|| false).is_err());
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn validated_stream_publication_keeps_cursor_and_location_bound_to_the_result() {
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        std::fs::write(fixture.0.join("probe"), b"abc").unwrap();
+        let saved = record(&fixture.0);
+        let expected_next = saved.tracking.as_ref().unwrap().next;
+        let mut index = Index::restore(&saved).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        index.checkpoint.next += 8;
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+
+        let mut locations = crate::locations::Locations::default();
+        let id = locations.add(&fixture.0).unwrap();
+        let other_id = locations.add(&other.0).unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let mut controller = crate::tracking::Controller::default();
+        controller
+            .start_verified_with(
+                id,
+                fixture.0.clone(),
+                saved.scan.detailed,
+                None,
+                move |root, detailed, _, cancelled, publish| {
+                    let mut receiver = Receiver::new(root.to_owned(), detailed, Default::default());
+                    let mut frames = wire.as_slice();
+                    for _ in 0..2 {
+                        receiver.receive(&mut frames, &cancelled)?;
+                        publish(receiver.publication(true, &cancelled)?.unwrap())?;
+                    }
+                    done.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Some(crate::tracking::Update::Record(result)) = controller.poll() else {
+            panic!("검증된 결과 필요");
+        };
+        assert_eq!(result.tracking.as_ref().unwrap().next, expected_next + 8);
+        assert!(locations.accept_published(other_id, &result).is_err());
+        assert!(locations.accept_published(id, &result).unwrap());
+        assert_eq!(
+            locations
+                .get(id)
+                .unwrap()
+                .scan
+                .completed()
+                .unwrap()
+                .result
+                .folders[0]
+                .logical_bytes,
+            3
+        );
+    }
+
     fn assert_same(expected: &crate::snapshot::SavedScan, actual: &crate::snapshot::SavedScan) {
         let mut a = Vec::new();
         let mut b = Vec::new();
@@ -1819,7 +2207,10 @@ pub(crate) mod tests {
         sender.write(&mut wire, &mut index, &|| false).unwrap();
         receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
         assert!(matches!(
-            receiver.publication(true, &|| false).unwrap(),
+            receiver
+                .publication(true, &|| false)
+                .unwrap()
+                .map(Publication::into_update),
             Some(crate::usn::WatchUpdate::Record(_))
         ));
         for i in 0..3 {
@@ -1845,8 +2236,10 @@ pub(crate) mod tests {
             receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
             assert!(receiver.publication(false, &|| false).unwrap().is_none());
         }
-        let Some(crate::usn::WatchUpdate::Record(result)) =
-            receiver.publication(true, &|| false).unwrap()
+        let Some(crate::usn::WatchUpdate::Record(result)) = receiver
+            .publication(true, &|| false)
+            .unwrap()
+            .map(Publication::into_update)
         else {
             panic!("최신 완료 결과 필요")
         };
