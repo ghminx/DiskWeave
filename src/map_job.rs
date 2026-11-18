@@ -175,6 +175,7 @@ mod tests {
         std::fs::create_dir_all(root.join("child")).unwrap();
         std::fs::write(root.join("child/deep.bin"), [0; 5]).unwrap();
         let source = Snapshot {
+            entries: None,
             id: 7,
             generation: 2,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -228,6 +229,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, p)| Snapshot {
+                entries: None,
                 id: i as u64 + 10,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&root.join(p), || false).unwrap()),

@@ -9,11 +9,16 @@ use crate::search_view::SearchView;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
+type LiveSelection = (
+    SearchInput,
+    std::collections::HashMap<(u64, PathBuf), Option<crate::usn::entries::Key>>,
+);
+
 #[derive(Default)]
 pub struct LocationsView {
     pub file_requested: Option<crate::file_ui::Kind>,
     pub drop_requested: Option<(Vec<PathBuf>, PathBuf)>,
-    live_selection: Option<(SearchInput, std::collections::HashSet<(u64, PathBuf)>)>,
+    live_selection: Option<LiveSelection>,
     pub global_mode: bool,
     pub selection_changed: bool,
     drives: DriveList,
@@ -31,7 +36,10 @@ impl LocationsView {
     ) {
         self.selection.clear();
         self.key = None;
-        self.live_selection = Some((input, paths));
+        self.live_selection = Some((
+            input,
+            paths.into_iter().map(|target| (target, None)).collect(),
+        ));
     }
     pub fn selected_targets(&self) -> Vec<crate::map_job::Target> {
         let Some(results) = &self.job.results else {
@@ -46,8 +54,12 @@ impl LocationsView {
             })
             .collect()
     }
-    pub fn preserve_live_selection(&mut self) {
-        if !self.global_mode || self.live_selection.is_some() {
+    pub fn preserve_live_selection(&mut self, locations: &Locations) {
+        if !self.global_mode {
+            return;
+        }
+        if self.live_selection.is_some() {
+            self.reconnect_selection(locations);
             return;
         }
         if let (Some(results), Some((_, input))) = (&self.job.results, &self.key) {
@@ -55,14 +67,52 @@ impl LocationsView {
                 .selection
                 .rows()
                 .filter_map(|row| {
-                    results.hits.get(row).map(|hit| {
+                    results.hits.get(row).and_then(|hit| {
                         let source = &results.sources[hit.source];
-                        (source.id, crate::search::item_path(&source.scan, hit.item))
+                        let key = match &source.entries {
+                            Some(entries) => Some(entries.key(hit.item)?),
+                            None => None,
+                        };
+                        Some((
+                            (source.id, crate::search::item_path(&source.scan, hit.item)),
+                            key,
+                        ))
                     })
                 })
                 .collect();
             self.live_selection = Some((input.clone(), paths));
         }
+        self.reconnect_selection(locations);
+    }
+    fn reconnect_selection(&mut self, locations: &Locations) {
+        let Some((_, paths)) = &mut self.live_selection else {
+            return;
+        };
+        paths.retain(|(id, path), key| {
+            let Some(location) = locations.get(*id).filter(|location| !location.stale) else {
+                return false;
+            };
+            let Some(completed) = location.scan.completed() else {
+                return false;
+            };
+            if let Some(entries) = &completed.entries {
+                let Some(relative) = path.strip_prefix(&completed.result.folders[0].path).ok()
+                else {
+                    return false;
+                };
+                let Some(next) = entries.path_key(relative) else {
+                    return false;
+                };
+                if key.is_some_and(|old| entries.same_scope(old) && old != next) {
+                    return false;
+                }
+                // 검색 완료를 기다리지 않고 새 수명의 기준점에 연결하여 다음 교체와 구분.
+                *key = Some(next);
+            } else {
+                *key = None;
+            }
+            true
+        });
     }
     pub fn choose_scope(&mut self, view: &mut SearchView, scope: crate::search_view::SearchScope) {
         self.live_selection = None;
@@ -159,6 +209,7 @@ impl LocationsView {
             {
                 self.live_selection = None;
             }
+            self.reconnect_selection(locations);
             self.job.submit(locations.snapshots(), input.clone());
             self.key = Some(key);
             self.selection.clear();
@@ -171,7 +222,13 @@ impl LocationsView {
                 for (row, hit) in results.hits.iter().enumerate() {
                     let source = &results.sources[hit.source];
                     if paths
-                        .contains(&(source.id, crate::search::item_path(&source.scan, hit.item)))
+                        .get(&(source.id, crate::search::item_path(&source.scan, hit.item)))
+                        .is_some_and(|key| match (key, &source.entries) {
+                            (Some(key), Some(entries)) if entries.same_scope(*key) => {
+                                entries.key(hit.item) == Some(*key)
+                            }
+                            _ => true,
+                        })
                     {
                         self.selection.click(row, true, false);
                     }
@@ -542,6 +599,203 @@ impl LocationsView {
 #[cfg(test)]
 mod search_ui_tests {
     #[test]
+    fn tracked_searches_keep_existing_entries_but_do_not_select_replaced_paths() {
+        use crate::usn::{Event, Index, Journal, Source};
+        struct Files {
+            volume: String,
+            next: i64,
+            events: Vec<Event>,
+        }
+        impl Source for Files {
+            fn journal(&mut self) -> std::io::Result<Journal> {
+                Ok(Journal {
+                    volume: self.volume.clone(),
+                    id: 7,
+                    first: 0,
+                    lowest: 0,
+                    next: self.next,
+                })
+            }
+            fn read(&mut self, start: i64, end: i64) -> std::io::Result<Vec<Event>> {
+                Ok(self
+                    .events
+                    .iter()
+                    .filter(|event| event.usn >= start && event.usn < end)
+                    .cloned()
+                    .collect())
+            }
+            fn inspect(
+                &mut self,
+                path: &std::path::Path,
+                detailed: bool,
+            ) -> std::io::Result<crate::ntfs::Info> {
+                crate::ntfs_native::inspect_file(path, detailed, &self.volume)
+            }
+            fn list(&mut self, path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+                std::fs::read_dir(path)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect()
+            }
+        }
+        fn settle_global(
+            view: &mut LocationsView,
+            locations: &Locations,
+            input: &crate::search::SearchInput,
+        ) {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                view.refresh(locations, input);
+                if view.results().is_some_and(|results| {
+                    results.sources.iter().all(|source| {
+                        source.generation == locations.get(source.id).unwrap().generation
+                    })
+                }) {
+                    return;
+                }
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+        }
+        fn settle_search(view: &mut crate::search_view::SearchView) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while matches!(view.job.status(), crate::search_job::SearchStatus::Running) {
+                view.poll();
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+        }
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let path = fixture.0.join("keep.bin");
+        std::fs::write(&path, b"123").unwrap();
+        let drive = fixture
+            .0
+            .components()
+            .take(2)
+            .collect::<std::path::PathBuf>();
+        let mut files = Files {
+            volume: crate::ntfs_native::target(&drive).unwrap().volume,
+            next: 100,
+            events: vec![],
+        };
+        let mut index = Index::begin(&fixture.0, true, &mut files, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let mut locations = Locations::default();
+        let id = locations.add(&fixture.0).unwrap();
+        locations.accept_tracking(id, &before).unwrap();
+        let mut search = crate::search_view::SearchView::default();
+        search.input.text = "bin".into();
+        search.refresh(&before.scan, 0);
+        settle_search(&mut search);
+        search.selection.click(0, false, false);
+        let mut explorer = crate::explorer::Explorer::new(&before.scan);
+        explorer.select(crate::explorer::Item::File(0));
+        let mut global = LocationsView {
+            global_mode: true,
+            ..Default::default()
+        };
+        settle_global(&mut global, &locations, &search.input);
+        global.select_result(0, false, false);
+        global.preserve_live_selection(&locations);
+        let added = fixture.0.join("added.bin");
+        std::fs::write(&added, b"123456789").unwrap();
+        let crate::ntfs::Id::V2(new_id) = files.inspect(&added, false).unwrap().reference.unwrap();
+        files.events.push(Event {
+            usn: 100,
+            id: new_id,
+            parent: index.checkpoint.root,
+            reason: 0x80000100,
+        });
+        files.next = 108;
+        index.refresh(&mut files, &|| false).unwrap();
+        let after = index.snapshot(&|| false).unwrap();
+        locations.accept_tracking(id, &after).unwrap();
+        explorer = search.replace_result(
+            Some(&explorer),
+            Some(&before.scan),
+            &after.scan,
+            before.entries.as_deref().zip(after.entries.as_deref()),
+        );
+        settle_search(&mut search);
+        settle_global(&mut global, &locations, &search.input);
+        let chosen = search
+            .selection
+            .single(&search.job.results().unwrap().items)
+            .unwrap();
+        assert_eq!(crate::search::item_path(&after.scan, chosen), path);
+        assert_eq!(
+            crate::search::item_path(&after.scan, global.selected_target().unwrap().2),
+            path
+        );
+        assert_eq!(
+            crate::search::item_path(&after.scan, explorer.selected()),
+            path
+        );
+        global.preserve_live_selection(&locations);
+        let mut restarted = Index::begin(&fixture.0, true, &mut files, &|| false).unwrap();
+        let resumed = restarted.snapshot(&|| false).unwrap();
+        locations.accept_tracking(id, &resumed).unwrap();
+        explorer = search.replace_result(
+            Some(&explorer),
+            Some(&after.scan),
+            &resumed.scan,
+            after.entries.as_deref().zip(resumed.entries.as_deref()),
+        );
+        settle_search(&mut search);
+        settle_global(&mut global, &locations, &search.input);
+        let chosen = search
+            .selection
+            .single(&search.job.results().unwrap().items)
+            .expect("새 추적 수명에서도 기존 경로 선택 복구 필요");
+        assert_eq!(crate::search::item_path(&resumed.scan, chosen), path);
+        assert_eq!(
+            crate::search::item_path(&resumed.scan, global.selected_target().unwrap().2),
+            path
+        );
+        global.preserve_live_selection(&locations);
+        let mut rapid_restart = Index::begin(&fixture.0, true, &mut files, &|| false).unwrap();
+        let rapid_baseline = rapid_restart.snapshot(&|| false).unwrap();
+        locations.accept_tracking(id, &rapid_baseline).unwrap();
+        explorer = search.replace_result(
+            Some(&explorer),
+            Some(&resumed.scan),
+            &rapid_baseline.scan,
+            resumed
+                .entries
+                .as_deref()
+                .zip(rapid_baseline.entries.as_deref()),
+        );
+        // 검색 완료 전에 같은 새 수명의 다음 변경을 적용하는 입력 순서 재현.
+        global.refresh(&locations, &search.input);
+        index = rapid_restart;
+        let after = rapid_baseline;
+        global.preserve_live_selection(&locations);
+        std::fs::rename(&path, fixture.0.join("previous.bin")).unwrap();
+        std::fs::write(&path, b"12345").unwrap();
+        let crate::ntfs::Id::V2(replaced) = files.inspect(&path, false).unwrap().reference.unwrap();
+        files.events.push(Event {
+            usn: 108,
+            id: replaced,
+            parent: index.checkpoint.root,
+            reason: 0x80000100,
+        });
+        files.next = 116;
+        index.refresh(&mut files, &|| false).unwrap();
+        let replacement = index.snapshot(&|| false).unwrap();
+        locations.accept_tracking(id, &replacement).unwrap();
+        explorer = search.replace_result(
+            Some(&explorer),
+            Some(&after.scan),
+            &replacement.scan,
+            after.entries.as_deref().zip(replacement.entries.as_deref()),
+        );
+        settle_search(&mut search);
+        settle_global(&mut global, &locations, &search.input);
+        assert_eq!(explorer.selected(), crate::explorer::Item::Folder(0));
+        assert_eq!(search.selection.count(), 0);
+        assert!(global.selected_target().is_none());
+        assert_eq!(search.input.text, "bin");
+    }
+    #[test]
     fn live_global_refresh_keeps_the_selected_source_and_path() {
         let root =
             std::env::temp_dir().join(format!("diskweave-global-live-{}", std::process::id()));
@@ -566,7 +820,7 @@ mod search_ui_tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         view.select_result(0, false, false);
-        view.preserve_live_selection();
+        view.preserve_live_selection(&locations);
         std::fs::write(root.join("big"), b"123456789").unwrap();
         locations.start(root.clone()).unwrap();
         while locations.is_running() {

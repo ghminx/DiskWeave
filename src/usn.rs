@@ -6,6 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 #[path = "usn/buffered.rs"]
 pub mod buffered;
+#[path = "usn/entries.rs"]
+pub mod entries;
 #[path = "usn/stream.rs"]
 pub mod stream;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -236,7 +238,7 @@ pub struct Checkpoint {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn conflicting_directories(nodes: &BTreeMap<PathBuf, Node>) -> Vec<(u64, PathBuf, PathBuf)> {
+fn conflicting_directories(nodes: &entries::Entries) -> Vec<(u64, PathBuf, PathBuf)> {
     let mut by_id = HashMap::new();
     let mut conflicts = Vec::new();
     for (path, node) in nodes
@@ -320,10 +322,11 @@ pub enum WatchUpdate {
 pub struct Index {
     root: PathBuf,
     detailed: bool,
-    nodes: BTreeMap<PathBuf, Node>,
+    nodes: entries::Entries,
     unavailable: BTreeMap<PathBuf, Unavailable>,
     pub checkpoint: Checkpoint,
     scan: Option<Arc<ScanResult>>,
+    projection: Option<Arc<entries::Projection>>,
     started: SystemTime,
     changes: Vec<stream::Change>,
 }
@@ -502,7 +505,7 @@ impl Index {
             unavailable: vec![],
             confirmed_after: None,
         };
-        let mut nodes = BTreeMap::new();
+        let mut nodes = entries::Entries::new();
         nodes.insert(PathBuf::new(), first);
         let mut unavailable = BTreeMap::new();
         Self::collect(
@@ -521,6 +524,7 @@ impl Index {
             unavailable,
             checkpoint,
             scan: None,
+            projection: None,
             started,
             changes: vec![],
         };
@@ -532,7 +536,7 @@ impl Index {
         reason: UnavailableReason,
         listing: bool,
         now: SystemTime,
-        nodes: &mut BTreeMap<PathBuf, Node>,
+        nodes: &mut entries::Entries,
         unavailable: &mut BTreeMap<PathBuf, Unavailable>,
     ) -> io::Result<()> {
         if relative.as_os_str().is_empty() {
@@ -575,7 +579,7 @@ impl Index {
         detailed: bool,
         source: &mut impl Source,
         cancelled: &impl Fn() -> bool,
-        nodes: &mut BTreeMap<PathBuf, Node>,
+        nodes: &mut entries::Entries,
         unavailable: &mut BTreeMap<PathBuf, Unavailable>,
     ) -> io::Result<()> {
         let mut pending = vec![relative.to_owned()];
@@ -647,7 +651,7 @@ impl Index {
             .iter()
             .map(|issue| (issue.path.as_path(), issue.error.to_string()))
             .collect();
-        let mut nodes = BTreeMap::new();
+        let mut nodes = entries::Entries::new();
         for (i, f) in record.scan.folders.iter().enumerate() {
             nodes.insert(
                 f.path
@@ -730,6 +734,7 @@ impl Index {
                 current
             },
             scan: Some(Arc::clone(&record.scan)),
+            projection: None,
             started: record.started,
             changes: vec![],
         })
@@ -1161,10 +1166,12 @@ impl Index {
         self.checkpoint.pending.sort_unstable();
         if changed {
             self.scan = None;
+            self.projection = None;
         }
         Ok(changed)
     }
     pub fn snapshot(&mut self, cancelled: &impl Fn() -> bool) -> io::Result<SavedScan> {
+        crate::output::check(cancelled)?;
         if self.scan.is_none() {
             let mut scan = ScanResult {
                 detailed: self.detailed,
@@ -1182,13 +1189,15 @@ impl Index {
             let mut refs = vec![];
             let mut files = vec![];
             let mut excluded = vec![];
+            let mut folder_keys = vec![];
+            let mut file_keys = vec![];
             let mut directories: Vec<_> = self
                 .nodes
-                .iter()
-                .filter(|(_, n)| n.dir() && !n.excluded())
+                .identified()
+                .filter(|(_, _, n)| n.dir() && !n.excluded())
                 .collect();
-            directories.sort_by_key(|(p, _)| p.components().count());
-            for (p, n) in directories {
+            directories.sort_by_key(|(p, _, _)| p.components().count());
+            for (p, key, n) in directories {
                 crate::output::check(cancelled)?;
                 let parent = if p.as_os_str().is_empty() {
                     None
@@ -1201,6 +1210,7 @@ impl Index {
                 };
                 folders.insert(p.clone(), scan.folders.len());
                 refs.push(n.id);
+                folder_keys.push(key);
                 scan.folders.push(Folder {
                     access: Default::default(),
                     path: self.root.join(p),
@@ -1214,7 +1224,7 @@ impl Index {
                     attributes: n.attributes,
                 });
             }
-            for (p, n) in &self.nodes {
+            for (p, key, n) in self.nodes.identified() {
                 crate::output::check(cancelled)?;
                 if n.excluded() {
                     scan.skipped_reparse_points += 1;
@@ -1257,6 +1267,7 @@ impl Index {
                     extra: n.extra,
                 });
                 files.push(n.id);
+                file_keys.push(key);
             }
             for (p, e) in &self.unavailable {
                 let parent = *folders
@@ -1282,6 +1293,11 @@ impl Index {
                 }
             }
             crate::scanner::finish(&mut scan)?;
+            self.projection = Some(Arc::new(self.nodes.project(
+                folder_keys,
+                file_keys,
+                cancelled,
+            )?));
             self.checkpoint.folders = refs;
             self.checkpoint.files = files;
             self.checkpoint.excluded = excluded;
@@ -1295,6 +1311,10 @@ impl Index {
             SystemTime::now(),
             Duration::ZERO,
         );
+        if self.projection.is_none() {
+            self.projection = Some(Arc::new(self.nodes.project_scan(&record.scan, cancelled)?));
+        }
+        record.entries = self.projection.clone();
         record.tracking = Some(self.checkpoint.clone());
         Ok(record)
     }
@@ -2509,6 +2529,239 @@ mod tests {
             attributes: 0x400,
         });
         assert!(checkpoint.validate(&record.scan).is_err());
+    }
+    #[test]
+    fn fixed_ids_keep_open_folders_and_fall_back_when_the_selected_subtree_is_deleted() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        fs::create_dir_all(scope.join("folder/deep/nested")).unwrap();
+        fs::write(scope.join("folder/deep/file"), b"123").unwrap();
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let folder = before.scan.folder_index(Path::new("folder/deep")).unwrap();
+        let mut explorer = crate::explorer::Explorer::new(&before.scan);
+        explorer.open_folder(&before.scan, folder);
+        explorer.toggle_folder(&before.scan, folder);
+        explorer.select(crate::explorer::Item::File(0));
+        let parent = f.id(&scope);
+        fs::create_dir(scope.join("aaa")).unwrap();
+        let added_id = f.id(&scope.join("aaa"));
+        f.event(added_id, parent, 0x80000100);
+        index.refresh(&mut f, &|| false).unwrap();
+        let added = index.snapshot(&|| false).unwrap();
+        let next = explorer.rebase_entries(
+            &before.scan,
+            &added.scan,
+            before.entries.as_ref().unwrap(),
+            added.entries.as_ref().unwrap(),
+        );
+        assert_ne!(folder, next.folder());
+        assert_eq!(
+            added.scan.folders[next.folder()].path,
+            scope.join("folder/deep")
+        );
+        assert!(next.is_expanded(next.folder()));
+        assert!(matches!(next.selected(), crate::explorer::Item::File(_)));
+        let deleted = f.id(&scope.join("folder"));
+        fs::remove_dir_all(scope.join("folder")).unwrap();
+        f.event(deleted, parent, 0x80000200);
+        index.refresh(&mut f, &|| false).unwrap();
+        let removed = index.snapshot(&|| false).unwrap();
+        let restored = next.rebase_entries(
+            &added.scan,
+            &removed.scan,
+            added.entries.as_ref().unwrap(),
+            removed.entries.as_ref().unwrap(),
+        );
+        assert_eq!(restored.folder(), 0);
+        assert_eq!(restored.selected(), crate::explorer::Item::Folder(0));
+    }
+    #[test]
+    fn cancelled_id_projection_does_not_publish_an_incomplete_mapping() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        fs::write(scope.join("file"), b"123").unwrap();
+        let before = Index::begin(&scope, false, &mut f, &|| false)
+            .unwrap()
+            .snapshot(&|| false)
+            .unwrap();
+        let mut restored = Index::restore(&before).unwrap();
+        let checkpoint = restored.checkpoint.clone();
+        let calls = std::cell::Cell::new(0);
+        let error = restored
+            .snapshot(&|| {
+                calls.set(calls.get() + 1);
+                calls.get() >= 2
+            })
+            .err()
+            .expect("ID 대응표 구성 중 취소 필요");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(restored.checkpoint, checkpoint);
+        let after = restored.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&before.scan, &after.scan));
+        assert!(after
+            .entries
+            .as_ref()
+            .unwrap()
+            .key(crate::explorer::Item::File(0))
+            .is_some());
+    }
+    #[test]
+    fn hard_link_paths_have_distinct_keys_and_removed_or_replaced_entries_get_new_keys() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let a = scope.join("a");
+        let b = scope.join("b");
+        fs::write(&a, b"123").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let key = |record: &SavedScan, name| {
+            record
+                .entries
+                .as_ref()
+                .unwrap()
+                .path_key(Path::new(name))
+                .unwrap()
+        };
+        let ka = key(&before, "a");
+        let kb = key(&before, "b");
+        assert_ne!(ka, kb);
+        assert_eq!(
+            before.tracking.as_ref().unwrap().files[0],
+            before.tracking.as_ref().unwrap().files[1]
+        );
+        let parent = f.id(&scope);
+        let old_id = f.id(&a);
+        fs::write(&a, b"12345").unwrap();
+        f.event(old_id, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        let edited = index.snapshot(&|| false).unwrap();
+        assert_eq!((key(&edited, "a"), key(&edited, "b")), (ka, kb));
+        assert_eq!(edited.scan.folders[0].logical_bytes, 10);
+        fs::remove_file(&b).unwrap();
+        f.event(old_id, parent, 0x80000200);
+        index.refresh(&mut f, &|| false).unwrap();
+        assert!(index
+            .snapshot(&|| false)
+            .unwrap()
+            .entries
+            .as_ref()
+            .unwrap()
+            .item(kb)
+            .is_none());
+        fs::hard_link(&a, &b).unwrap();
+        f.event(old_id, parent, 0x80000100);
+        index.refresh(&mut f, &|| false).unwrap();
+        let restored = index.snapshot(&|| false).unwrap();
+        assert_ne!(key(&restored, "b"), kb);
+        assert_eq!(key(&restored, "a"), ka);
+        fs::rename(&a, f.root.join("held")).unwrap();
+        fs::create_dir(&a).unwrap();
+        let new_id = f.id(&a);
+        f.event(new_id, parent, 0x80000100);
+        index.refresh(&mut f, &|| false).unwrap();
+        let replaced = index.snapshot(&|| false).unwrap();
+        assert_ne!(key(&replaced, "a"), ka);
+        assert!(replaced.entries.as_ref().unwrap().item(ka).is_none());
+    }
+    #[test]
+    fn excluded_files_recover_with_new_keys_and_snapshot_ids_are_not_persisted() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let file = scope.join("file");
+        fs::write(&file, b"123").unwrap();
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let key = before
+            .entries
+            .as_ref()
+            .unwrap()
+            .path_key(Path::new("file"))
+            .unwrap();
+        let id = f.id(&file);
+        let parent = f.id(&scope);
+        f.blocked = Some(file.clone());
+        f.event(id, parent, 0x80000001);
+        index.refresh(&mut f, &|| false).unwrap();
+        let excluded = index.snapshot(&|| false).unwrap();
+        assert!(excluded.entries.as_ref().unwrap().item(key).is_none());
+        assert_eq!(excluded.scan.error_count, 1);
+        f.blocked = None;
+        f.clock += Duration::from_secs(31);
+        index.refresh(&mut f, &|| false).unwrap();
+        let recovered = index.snapshot(&|| false).unwrap();
+        assert_ne!(
+            recovered
+                .entries
+                .as_ref()
+                .unwrap()
+                .path_key(Path::new("file"))
+                .unwrap(),
+            key
+        );
+        let mut bytes = vec![];
+        crate::snapshot::write_to(&recovered, &mut bytes, || false).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("entries").is_none());
+        let loaded = crate::snapshot::read_from(bytes.as_slice(), || false).unwrap();
+        assert!(loaded.entries.is_none());
+        let mut resumed = Index::restore(&loaded).unwrap();
+        let fresh = resumed.snapshot(&|| false).unwrap();
+        let previous = recovered
+            .entries
+            .as_ref()
+            .unwrap()
+            .path_key(Path::new("file"))
+            .unwrap();
+        assert!(fresh.entries.as_ref().unwrap().item(previous).is_none());
+        let scan = Arc::clone(&fresh.scan);
+        assert!(resumed.refresh(&mut f, &|| true).is_err());
+        assert!(Arc::ptr_eq(
+            &scan,
+            &resumed.snapshot(&|| false).unwrap().scan
+        ));
+    }
+    #[test]
+    fn stable_ids_survive_inserting_and_removing_another_path() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        fs::write(scope.join("b"), b"123").unwrap();
+        fs::write(scope.join("c"), b"1234").unwrap();
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let key = |record: &SavedScan, name: &str| {
+            let row = record
+                .scan
+                .files
+                .iter()
+                .position(|file| file.name == name)
+                .unwrap();
+            record
+                .entries
+                .as_ref()
+                .expect("실시간 결과의 고정 ID 필요")
+                .key(crate::explorer::Item::File(row))
+                .unwrap()
+        };
+        let b = key(&before, "b");
+        let c = key(&before, "c");
+        let a_path = scope.join("a");
+        fs::write(&a_path, b"12").unwrap();
+        let a = f.id(&a_path);
+        let parent = f.id(&scope);
+        f.event(a, parent, 0x80000100);
+        index.refresh(&mut f, &|| false).unwrap();
+        let added = index.snapshot(&|| false).unwrap();
+        assert_eq!((key(&added, "b"), key(&added, "c")), (b, c));
+        assert_eq!(added.scan.folders[0].logical_bytes, 9);
+        assert_ne!(key(&added, "a"), b);
+        fs::remove_file(&a_path).unwrap();
+        f.event(a, parent, 0x80000200);
+        index.refresh(&mut f, &|| false).unwrap();
+        let removed = index.snapshot(&|| false).unwrap();
+        assert_eq!((key(&removed, "b"), key(&removed, "c")), (b, c));
+        assert_eq!(removed.scan.folders[0].logical_bytes, 7);
     }
     #[test]
     fn baseline_captures_records_before_the_os_discards_them() {

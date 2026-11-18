@@ -697,7 +697,7 @@ impl DiskWeaveApp {
             }
         }
         if self.file_refresh.busy() {
-            self.locations_view.preserve_live_selection();
+            self.locations_view.preserve_live_selection(&self.scan);
         }
         let tracking = self
             .tracking
@@ -705,12 +705,23 @@ impl DiskWeaveApp {
             .map(|id| (id, self.tracking.confirmed_after, self.tracking.running()));
         for update in self.file_refresh.poll(&mut self.scan, tracking) {
             if self.scan.selected_id() == Some(update.id) {
-                self.replace_live_result(update.old.as_deref(), &update.new);
+                self.replace_live_result(update.old.as_deref(), &update.new, None);
             }
         }
     }
-    fn replace_live_result(&mut self, old: Option<&ScanResult>, new: &Arc<ScanResult>) {
-        self.explorer = Some(self.search.replace_result(self.explorer.as_ref(), old, new));
+    fn replace_live_result(
+        &mut self,
+        old: Option<&ScanResult>,
+        new: &Arc<ScanResult>,
+        entries: Option<(
+            &crate::usn::entries::Projection,
+            &crate::usn::entries::Projection,
+        )>,
+    ) {
+        self.explorer = Some(
+            self.search
+                .replace_result(self.explorer.as_ref(), old, new, entries),
+        );
         self.detail_target = None;
         self.detail_context = None;
     }
@@ -725,17 +736,25 @@ impl DiskWeaveApp {
         }
         let was_running = self.tracking.running();
         if let Some(update) = self.tracking.poll() {
-            self.locations_view.preserve_live_selection();
+            self.locations_view.preserve_live_selection(&self.scan);
             let accepted = match update {
                 crate::tracking::Update::Record(record) => {
                     let old = self
                         .scan
                         .get(id)
                         .and_then(|e| e.scan.completed())
-                        .map(|c| Arc::clone(&c.result));
+                        .map(|c| (Arc::clone(&c.result), c.entries.clone()));
                     self.scan.accept_tracking(id, &record).map(|changed| {
                         if changed && self.scan.selected_id() == Some(id) {
-                            self.replace_live_result(old.as_deref(), &record.scan);
+                            let identities = old
+                                .as_ref()
+                                .and_then(|(_, entries)| entries.as_deref())
+                                .zip(record.entries.as_deref());
+                            self.replace_live_result(
+                                old.as_ref().map(|(scan, _)| scan.as_ref()),
+                                &record.scan,
+                                identities,
+                            );
                         }
                     })
                 }
@@ -748,7 +767,7 @@ impl DiskWeaveApp {
             }
         }
         if was_running && matches!(self.tracking.status, crate::tracking::Status::Failed(_)) {
-            self.locations_view.preserve_live_selection();
+            self.locations_view.preserve_live_selection(&self.scan);
             self.scan.tracking_failed(id);
         }
     }
@@ -1335,6 +1354,7 @@ impl DiskWeaveApp {
         let locations = self.active_locations();
         let entry = locations.get(locations.selected_id()?)?;
         Some(Snapshot {
+            entries: entry.scan.completed()?.entries.clone(),
             id: entry.id,
             generation: entry.generation,
             scan: Arc::clone(&entry.scan.completed()?.result),

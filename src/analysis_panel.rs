@@ -356,6 +356,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, p)| Snapshot {
+                entries: None,
                 id: i as u64 + 10,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&root.join(p), || false).unwrap()),
@@ -399,6 +400,7 @@ mod tests {
         panel.submit(key.clone(), sources.clone(), StatsScope::All);
         std::fs::write(root.join("a/a.bin"), [0; 4]).unwrap();
         let fresh = Snapshot {
+            entries: None,
             id: 10,
             generation: 2,
             scan: Arc::new(crate::scanner::scan(&root.join("a"), || false).unwrap()),

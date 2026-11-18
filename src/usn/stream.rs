@@ -41,8 +41,8 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().collect()
 }
 pub(super) fn diff(
-    old: &BTreeMap<PathBuf, Node>,
-    new: &BTreeMap<PathBuf, Node>,
+    old: &super::entries::Entries,
+    new: &super::entries::Entries,
     before: &BTreeMap<PathBuf, Unavailable>,
     after: &BTreeMap<PathBuf, Unavailable>,
 ) -> Vec<Change> {
@@ -473,6 +473,7 @@ impl Receiver {
                 unavailable: old.unavailable.clone(),
                 checkpoint: old.checkpoint.clone(),
                 scan: old.scan.clone(),
+                projection: old.projection.clone(),
                 started: old.started,
                 changes: vec![],
             }
@@ -480,7 +481,7 @@ impl Receiver {
             Index {
                 root: self.root.clone(),
                 detailed: self.detailed,
-                nodes: BTreeMap::new(),
+                nodes: super::entries::Entries::new(),
                 unavailable: BTreeMap::new(),
                 checkpoint: Checkpoint {
                     version: 4,
@@ -496,6 +497,7 @@ impl Receiver {
                     confirmed_after: header.confirmed_after,
                 },
                 scan: None,
+                projection: None,
                 started: header.started,
                 changes: vec![],
             }
@@ -540,8 +542,8 @@ impl Receiver {
                             {
                                 return Err(invalid("갱신 대상 파일 ID 불일치"));
                             }
-                            if let Some(old) = candidate.nodes.remove(&p) {
-                                units -= node_cost(&p, &old);
+                            if let Some(old) = candidate.nodes.get(&p) {
+                                units -= node_cost(&p, old);
                             }
                             if let Some(value) = value {
                                 if value.id == 0 || value.dir() && value.bytes != 0 {
@@ -551,6 +553,8 @@ impl Receiver {
                                 candidate.nodes.insert(p, value);
                             } else if expected.is_none() {
                                 return Err(invalid("존재하지 않는 삭제 대상"));
+                            } else {
+                                candidate.nodes.remove(&p);
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
@@ -602,6 +606,7 @@ impl Receiver {
         let ids = validate(&candidate, cancelled)?;
         if changed {
             candidate.scan = None;
+            candidate.projection = None;
             candidate.checkpoint.folders.clear();
             candidate.checkpoint.files.clear();
             candidate.checkpoint.excluded.clear();
@@ -894,6 +899,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replacing_a_path_does_not_transfer_explorer_selection_to_another_file() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("selected");
+        std::fs::write(&path, b"123").unwrap();
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+            events: vec![],
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let selected = crate::explorer::Item::File(0);
+        let mut explorer = crate::explorer::Explorer::new(&before.scan);
+        explorer.select(selected);
+        std::fs::rename(&path, fixture.0.join("previous")).unwrap();
+        std::fs::write(&path, b"12345").unwrap();
+        event(&mut source, &path, state.root, 0x80000100);
+        index.refresh(&mut source, &|| false).unwrap();
+        let after = index.snapshot(&|| false).unwrap();
+        let rebased = explorer.rebase_entries(
+            &before.scan,
+            &after.scan,
+            before.entries.as_ref().unwrap(),
+            after.entries.as_ref().unwrap(),
+        );
+        assert_eq!(rebased.selected(), crate::explorer::Item::Folder(0));
+    }
+    #[test]
+    fn metadata_deltas_keep_received_entry_ids_and_failed_frames_keep_the_id_map() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("file");
+        std::fs::write(&path, b"123").unwrap();
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+            events: vec![],
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(fixture.0.clone(), true, Default::default());
+        let mut baseline = vec![];
+        sender.write(&mut baseline, &mut index, &|| false).unwrap();
+        receiver
+            .receive(&mut baseline.as_slice(), &|| false)
+            .unwrap();
+        let before = receiver.snapshot(&|| false).unwrap();
+        let key = before
+            .entries
+            .as_ref()
+            .unwrap()
+            .path_key(Path::new("file"))
+            .unwrap();
+        std::fs::write(&path, b"1234567").unwrap();
+        event(&mut source, &path, state.root, 0x80000001);
+        index.refresh(&mut source, &|| false).unwrap();
+        let mut delta = vec![];
+        sender.write(&mut delta, &mut index, &|| false).unwrap();
+        assert!(receiver
+            .receive(&mut &delta[..delta.len() - 1], &|| false)
+            .is_err());
+        let kept = receiver.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(
+            before.entries.as_ref().unwrap(),
+            kept.entries.as_ref().unwrap()
+        ));
+        assert_eq!(before.tracking, kept.tracking);
+        assert!(receiver.receive(&mut delta.as_slice(), &|| true).is_err());
+        receiver.receive(&mut delta.as_slice(), &|| false).unwrap();
+        let after = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(
+            after.entries.as_ref().unwrap().path_key(Path::new("file")),
+            Some(key)
+        );
+        assert_eq!(after.scan.folders[0].logical_bytes, 7);
+    }
     #[test]
     fn unchanged_confirmation_keeps_the_same_result_without_sending_metadata() {
         let fixture = Fixture::new();

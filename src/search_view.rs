@@ -118,20 +118,41 @@ impl SearchView {
         previous: Option<&crate::explorer::Explorer>,
         old: Option<&ScanResult>,
         new: &Arc<ScanResult>,
+        entries: Option<(
+            &crate::usn::entries::Projection,
+            &crate::usn::entries::Projection,
+        )>,
     ) -> crate::explorer::Explorer {
-        let explorer = match (previous, old) {
-            (Some(view), Some(old)) => view.rebase(old, new),
+        let entries = entries.filter(|(before, after)| {
+            before
+                .key(Item::Folder(0))
+                .is_some_and(|key| after.same_scope(key))
+        });
+        let explorer = match (previous, old, entries) {
+            (Some(view), Some(old), Some((before, after))) => {
+                view.rebase_entries(old, new, before, after)
+            }
+            (Some(view), Some(old), None) => view.rebase(old, new),
             _ => crate::explorer::Explorer::new(new),
         };
         if let Some(old) = old {
-            self.rebase(old, new, explorer.folder());
+            self.rebase(old, new, explorer.folder(), entries);
         } else {
             self.invalidate();
         }
         explorer
     }
-    fn rebase(&mut self, old: &ScanResult, new: &Arc<ScanResult>, folder: usize) {
-        let paths = if let Some(pending) = self.live_selection.take() {
+    fn rebase(
+        &mut self,
+        old: &ScanResult,
+        new: &Arc<ScanResult>,
+        folder: usize,
+        entries: Option<(
+            &crate::usn::entries::Projection,
+            &crate::usn::entries::Projection,
+        )>,
+    ) {
+        let mut paths = if let Some(pending) = self.live_selection.take() {
             pending.4
         } else {
             self.selection
@@ -145,6 +166,17 @@ impl SearchView {
                 })
                 .collect()
         };
+        if let Some((before, after)) = entries {
+            let root = &old.folders[0].path;
+            paths = paths
+                .into_iter()
+                .filter_map(|path| {
+                    let key = before.path_key(path.strip_prefix(root).ok()?)?;
+                    let item = after.item(key)?;
+                    Some(crate::search::item_path(new, item))
+                })
+                .collect();
+        }
         self.invalidate();
         self.refresh(new, folder);
         let scope = if self.whole_scan { 0 } else { folder };
@@ -631,7 +663,7 @@ mod tests {
         view.selection.click(0, false, false);
         std::fs::write(root.join("new"), b"1234567").unwrap();
         let new = Arc::new(crate::scanner::scan(&root, || false).unwrap());
-        let explorer = view.replace_result(Some(&explorer), Some(&old), &new);
+        let explorer = view.replace_result(Some(&explorer), Some(&old), &new, None);
         wait(&mut view);
         assert_eq!(new.folders[explorer.folder()].path, root.join("a/deep"));
         assert_eq!(
@@ -644,11 +676,11 @@ mod tests {
         std::fs::remove_file(root.join("a/deep/kept.bin")).unwrap();
         std::fs::remove_dir(root.join("a/deep")).unwrap();
         let next = Arc::new(crate::scanner::scan(&root, || false).unwrap());
-        let explorer = view.replace_result(Some(&explorer), Some(&new), &next);
+        let explorer = view.replace_result(Some(&explorer), Some(&new), &next, None);
         wait(&mut view);
         assert_eq!(next.folders[explorer.folder()].path, root.join("a"));
         assert_eq!(view.selection.count(), 0);
-        let initial = view.replace_result(None, None, &next);
+        let initial = view.replace_result(None, None, &next, None);
         assert_eq!(initial.folder(), 0);
         assert!(view.job.results().is_none());
         assert_eq!(view.input.text, "bin");
@@ -668,7 +700,7 @@ mod tests {
         view.selection.click(0, false, false);
         std::fs::write(root.join("new.bin"), b"123456789").unwrap();
         let new = Arc::new(crate::scanner::scan(&root, || false).unwrap());
-        view.rebase(&old, &new, 0);
+        view.rebase(&old, &new, 0, None);
         wait(&mut view);
         assert_eq!(view.input.text, "bin");
         let selected = view
@@ -681,7 +713,7 @@ mod tests {
         );
         std::fs::remove_file(root.join("kept.bin")).unwrap();
         let next = Arc::new(crate::scanner::scan(&root, || false).unwrap());
-        view.rebase(&new, &next, 0);
+        view.rebase(&new, &next, 0, None);
         wait(&mut view);
         assert_eq!(view.selection.count(), 0);
         std::fs::remove_dir_all(root).unwrap();

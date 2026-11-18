@@ -16,6 +16,39 @@ pub struct Explorer {
 }
 
 impl Explorer {
+    /// 고정 ID가 남은 항목만 재연결하고 교체된 경로로 선택 승계 방지.
+    pub fn rebase_entries(
+        &self,
+        old: &ScanResult,
+        new: &ScanResult,
+        before: &crate::usn::entries::Projection,
+        after: &crate::usn::entries::Projection,
+    ) -> Self {
+        if before
+            .key(Item::Folder(0))
+            .is_none_or(|key| !after.same_scope(key))
+        {
+            return self.rebase(old, new);
+        }
+        let remap = |item| before.key(item).and_then(|key| after.item(key));
+        let mut next = Self::new(new);
+        let mut parent = Some(self.folder);
+        while let Some(folder) = parent {
+            if let Some(Item::Folder(folder)) = remap(Item::Folder(folder)) {
+                next.open_folder(new, folder);
+                break;
+            }
+            parent = old.folders[folder].parent;
+        }
+        for &folder in &self.expanded {
+            if let Some(Item::Folder(folder)) = remap(Item::Folder(folder)) {
+                next.expanded.insert(folder);
+            }
+        }
+        next.selected = remap(self.selected).unwrap_or(Item::Folder(next.folder));
+        next.rebuild_tree(new);
+        next
+    }
     /// 변경 세대의 인덱스를 경로로 다시 연결하고 사라진 폴더는 남은 상위로 복귀.
     pub fn rebase(&self, old: &ScanResult, new: &ScanResult) -> Self {
         let mut next = Self::new(new);

@@ -222,6 +222,7 @@ mod tests {
         )
         .unwrap();
         let sources = vec![crate::locations::Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(scan),
@@ -237,6 +238,7 @@ mod tests {
         );
         assert_eq!(stats.bytes, 6);
         let basic = vec![crate::locations::Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -279,6 +281,7 @@ mod tests {
             Arc::new(crate::scanner::scan_with_options(&root, true, || false, |_| {}).unwrap());
         let allocation = scan.files[0].extra.allocation.value().unwrap();
         let source = crate::locations::Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan,
@@ -316,6 +319,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, p)| crate::locations::Snapshot {
+                entries: None,
                 id: i as u64 + 10,
                 generation: 1,
                 scan: Arc::new(
@@ -358,6 +362,7 @@ mod tests {
             std::fs::write(root.join(format!("{i:03}.bin")), vec![0; i]).unwrap();
         }
         let sources = vec![Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -400,6 +405,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, path)| Snapshot {
+                entries: None,
                 id: index as u64,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&root.join(path), || false).unwrap()),
@@ -461,6 +467,7 @@ mod tests {
         let scan = Arc::new(crate::scanner::scan(&root, || false).unwrap());
         let folder = scan.folder_index(std::path::Path::new("data")).unwrap();
         let sources = vec![crate::locations::Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan,

@@ -242,6 +242,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("diskweave-map-empty-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut source = Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -308,6 +309,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(id, p)| Snapshot {
+                entries: None,
                 id: id as u64,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&root.join(p), || false).unwrap()),
@@ -363,6 +365,7 @@ mod tests {
             std::fs::write(root.join(format!("{id:04}.bin")), [0]).unwrap();
         }
         let sources = vec![Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -406,6 +409,7 @@ mod tests {
         std::fs::write(root.join("large.bin"), [0; 12]).unwrap();
         std::fs::write(root.join("empty"), []).unwrap();
         let sources = vec![crate::locations::Snapshot {
+            entries: None,
             id: 4,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),

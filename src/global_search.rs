@@ -162,6 +162,7 @@ mod tests {
                     };
                 }
                 Snapshot {
+                    entries: None,
                     id: id as u64,
                     generation: 1,
                     scan: Arc::new(scan),
@@ -233,6 +234,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("match.bin"), [0]).unwrap();
         let source = Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(crate::scanner::scan(&root, || false).unwrap()),
@@ -288,11 +290,13 @@ mod tests {
         std::fs::write(root.join("b").join("same.bin"), [0; 9]).unwrap();
         let sources = vec![
             Snapshot {
+                entries: None,
                 id: 10,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&root.join("a"), || false).unwrap()),
             },
             Snapshot {
+                entries: None,
                 id: 20,
                 generation: 4,
                 scan: Arc::new(crate::scanner::scan(&root.join("b"), || false).unwrap()),

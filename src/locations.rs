@@ -19,6 +19,7 @@ pub struct Location {
 }
 #[derive(Clone)]
 pub struct Snapshot {
+    pub entries: Option<Arc<crate::usn::entries::Projection>>,
     pub id: u64,
     pub generation: u64,
     pub scan: Arc<ScanResult>,
@@ -434,6 +435,7 @@ impl Locations {
             .filter(|e| !e.stale)
             .filter_map(|e| {
                 e.scan.completed().map(|c| Snapshot {
+                    entries: c.entries.clone(),
                     id: e.id,
                     generation: e.generation,
                     scan: Arc::clone(&c.result),

@@ -201,6 +201,7 @@ mod tests {
         scan.folders[0].access = crate::scanner::FolderAccess::Partial;
         scan.folders[denied].access = crate::scanner::FolderAccess::Denied;
         let sources = [Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(scan),
@@ -248,6 +249,7 @@ mod tests {
         scan.files[0].modified = None;
         scan.files[0].extra.allocation = crate::metadata::Field::Value(4096);
         let sources = [Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(scan),
@@ -283,6 +285,7 @@ mod tests {
         scan.files[0].name = "a,\"b\r\n.csv".into();
         scan.files[0].modified = None;
         let sources = [Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(scan),
@@ -322,6 +325,7 @@ mod tests {
         scan.error_count = 1;
         scan.folders[0].modified = None;
         let source = [Snapshot {
+            entries: None,
             id: 1,
             generation: 1,
             scan: Arc::new(scan),
@@ -357,6 +361,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, p)| Snapshot {
+                entries: None,
                 id: i as u64,
                 generation: 1,
                 scan: Arc::new(crate::scanner::scan(&base.join(p), || false).unwrap()),

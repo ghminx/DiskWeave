@@ -426,6 +426,7 @@ pub(crate) mod tests {
         }
         pub fn snapshot(&self) -> crate::locations::Snapshot {
             crate::locations::Snapshot {
+                entries: None,
                 id: 1,
                 generation: 1,
                 scan: Arc::new(

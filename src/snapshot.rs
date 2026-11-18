@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SavedScan {
+    pub entries: Option<Arc<crate::usn::entries::Projection>>,
     pub tracking: Option<crate::usn::Checkpoint>,
     pub engine: Option<crate::engine::Report>,
     pub scan: Arc<ScanResult>,
@@ -26,6 +27,7 @@ impl SavedScan {
         elapsed: Duration,
     ) -> Self {
         Self {
+            entries: None,
             tracking: None,
             engine: None,
             scan,
@@ -441,6 +443,7 @@ pub fn read_from(reader: impl Read, cancelled: impl Fn() -> bool) -> io::Result<
         state.validate(&scan)?;
     }
     Ok(SavedScan {
+        entries: None,
         tracking: a.tracking,
         engine: a.engine,
         scan: Arc::new(scan),
