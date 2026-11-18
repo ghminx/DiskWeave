@@ -389,7 +389,12 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
             }
         }
         let initial = receiver.snapshot(&|| false)?;
-        let first_key = initial.entries.as_ref().unwrap().path_key(Path::new(&name(0, width))).unwrap();
+        let first_key = initial
+            .entries
+            .as_ref()
+            .unwrap()
+            .path_key(Path::new(&name(0, width)))
+            .unwrap();
         assert_eq!(initial.scan.files.len(), count);
         assert_eq!(initial.scan.folders[0].logical_bytes, count as u64 * 8);
         let mut source = Synthetic {
@@ -415,7 +420,14 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
         }
         let (delta_bytes, delta_cost) = new_update.unwrap();
         let result = receiver.snapshot(&|| false)?;
-        assert_eq!(result.entries.as_ref().unwrap().path_key(Path::new(&name(0, width))), Some(first_key));
+        assert_eq!(
+            result
+                .entries
+                .as_ref()
+                .unwrap()
+                .path_key(Path::new(&name(0, width))),
+            Some(first_key)
+        );
         let identities = result.entries.as_ref().unwrap();
         let queried = Instant::now();
         for row in 0..count {
@@ -427,7 +439,7 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
         assert_eq!(result.scan.folders[0].logical_bytes, count as u64 * 8 + 9);
         result.tracking.as_ref().unwrap().validate(&result.scan)?;
         let (bytes, cost) = new.unwrap();
-        results.push(serde_json::json!({"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
+        results.push(serde_json::json!({"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
     }
     let cancel_ms = cancellation(&mut Index::restore(&record)?, &root)?;
     let report = serde_json::json!({"count":count,"name_width":width,"bounded_channel_bytes":4*BUFFER,"frame_limit_bytes":1024*1024,"cancel_ms":cancel_ms,"note":"같은 프로세스의 제한된 채널에서 전송과 부모 결과 구성을 측정함. CPU는 프로세스 시간 차이, RAM은 해당 단계에서 이미 유지 중인 원본/인덱스/이전 결과를 포함한 25ms 간격 working set 표본 최대값임. 실제 관리자 IPC/UAC·OS 수집·GUI 게시 시간은 포함하지 않음. 재구성·원본 수집의 전체 메모리 상한을 의미하지 않음.","results":results});

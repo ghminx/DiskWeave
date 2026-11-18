@@ -1,4 +1,4 @@
-use super::Node;
+use super::{edit::Budget, stream::Change, Node};
 use crate::{explorer::Item, scanner::ScanResult};
 use std::{
     collections::{btree_map, BTreeMap, HashMap},
@@ -8,6 +8,7 @@ use std::{
         Arc,
     },
 };
+use std::{io, os::windows::ffi::OsStrExt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -24,6 +25,9 @@ pub struct Projection {
     items: HashMap<u64, Item>,
 }
 impl Projection {
+    pub(super) fn matches_rows(&self, folders: &[u64], files: &[u64]) -> bool {
+        self.folders == folders && self.files == files
+    }
     pub fn same_scope(&self, key: Key) -> bool {
         self.scope == key.scope
     }
@@ -51,29 +55,32 @@ impl Projection {
     }
 }
 
+struct Undo {
+    next: u64,
+    before: BTreeMap<PathBuf, Option<(u64, Node)>>,
+    budget: Arc<Budget>,
+}
 /// 경로 인덱스와 메타데이터 소유 저장소를 분리한 추적 수명 내 고정 ID 보관.
-#[derive(Clone)]
 pub(super) struct Entries {
     scope: u64,
     next: u64,
-    paths: Arc<BTreeMap<PathBuf, u64>>,
+    paths: BTreeMap<PathBuf, u64>,
     values: HashMap<u64, Node>,
+    undo: Option<Undo>,
 }
-impl PartialEq for Entries {
-    fn eq(&self, other: &Self) -> bool {
-        self.scope == other.scope && self.paths == other.paths && self.values == other.values
-    }
-}
-impl Eq for Entries {}
 impl Entries {
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             scope: NEXT.fetch_add(1, Ordering::Relaxed),
             next: 1,
-            paths: Arc::new(BTreeMap::new()),
+            paths: BTreeMap::new(),
             values: HashMap::new(),
+            undo: None,
         }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
     pub fn len(&self) -> usize {
         self.values.len()
@@ -84,38 +91,140 @@ impl Entries {
     pub fn contains_key(&self, path: &Path) -> bool {
         self.paths.contains_key(path)
     }
-    pub fn insert(&mut self, path: PathBuf, node: Node) -> Option<Node> {
-        let previous = self.paths.get(&path).copied();
-        let same = previous.is_some_and(|number| {
-            let old = &self.values[&number];
-            old.id == node.id && old.attributes & 0x410 == node.attributes & 0x410
+    pub fn begin_edit(&mut self, budget: Arc<Budget>) -> io::Result<()> {
+        if self.undo.is_some() {
+            return Err(io::Error::other("중첩된 변경 원본 보관"));
+        }
+        self.undo = Some(Undo {
+            next: self.next,
+            before: BTreeMap::new(),
+            budget,
         });
-        let number = if same {
-            previous.unwrap()
-        } else {
+        Ok(())
+    }
+    fn record(
+        undo: &mut Option<Undo>,
+        path: &Path,
+        previous: Option<(u64, &Node)>,
+    ) -> io::Result<()> {
+        if let Some(undo) = undo {
+            if !undo.before.contains_key(path) {
+                let cost = previous.map_or(384 + path.as_os_str().len() as u64 * 4, |(_, node)| {
+                    super::stream::node_cost(path, node)
+                });
+                undo.budget.charge(cost)?;
+                undo.before.insert(
+                    path.to_owned(),
+                    previous.map(|(number, node)| (number, node.clone())),
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn original(&self, path: &Path) -> Option<&Node> {
+        match self.undo.as_ref().and_then(|undo| undo.before.get(path)) {
+            Some(old) => old.as_ref().map(|(_, node)| node),
+            None => self.get(path),
+        }
+    }
+    pub fn insert(&mut self, path: PathBuf, node: Node) -> io::Result<Option<Node>> {
+        let previous = self.paths.get(&path).copied();
+        if previous.is_some_and(|number| self.values[&number] == node) {
+            return Ok(Some(node));
+        }
+        Self::record(
+            &mut self.undo,
+            &path,
+            previous.map(|number| (number, &self.values[&number])),
+        )?;
+        let same =
+            |old: &Node| old.id == node.id && old.attributes & 0x410 == node.attributes & 0x410;
+        let current = previous.filter(|number| same(&self.values[number]));
+        let original = self
+            .undo
+            .as_ref()
+            .and_then(|undo| undo.before.get(&path))
+            .and_then(Option::as_ref)
+            .filter(|(_, old)| same(old))
+            .map(|(number, _)| *number);
+        let number = current.or(original).unwrap_or_else(|| {
             let number = self.next;
             self.next = self.next.checked_add(1).expect("추적 항목 ID 범위 초과");
-            Arc::make_mut(&mut self.paths).insert(path, number);
             number
-        };
+        });
+        if previous != Some(number) {
+            self.paths.insert(path, number);
+        }
         let old = previous.and_then(|number| self.values.remove(&number));
         self.values.insert(number, node);
-        old
+        Ok(old)
     }
-    pub fn remove(&mut self, path: &Path) -> Option<Node> {
-        let number = Arc::make_mut(&mut self.paths).remove(path)?;
-        self.values.remove(&number)
+    pub fn remove(&mut self, path: &Path) -> io::Result<Option<Node>> {
+        let Some(number) = self.paths.get(path).copied() else {
+            return Ok(None);
+        };
+        Self::record(&mut self.undo, path, Some((number, &self.values[&number])))?;
+        self.paths.remove(path);
+        Ok(self.values.remove(&number))
     }
-    pub fn retain(&mut self, mut keep: impl FnMut(&PathBuf, &Node) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&PathBuf, &Node) -> bool) -> io::Result<()> {
         let values = &mut self.values;
-        Arc::make_mut(&mut self.paths).retain(|path, number| {
-            if keep(path, &values[number]) {
-                true
-            } else {
-                values.remove(number);
-                false
+        let undo = &mut self.undo;
+        let mut failure = None;
+        self.paths.retain(|path, number| {
+            if failure.is_some() || keep(path, &values[number]) {
+                return true;
             }
+            if let Err(error) = Self::record(undo, path, Some((*number, &values[number]))) {
+                failure = Some(error);
+                return true;
+            }
+            values.remove(number);
+            false
         });
+        failure.map_or(Ok(()), Err)
+    }
+    pub fn mapping_changed(&self) -> bool {
+        self.undo.as_ref().is_some_and(|undo| {
+            undo.before
+                .iter()
+                .any(|(path, old)| old.as_ref().map(|(number, _)| number) != self.paths.get(path))
+        })
+    }
+    pub fn touched(&self) -> usize {
+        self.undo.as_ref().map_or(0, |undo| undo.before.len())
+    }
+    pub fn changes(&self) -> impl Iterator<Item = Change> + '_ {
+        self.undo
+            .as_ref()
+            .into_iter()
+            .flat_map(|undo| &undo.before)
+            .filter_map(|(path, previous)| {
+                let old = previous.as_ref().map(|(_, node)| node);
+                let new = self.get(path);
+                (old != new).then(|| Change::Node {
+                    path: path.as_os_str().encode_wide().collect(),
+                    expected: old.map(|node| node.id),
+                    value: new.cloned(),
+                })
+            })
+    }
+    pub fn finish_edit(&mut self) {
+        self.undo = None;
+    }
+    pub fn rollback(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            for (path, old) in undo.before {
+                if let Some(number) = self.paths.remove(&path) {
+                    self.values.remove(&number);
+                }
+                if let Some((number, node)) = old {
+                    self.paths.insert(path, number);
+                    self.values.insert(number, node);
+                }
+            }
+            self.next = undo.next;
+        }
     }
     pub fn iter(&self) -> Iter<'_> {
         Iter {
@@ -176,7 +285,15 @@ impl Entries {
         }
         Ok(Projection {
             scope: self.scope,
-            paths: Arc::clone(&self.paths),
+            paths: Arc::new(
+                self.paths
+                    .iter()
+                    .map(|(path, number)| {
+                        crate::output::check(cancelled)?;
+                        Ok((path.clone(), *number))
+                    })
+                    .collect::<io::Result<BTreeMap<_, _>>>()?,
+            ),
             folders,
             files,
             items,

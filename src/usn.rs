@@ -6,13 +6,15 @@ use crate::{
 use serde::{Deserialize, Serialize};
 #[path = "usn/buffered.rs"]
 pub mod buffered;
+#[path = "usn/edit.rs"]
+pub mod edit;
 #[path = "usn/entries.rs"]
 pub mod entries;
 #[path = "usn/stream.rs"]
 pub mod stream;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -323,12 +325,20 @@ pub struct Index {
     root: PathBuf,
     detailed: bool,
     nodes: entries::Entries,
-    unavailable: BTreeMap<PathBuf, Unavailable>,
+    unavailable: edit::Issues,
     pub checkpoint: Checkpoint,
     scan: Option<Arc<ScanResult>>,
     projection: Option<Arc<entries::Projection>>,
     started: SystemTime,
     changes: Vec<stream::Change>,
+    last_edit: edit::Stats,
+}
+struct RefreshPlan {
+    root: Node,
+    directories: HashSet<PathBuf>,
+    files: HashSet<PathBuf>,
+    retry_ready: HashSet<PathBuf>,
+    now: SystemTime,
 }
 impl Checkpoint {
     pub fn validate(&self, scan: &ScanResult) -> io::Result<()> {
@@ -506,8 +516,8 @@ impl Index {
             confirmed_after: None,
         };
         let mut nodes = entries::Entries::new();
-        nodes.insert(PathBuf::new(), first);
-        let mut unavailable = BTreeMap::new();
+        nodes.insert(PathBuf::new(), first)?;
+        let mut unavailable = edit::Issues::new();
         Self::collect(
             root,
             Path::new(""),
@@ -527,6 +537,7 @@ impl Index {
             projection: None,
             started,
             changes: vec![],
+            last_edit: edit::Stats::default(),
         };
         index.refresh(source, cancelled)?;
         Ok(index)
@@ -537,7 +548,7 @@ impl Index {
         listing: bool,
         now: SystemTime,
         nodes: &mut entries::Entries,
-        unavailable: &mut BTreeMap<PathBuf, Unavailable>,
+        unavailable: &mut edit::Issues,
     ) -> io::Result<()> {
         if relative.as_os_str().is_empty() {
             return Err(context(relative, reason.error()));
@@ -565,12 +576,12 @@ impl Index {
         match &previous {
             None => {}
             Some(node) if !node.dir() => {
-                nodes.remove(relative);
+                nodes.remove(relative)?;
             }
-            Some(_) => nodes.retain(|p, _| !p.starts_with(relative) || listing && p == relative),
+            Some(_) => nodes.retain(|p, _| !p.starts_with(relative) || listing && p == relative)?,
         }
-        unavailable.retain(|p, _| !p.starts_with(relative));
-        unavailable.insert(relative.to_owned(), value);
+        unavailable.retain(|p, _| !p.starts_with(relative))?;
+        unavailable.insert(relative.to_owned(), value)?;
         Ok(())
     }
     fn collect(
@@ -580,7 +591,7 @@ impl Index {
         source: &mut impl Source,
         cancelled: &impl Fn() -> bool,
         nodes: &mut entries::Entries,
-        unavailable: &mut BTreeMap<PathBuf, Unavailable>,
+        unavailable: &mut edit::Issues,
     ) -> io::Result<()> {
         let mut pending = vec![relative.to_owned()];
         while let Some(parent) = pending.pop() {
@@ -630,7 +641,7 @@ impl Index {
                 if node.dir() && !node.excluded() {
                     pending.push(rel.clone());
                 }
-                nodes.insert(rel, node);
+                nodes.insert(rel, node)?;
             }
         }
         Ok(())
@@ -667,7 +678,7 @@ impl Index {
                     extra: Extra::default(),
                     issue: None,
                 },
-            );
+            )?;
         }
         for (i, f) in record.scan.files.iter().enumerate() {
             let p = record.scan.folders[f.parent].path.join(&f.name);
@@ -699,7 +710,7 @@ impl Index {
                     extra: f.extra,
                     issue,
                 },
-            );
+            )?;
         }
         for e in &state.excluded {
             let p = PathBuf::from(std::ffi::OsString::from_wide(&e.path));
@@ -717,7 +728,7 @@ impl Index {
                     extra: Extra::default(),
                     issue: None,
                 },
-            );
+            )?;
         }
         Ok(Self {
             root,
@@ -737,6 +748,7 @@ impl Index {
             projection: None,
             started: record.started,
             changes: vec![],
+            last_edit: edit::Stats::default(),
         })
     }
     fn verify(&self, j: &Journal) -> io::Result<()> {
@@ -749,6 +761,18 @@ impl Index {
         &mut self,
         source: &mut impl Source,
         cancelled: &impl Fn() -> bool,
+    ) -> io::Result<bool> {
+        self.refresh_bounded(source, cancelled, stream::Limits::default().state_bytes / 2)
+    }
+    #[allow(dead_code)] // 개발용 비교 도구의 변경량 계측.
+    pub fn edit_stats(&self) -> edit::Stats {
+        self.last_edit
+    }
+    pub fn refresh_bounded(
+        &mut self,
+        source: &mut impl Source,
+        cancelled: &impl Fn() -> bool,
+        undo_bytes: u64,
     ) -> io::Result<bool> {
         crate::output::check(cancelled)?;
         let confirmed_after = source.now();
@@ -772,7 +796,6 @@ impl Index {
             .take(64)
             .map(|(p, _)| p.clone())
             .collect();
-        let mut attempted = HashSet::new();
         if retry_ready.is_empty()
             && events.is_empty()
             && self.checkpoint.pending.is_empty()
@@ -782,6 +805,7 @@ impl Index {
             let final_journal = source.journal()?;
             self.verify_at(&final_journal, journal.next)?;
             crate::output::check(cancelled)?;
+            self.last_edit = edit::Stats::default();
             self.checkpoint.next = journal.next;
             self.checkpoint.confirmed_after = Some(confirmed_after);
             return Ok(false);
@@ -857,9 +881,56 @@ impl Index {
                 }
             }
         }
-        let mut next = self.nodes.clone();
-        let mut unavailable = self.unavailable.clone();
-        next.insert(PathBuf::new(), root);
+        let plan = RefreshPlan {
+            root,
+            directories,
+            files,
+            retry_ready,
+            now,
+        };
+        let mut edit = edit::Edit::begin(self, undo_bytes, false)?;
+        edit.apply_changes(source, cancelled, plan)?;
+        let final_root = Node::from_info(source.inspect(&edit.root, false)?)?;
+        if final_root.id != edit.checkpoint.root || final_root.excluded() {
+            return Err(invalid("반영 중 추적 폴더가 바뀌었습니다"));
+        }
+        let final_journal = source.journal()?;
+        edit.verify_at(&final_journal, journal.next)?;
+        crate::output::check(cancelled)?;
+        let file_ids: HashSet<_> = edit
+            .nodes
+            .values()
+            .filter(|n| !n.dir() && !n.excluded())
+            .map(|n| n.id)
+            .collect();
+        let mut pending: Vec<_> = pending
+            .into_iter()
+            .filter(|id| file_ids.contains(id))
+            .collect();
+        pending.sort_unstable();
+        let changed = edit.commit(cancelled, true)?;
+        self.checkpoint.next = journal.next;
+        self.checkpoint.confirmed_after = Some(confirmed_after);
+        self.checkpoint.pending = pending;
+        Ok(changed)
+    }
+    fn apply_changes(
+        &mut self,
+        source: &mut impl Source,
+        cancelled: &impl Fn() -> bool,
+        plan: RefreshPlan,
+    ) -> io::Result<()> {
+        let RefreshPlan {
+            root,
+            directories,
+            files,
+            retry_ready,
+            now,
+        } = plan;
+        let mut attempted = HashSet::new();
+        let next = &mut self.nodes;
+        let unavailable = &mut self.unavailable;
+        next.insert(PathBuf::new(), root)?;
         let mut replacements = HashMap::new();
         let mut directories: Vec<_> = directories.into_iter().collect();
         let mut remaining_files = Some(files);
@@ -907,14 +978,14 @@ impl Index {
                             unavailable_reason(&e).unwrap(),
                             false,
                             now,
-                            &mut next,
-                            &mut unavailable,
+                            next,
+                            unavailable,
                         )?;
                         continue;
                     }
                     Ok(None) => {
-                        next.retain(|p, _| !p.starts_with(&directory));
-                        unavailable.retain(|p, _| !p.starts_with(&directory));
+                        next.retain(|p, _| !p.starts_with(&directory))?;
+                        unavailable.retain(|p, _| !p.starts_with(&directory))?;
                         continue;
                     }
                     Err(e) => return Err(context(&absolute, e)),
@@ -931,7 +1002,7 @@ impl Index {
                     rechecking = true;
                     break;
                 }
-                next.insert(directory.clone(), current);
+                next.insert(directory.clone(), current)?;
                 let children = match source.list(&absolute) {
                     Ok(v) => v,
                     Err(e)
@@ -943,8 +1014,8 @@ impl Index {
                             unavailable_reason(&e).unwrap(),
                             true,
                             now,
-                            &mut next,
-                            &mut unavailable,
+                            next,
+                            unavailable,
                         )?;
                         continue;
                     }
@@ -966,8 +1037,8 @@ impl Index {
                             unavailable_reason(&e).unwrap(),
                             false,
                             now,
-                            &mut next,
-                            &mut unavailable,
+                            next,
+                            unavailable,
                         )?;
                         continue;
                     }
@@ -986,8 +1057,8 @@ impl Index {
                     rechecking = true;
                     break;
                 }
-                next.insert(directory.clone(), after.unwrap());
-                unavailable.remove(&directory);
+                next.insert(directory.clone(), after.unwrap())?;
+                unavailable.remove(&directory)?;
                 let mut seen = HashSet::new();
                 for path in children {
                     crate::output::check(cancelled)?;
@@ -1012,8 +1083,8 @@ impl Index {
                                 unavailable_reason(&e).unwrap(),
                                 false,
                                 now,
-                                &mut next,
-                                &mut unavailable,
+                                next,
+                                unavailable,
                             )?;
                             continue;
                         }
@@ -1033,24 +1104,24 @@ impl Index {
                             UnavailableReason::Changing,
                             false,
                             now,
-                            &mut next,
-                            &mut unavailable,
+                            next,
+                            unavailable,
                         )?;
                         continue;
                     }
-                    let recovered = unavailable.remove(&rel).is_some();
+                    let recovered = unavailable.remove(&rel)?.is_some();
                     let replaced = next.get(&rel).is_none_or(|old| {
                         old.id != node.id || old.attributes & 0x410 != node.attributes & 0x410
                     });
                     if replaced {
                         // 새 경로에는 기존 하위 노드가 없으므로 전체 목록 순회 생략.
                         if next.contains_key(&rel) {
-                            next.retain(|p, _| !p.starts_with(&rel));
+                            next.retain(|p, _| !p.starts_with(&rel))?;
                         }
-                        unavailable.retain(|p, _| !p.starts_with(&rel));
+                        unavailable.retain(|p, _| !p.starts_with(&rel))?;
                     }
                     let descend = (replaced || recovered) && node.dir() && !node.excluded();
-                    next.insert(rel.clone(), node);
+                    next.insert(rel.clone(), node)?;
                     if descend {
                         Self::collect(
                             &self.root,
@@ -1058,8 +1129,8 @@ impl Index {
                             self.detailed,
                             source,
                             cancelled,
-                            &mut next,
-                            &mut unavailable,
+                            next,
+                            unavailable,
                         )?;
                     }
                 }
@@ -1070,8 +1141,8 @@ impl Index {
                     .cloned()
                     .collect();
                 for p in removed {
-                    next.retain(|key, _| !key.starts_with(&p));
-                    unavailable.retain(|key, _| !key.starts_with(&p));
+                    next.retain(|key, _| !key.starts_with(&p))?;
+                    unavailable.retain(|key, _| !key.starts_with(&p))?;
                 }
             }
             if rechecking {
@@ -1080,7 +1151,11 @@ impl Index {
             if let Some(files) = remaining_files.take() {
                 for path in files {
                     crate::output::check(cancelled)?;
-                    if !next.contains_key(&path) || next[&path].id != self.nodes[&path].id {
+                    if !next.contains_key(&path)
+                        || next
+                            .original(&path)
+                            .is_none_or(|old| next[&path].id != old.id)
+                    {
                         continue;
                     }
                     let absolute = self.root.join(&path);
@@ -1092,14 +1167,14 @@ impl Index {
                                 unavailable_reason(&e).unwrap(),
                                 false,
                                 now,
-                                &mut next,
-                                &mut unavailable,
+                                next,
+                                unavailable,
                             )?;
                             continue;
                         }
                         Ok(None) => {
-                            next.retain(|p, _| !p.starts_with(&path));
-                            unavailable.retain(|p, _| !p.starts_with(&path));
+                            next.retain(|p, _| !p.starts_with(&path))?;
+                            unavailable.retain(|p, _| !p.starts_with(&path))?;
                             continue;
                         }
                         Err(e) => return Err(context(&absolute, e)),
@@ -1111,12 +1186,12 @@ impl Index {
                         check_directories = true;
                         continue;
                     }
-                    next.insert(path, node);
+                    next.insert(path, node)?;
                 }
             }
             if check_directories {
                 // USN 확인 이후 이동한 폴더는 양쪽 부모의 현재 이름으로 재연결.
-                let conflicts = conflicting_directories(&next);
+                let conflicts = conflicting_directories(next);
                 let mut this_round = HashSet::new();
                 for (id, before, after) in conflicts {
                     if repaired.contains(&id) {
@@ -1140,35 +1215,7 @@ impl Index {
                 break;
             }
         }
-        let final_root = Node::from_info(source.inspect(&self.root, false)?)?;
-        if final_root.id != self.checkpoint.root || final_root.excluded() {
-            return Err(invalid("반영 중 추적 폴더가 바뀌었습니다"));
-        }
-        let final_journal = source.journal()?;
-        self.verify_at(&final_journal, journal.next)?;
-        crate::output::check(cancelled)?;
-        let changed = self.nodes != next || self.unavailable != unavailable;
-        self.changes = stream::diff(&self.nodes, &next, &self.unavailable, &unavailable);
-        self.nodes = next;
-        self.unavailable = unavailable;
-        self.checkpoint.next = journal.next;
-        self.checkpoint.confirmed_after = Some(confirmed_after);
-        let file_ids: HashSet<_> = self
-            .nodes
-            .values()
-            .filter(|n| !n.dir() && !n.excluded())
-            .map(|n| n.id)
-            .collect();
-        self.checkpoint.pending = pending
-            .into_iter()
-            .filter(|id| file_ids.contains(id))
-            .collect();
-        self.checkpoint.pending.sort_unstable();
-        if changed {
-            self.scan = None;
-            self.projection = None;
-        }
-        Ok(changed)
+        Ok(())
     }
     pub fn snapshot(&mut self, cancelled: &impl Fn() -> bool) -> io::Result<SavedScan> {
         crate::output::check(cancelled)?;
@@ -1293,11 +1340,18 @@ impl Index {
                 }
             }
             crate::scanner::finish(&mut scan)?;
-            self.projection = Some(Arc::new(self.nodes.project(
-                folder_keys,
-                file_keys,
-                cancelled,
-            )?));
+            // 저장 자료의 행 순서는 다를 수 있으므로 실제 구성 순서까지 확인 후 재사용.
+            if self
+                .projection
+                .as_ref()
+                .is_none_or(|p| !p.matches_rows(&folder_keys, &file_keys))
+            {
+                self.projection = Some(Arc::new(self.nodes.project(
+                    folder_keys,
+                    file_keys,
+                    cancelled,
+                )?));
+            }
             self.checkpoint.folders = refs;
             self.checkpoint.files = files;
             self.checkpoint.excluded = excluded;
@@ -1323,6 +1377,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -2531,6 +2586,86 @@ mod tests {
         assert!(checkpoint.validate(&record.scan).is_err());
     }
     #[test]
+    fn change_budget_failure_preserves_metadata_keys_and_checkpoint_then_allows_retry() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        for n in 0..20 {
+            fs::write(scope.join(format!("file-{n}")), b"123").unwrap();
+        }
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let changed = scope.join("file-0");
+        fs::write(&changed, b"1234567").unwrap();
+        let id = f.id(&changed);
+        let parent = f.id(&scope);
+        f.event(id, parent, 0x80000001);
+        let error = index
+            .refresh_bounded(&mut f, &|| false, 0)
+            .expect_err("원본 보관 예산 0에서 변경 거부 필요");
+        assert!(error.to_string().contains("예산"), "{error}");
+        let kept = index.snapshot(&|| false).unwrap();
+        assert_eq!(kept.tracking, before.tracking);
+        assert!(Arc::ptr_eq(&kept.scan, &before.scan));
+        assert!(Arc::ptr_eq(
+            kept.entries.as_ref().unwrap(),
+            before.entries.as_ref().unwrap()
+        ));
+        assert_eq!(kept.scan.folders[0].logical_bytes, 60);
+        assert!(index.refresh_bounded(&mut f, &|| false, 16_384).unwrap());
+        assert_eq!(
+            index.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
+            64
+        );
+        assert_eq!(index.edit_stats().touched_nodes, 1);
+        assert_eq!(index.edit_stats().changed_entries, 1);
+    }
+    #[test]
+    fn final_validation_rolls_back_file_and_exclusion_edits_without_changing_published_ids() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        for n in 0..20 {
+            fs::write(scope.join(format!("file-{n}")), b"123").unwrap();
+        }
+        let mut index = Index::begin(&scope, false, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let parent = f.id(&scope);
+        let changed = scope.join("file-0");
+        let blocked = scope.join("file-1");
+        fs::write(&changed, b"1234567").unwrap();
+        let changed_id = f.id(&changed);
+        let blocked_id = f.id(&blocked);
+        f.event(changed_id, parent, 0x80000001);
+        f.event(blocked_id, parent, 0x80000001);
+        f.blocked = Some(blocked);
+        let journal = f.journal.clone();
+        let mut replaced = journal.clone();
+        replaced.id += 1;
+        f.journal_on_read = Some(replaced);
+        assert!(index.refresh(&mut f, &|| false).is_err());
+        let kept = index.snapshot(&|| false).unwrap();
+        assert_eq!(before.tracking, kept.tracking);
+        assert!(Arc::ptr_eq(&before.scan, &kept.scan));
+        assert!(Arc::ptr_eq(
+            before.entries.as_ref().unwrap(),
+            kept.entries.as_ref().unwrap()
+        ));
+        f.journal = journal;
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let after = index.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 61);
+        assert_eq!(after.scan.error_count, 1);
+        assert_eq!(index.edit_stats().touched_nodes, 2);
+        assert_eq!(index.edit_stats().touched_unavailable, 1);
+        assert_eq!(index.edit_stats().changed_entries, 3);
+        for n in [0, 2, 19] {
+            let path = PathBuf::from(format!("file-{n}"));
+            assert_eq!(
+                before.entries.as_ref().unwrap().path_key(&path),
+                after.entries.as_ref().unwrap().path_key(&path)
+            );
+        }
+    }
+    #[test]
     fn fixed_ids_keep_open_folders_and_fall_back_when_the_selected_subtree_is_deleted() {
         let mut f = Fixture::new();
         let scope = f.root.join("scope");
@@ -2575,6 +2710,43 @@ mod tests {
         );
         assert_eq!(restored.folder(), 0);
         assert_eq!(restored.selected(), crate::explorer::Item::Folder(0));
+    }
+    #[test]
+    fn restored_noncanonical_rows_reconnect_keys_to_the_correct_files_after_a_content_update() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        for name in ["a", "b"] {
+            fs::write(scope.join(name), b"123").unwrap();
+        }
+        let mut saved = Index::begin(&scope, false, &mut f, &|| false)
+            .unwrap()
+            .snapshot(&|| false)
+            .unwrap();
+        let scan = Arc::get_mut(&mut saved.scan).unwrap();
+        scan.files.reverse();
+        crate::scanner::finish(scan).unwrap();
+        saved.tracking.as_mut().unwrap().files.reverse();
+        saved.entries = None;
+        let mut restored = Index::restore(&saved).unwrap();
+        let before = restored.snapshot(&|| false).unwrap();
+        let key = before
+            .entries
+            .as_ref()
+            .unwrap()
+            .path_key(Path::new("a"))
+            .unwrap();
+        fs::write(scope.join("a"), b"1234567").unwrap();
+        let id = f.id(&scope.join("a"));
+        let parent = f.id(&scope);
+        f.event(id, parent, 0x80000001);
+        restored.refresh(&mut f, &|| false).unwrap();
+        let after = restored.snapshot(&|| false).unwrap();
+        let Some(crate::explorer::Item::File(row)) = after.entries.as_ref().unwrap().item(key)
+        else {
+            panic!("같은 파일 ID 보존 필요")
+        };
+        assert_eq!(after.scan.files[row].name, "a");
+        assert_eq!(after.scan.files[row].logical_bytes, 7);
     }
     #[test]
     fn cancelled_id_projection_does_not_publish_an_incomplete_mapping() {
@@ -2638,6 +2810,10 @@ mod tests {
         index.refresh(&mut f, &|| false).unwrap();
         let edited = index.snapshot(&|| false).unwrap();
         assert_eq!((key(&edited, "a"), key(&edited, "b")), (ka, kb));
+        assert!(Arc::ptr_eq(
+            before.entries.as_ref().unwrap(),
+            edited.entries.as_ref().unwrap()
+        ));
         assert_eq!(edited.scan.folders[0].logical_bytes, 10);
         fs::remove_file(&b).unwrap();
         f.event(old_id, parent, 0x80000200);

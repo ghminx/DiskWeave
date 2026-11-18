@@ -1,7 +1,7 @@
 use super::{Advance, Checkpoint, Index, Node, Unavailable};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     io::{self, Read, Write},
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
@@ -39,51 +39,6 @@ pub(super) enum Change {
 }
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().collect()
-}
-pub(super) fn diff(
-    old: &super::entries::Entries,
-    new: &super::entries::Entries,
-    before: &BTreeMap<PathBuf, Unavailable>,
-    after: &BTreeMap<PathBuf, Unavailable>,
-) -> Vec<Change> {
-    let mut changes = Vec::new();
-    for (path, node) in old {
-        if new.get(path) != Some(node) {
-            changes.push(Change::Node {
-                path: wide(path),
-                expected: Some(node.id),
-                value: new.get(path).cloned(),
-            });
-        }
-    }
-    for (path, node) in new {
-        if !old.contains_key(path) {
-            changes.push(Change::Node {
-                path: wide(path),
-                expected: None,
-                value: Some(node.clone()),
-            });
-        }
-    }
-    for (path, item) in before {
-        if after.get(path) != Some(item) {
-            changes.push(Change::Unavailable {
-                path: wide(path),
-                present: true,
-                value: after.get(path).cloned(),
-            });
-        }
-    }
-    for (path, item) in after {
-        if !before.contains_key(path) {
-            changes.push(Change::Unavailable {
-                path: wide(path),
-                present: false,
-                value: Some(item.clone()),
-            });
-        }
-    }
-    changes
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,12 +142,12 @@ fn path(value: &[u16]) -> io::Result<PathBuf> {
     }
     Ok(path)
 }
-fn node_cost(path: &Path, node: &Node) -> u64 {
+pub(super) fn node_cost(path: &Path, node: &Node) -> u64 {
     384 + std::mem::size_of::<Node>() as u64
         + (path.as_os_str().len() as u64) * 4
         + node.issue.as_ref().map_or(0, |s| s.len() as u64 * 2)
 }
-fn unavailable_cost(path: &Path, item: &Unavailable) -> u64 {
+pub(super) fn unavailable_cost(path: &Path, item: &Unavailable) -> u64 {
     384 + std::mem::size_of::<Unavailable>() as u64
         + path.as_os_str().len() as u64 * 4
         + item.path.len() as u64 * 2
@@ -447,7 +402,9 @@ impl Receiver {
                 }
             }
             crate::output::check(cancelled)?;
-            let checkpoint = &mut self.index.as_mut().unwrap().checkpoint;
+            let index = self.index.as_mut().unwrap();
+            index.last_edit = Default::default();
+            let checkpoint = &mut index.checkpoint;
             checkpoint.next = header.next;
             checkpoint.pending = pending;
             checkpoint.confirmed_after = header.confirmed_after;
@@ -458,55 +415,38 @@ impl Receiver {
         if self.units > self.limits.state_bytes / 2 {
             return Err(invalid("갱신 후보가 메모리 예산을 초과했습니다"));
         }
-        let mut candidate = if let Some(old) = &self.index {
-            if header.volume != old.checkpoint.volume
-                || header.journal != old.checkpoint.journal
-                || header.root_id != old.checkpoint.root
-                || header.next < old.checkpoint.next
-            {
-                return Err(invalid("갱신 볼륨·저널·기준점 불일치"));
-            }
-            Index {
-                root: old.root.clone(),
-                detailed: old.detailed,
-                nodes: old.nodes.clone(),
-                unavailable: old.unavailable.clone(),
-                checkpoint: old.checkpoint.clone(),
-                scan: old.scan.clone(),
-                projection: old.projection.clone(),
-                started: old.started,
-                changes: vec![],
-            }
-        } else {
-            Index {
-                root: self.root.clone(),
-                detailed: self.detailed,
-                nodes: super::entries::Entries::new(),
-                unavailable: BTreeMap::new(),
-                checkpoint: Checkpoint {
-                    version: 4,
-                    volume: header.volume.clone(),
-                    root: header.root_id,
-                    journal: header.journal,
-                    next: header.next,
-                    folders: vec![],
-                    files: vec![],
-                    excluded: vec![],
-                    pending: vec![],
-                    unavailable: vec![],
-                    confirmed_after: header.confirmed_after,
-                },
-                scan: None,
-                projection: None,
-                started: header.started,
-                changes: vec![],
-            }
-        };
-        candidate.checkpoint.next = header.next;
-        candidate.checkpoint.pending.clear();
-        candidate.checkpoint.confirmed_after = header.confirmed_after;
         let baseline = self.index.is_none();
-        let mut changed = baseline;
+        let mut fresh = baseline.then(|| Index {
+            root: self.root.clone(),
+            detailed: self.detailed,
+            nodes: super::entries::Entries::new(),
+            unavailable: super::edit::Issues::new(),
+            checkpoint: Checkpoint {
+                version: 4,
+                volume: header.volume.clone(),
+                root: header.root_id,
+                journal: header.journal,
+                next: header.next,
+                folders: vec![],
+                files: vec![],
+                excluded: vec![],
+                pending: vec![],
+                unavailable: vec![],
+                confirmed_after: header.confirmed_after,
+            },
+            scan: None,
+            projection: None,
+            started: header.started,
+            changes: vec![],
+            last_edit: Default::default(),
+        });
+        let index = if baseline {
+            fresh.as_mut().unwrap()
+        } else {
+            self.index.as_mut().unwrap()
+        };
+        let mut candidate = super::edit::Edit::begin(index, self.limits.state_bytes / 2, baseline)?;
+        let mut pending = Vec::new();
         let mut units = self.units;
         let mut frames = 1;
         let mut seen = HashSet::new();
@@ -550,11 +490,11 @@ impl Receiver {
                                     return Err(invalid("갱신 항목 정보 오류"));
                                 }
                                 units += node_cost(&p, &value);
-                                candidate.nodes.insert(p, value);
+                                candidate.nodes.insert(p, value)?;
                             } else if expected.is_none() {
                                 return Err(invalid("존재하지 않는 삭제 대상"));
                             } else {
-                                candidate.nodes.remove(&p);
+                                candidate.nodes.remove(&p)?;
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
@@ -563,7 +503,7 @@ impl Receiver {
                             {
                                 return Err(invalid("확인 불가 항목 기준 불일치"));
                             }
-                            if let Some(old) = candidate.unavailable.remove(&p) {
+                            if let Some(old) = candidate.unavailable.remove(&p)? {
                                 units -= unavailable_cost(&p, &old);
                             }
                             if let Some(value) = value {
@@ -571,20 +511,19 @@ impl Receiver {
                                     return Err(invalid("확인 불가 항목 경로 불일치"));
                                 }
                                 units += unavailable_cost(&p, &value);
-                                candidate.unavailable.insert(p, value);
+                                candidate.unavailable.insert(p, value)?;
                             } else if !present {
                                 return Err(invalid("존재하지 않는 제외 해제 대상"));
                             }
                         }
                     }
-                    changed = true;
                 }
                 Frame::Pending(ids) => {
                     for id in ids {
                         if id == 0 || !pending_seen.insert(id) {
                             return Err(invalid("대기 파일 ID 중복·누락"));
                         }
-                        candidate.checkpoint.pending.push(id);
+                        pending.push(id);
                     }
                 }
                 Frame::Begin { .. } | Frame::Failed(_) => {
@@ -593,27 +532,35 @@ impl Receiver {
             }
             frames += 1;
             if candidate.nodes.len() + candidate.unavailable.len() > self.limits.entries
-                || candidate.checkpoint.pending.len() > self.limits.entries
+                || pending.len() > self.limits.entries
                 || units > self.limits.state_bytes / 2
                 || units
-                    .checked_add(self.units)
+                    .checked_add(candidate.undo_bytes())
                     .is_none_or(|n| n > self.limits.state_bytes)
                 || frames > self.limits.entries as u64 * 4 + 8
             {
                 return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
             }
         }
-        let ids = validate(&candidate, cancelled)?;
+        let ids = validate(&candidate, &pending, cancelled)?;
+        let changed = candidate.commit(cancelled, false)?;
+        let index = if baseline {
+            fresh.as_mut().unwrap()
+        } else {
+            self.index.as_mut().unwrap()
+        };
+        index.checkpoint.next = header.next;
+        index.checkpoint.pending = pending;
+        index.checkpoint.confirmed_after = header.confirmed_after;
         if changed {
-            candidate.scan = None;
-            candidate.projection = None;
-            candidate.checkpoint.folders.clear();
-            candidate.checkpoint.files.clear();
-            candidate.checkpoint.excluded.clear();
-            candidate.checkpoint.unavailable.clear();
+            index.checkpoint.folders.clear();
+            index.checkpoint.files.clear();
+            index.checkpoint.excluded.clear();
+            index.checkpoint.unavailable.clear();
         }
-        crate::output::check(cancelled)?;
-        self.index = Some(candidate);
+        if baseline {
+            self.index = fresh;
+        }
         self.session = Some(session);
         self.revision = revision;
         self.units = units;
@@ -621,6 +568,12 @@ impl Receiver {
         self.ids = ids;
         self.dirty |= changed;
         Ok(changed)
+    }
+    #[allow(dead_code)] // 개발용 비교 도구의 수신 변경량 계측.
+    pub fn edit_stats(&self) -> super::edit::Stats {
+        self.index
+            .as_ref()
+            .map_or_else(Default::default, Index::edit_stats)
     }
     /// 모든 변경을 먼저 적용하고 소비자가 준비됐을 때만 완료 목록 재구성.
     pub fn pending(&self) -> bool {
@@ -672,7 +625,11 @@ impl Receiver {
         self.index.ok_or_else(|| invalid("기준 목록 없음"))
     }
 }
-fn validate(index: &Index, cancelled: &impl Fn() -> bool) -> io::Result<HashSet<u64>> {
+fn validate(
+    index: &Index,
+    pending: &[u64],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<HashSet<u64>> {
     let root = index
         .nodes
         .get(Path::new(""))
@@ -745,13 +702,7 @@ fn validate(index: &Index, cancelled: &impl Fn() -> bool) -> io::Result<HashSet<
             return Err(invalid("확인 불가 항목 부모·상태 오류"));
         }
     }
-    if dirs.keys().any(|id| files.contains(id))
-        || index
-            .checkpoint
-            .pending
-            .iter()
-            .any(|id| !files.contains(id))
-    {
+    if dirs.keys().any(|id| files.contains(id)) || pending.iter().any(|id| !files.contains(id)) {
         return Err(invalid("등록되지 않은 대기 파일 ID"));
     }
     Ok(files)
@@ -991,7 +942,85 @@ mod tests {
             after.entries.as_ref().unwrap().path_key(Path::new("file")),
             Some(key)
         );
+        assert!(
+            Arc::ptr_eq(
+                before.entries.as_ref().unwrap(),
+                after.entries.as_ref().unwrap()
+            ),
+            "내용 변경에 불변인 경로/ID 대응표 재사용 필요"
+        );
+        assert!(!Arc::ptr_eq(&before.scan, &after.scan));
         assert_eq!(after.scan.folders[0].logical_bytes, 7);
+    }
+    #[test]
+    fn structural_delta_budget_failure_rolls_back_deleted_paths_and_can_retry_the_same_revision() {
+        let fixture = Fixture::new();
+        for n in 0..20 {
+            std::fs::write(fixture.0.join(format!("a-{n:02}")), b"123").unwrap();
+        }
+        let saved = record(&fixture.0);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            events: vec![],
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: 7,
+                first: 0,
+                lowest: 0,
+                next: 100,
+            },
+        };
+        let mut index = Index::restore(&saved).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(fixture.0.clone(), true, Default::default());
+        let mut wire = vec![];
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let before = receiver.snapshot(&|| false).unwrap();
+        for n in 0..20 {
+            let new = fixture.0.join(format!("z-{n:02}"));
+            std::fs::rename(fixture.0.join(format!("a-{n:02}")), &new).unwrap();
+            event(&mut source, &new, state.root, 0x80003000);
+        }
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.limits.state_bytes = receiver.units * 2;
+        let revision = receiver.revision;
+        let error = receiver
+            .receive(&mut wire.as_slice(), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("예산"), "{error}");
+        let kept = receiver.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&kept.scan, &before.scan));
+        assert!(Arc::ptr_eq(
+            kept.entries.as_ref().unwrap(),
+            before.entries.as_ref().unwrap()
+        ));
+        assert_eq!(kept.tracking, before.tracking);
+        assert_eq!(receiver.revision, revision);
+        receiver.limits = Default::default();
+        assert!(receiver.receive(&mut wire.as_slice(), &|| false).unwrap());
+        let after = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 60);
+        assert_eq!(after.scan.files.len(), 20);
+        assert!(after
+            .scan
+            .files
+            .iter()
+            .all(|file| file.name.to_string_lossy().starts_with("z-")));
+        for n in 0..20 {
+            let key = before
+                .entries
+                .as_ref()
+                .unwrap()
+                .path_key(Path::new(&format!("a-{n:02}")))
+                .unwrap();
+            assert!(after.entries.as_ref().unwrap().item(key).is_none());
+        }
+        assert!((40..=41).contains(&receiver.edit_stats().changed_entries));
     }
     #[test]
     fn unchanged_confirmation_keeps_the_same_result_without_sending_metadata() {
@@ -1238,6 +1267,10 @@ mod tests {
             let kept = receiver.snapshot(&|| false).unwrap();
             assert!(Arc::ptr_eq(&before.scan, &kept.scan));
             assert_eq!(kept.tracking.as_ref().unwrap().next, 100);
+            assert!(Arc::ptr_eq(
+                before.entries.as_ref().unwrap(),
+                kept.entries.as_ref().unwrap()
+            ));
         }
         let calls = std::cell::Cell::new(0);
         assert!(receiver
