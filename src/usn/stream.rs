@@ -532,10 +532,6 @@ impl Receiver {
         let mut units = self.units;
         let mut frames = 1;
         let mut seen = HashSet::new();
-        let mut local_validation = !baseline;
-        let mut link_changes = HashMap::<u64, i64>::new();
-        let mut logical = i128::from(self.validation.logical);
-        let mut allocation = i128::from(self.validation.allocation);
         let mut pending_seen = HashSet::new();
         loop {
             crate::output::check(cancelled)?;
@@ -568,45 +564,6 @@ impl Receiver {
                             {
                                 return Err(invalid("갱신 대상 파일 ID 불일치"));
                             }
-                            if local_validation {
-                                let old = candidate.nodes.get(&p);
-                                let new = value.as_ref();
-                                let same_identity = old.zip(new).is_some_and(|(old, new)| {
-                                    old.id == new.id
-                                        && old.attributes & 0x410 == new.attributes & 0x410
-                                });
-                                local_validation = same_identity
-                                    || old
-                                        .into_iter()
-                                        .chain(new)
-                                        .all(|n| !n.dir() && !n.excluded())
-                                        && new.is_none_or(|_| {
-                                            p.parent().is_some_and(|parent| {
-                                                candidate
-                                                    .nodes
-                                                    .get(parent)
-                                                    .is_some_and(|n| n.dir() && !n.excluded())
-                                                    && !candidate
-                                                        .unavailable
-                                                        .get(parent)
-                                                        .is_some_and(|entry| entry.listing)
-                                            }) && !candidate.unavailable.contains_key(&p)
-                                        });
-                                if local_validation {
-                                    let (old_bytes, old_alloc) = old.map_or((0, 0), file_sizes);
-                                    let (new_bytes, new_alloc) = new.map_or((0, 0), file_sizes);
-                                    logical += i128::from(new_bytes) - i128::from(old_bytes);
-                                    allocation += i128::from(new_alloc) - i128::from(old_alloc);
-                                    if !same_identity {
-                                        if let Some(old) = old {
-                                            *link_changes.entry(old.id).or_default() -= 1;
-                                        }
-                                        if let Some(new) = new {
-                                            *link_changes.entry(new.id).or_default() += 1;
-                                        }
-                                    }
-                                }
-                            }
                             if let Some(old) = candidate.nodes.get(&p) {
                                 units -= node_cost(&p, old);
                             }
@@ -623,11 +580,6 @@ impl Receiver {
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
-                            local_validation &= candidate
-                                .unavailable
-                                .get(&p)
-                                .zip(value.as_ref())
-                                .is_some_and(|(old, new)| old.same_status(new));
                             if candidate.unavailable.contains_key(&p) != present
                                 || baseline && present
                             {
@@ -672,41 +624,18 @@ impl Receiver {
                 return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
             }
         }
-        let (full_validation, logical, allocation) = {
+        let validation = {
             let _sample = super::cost::measure(super::cost::Stage::ReceiveValidation);
-            if local_validation {
-                for (&id, difference) in &mut link_changes {
-                    crate::output::check(cancelled)?;
-                    let previous = self.validation.identities.get(&id).copied();
-                    if previous == Some(0) {
-                        return Err(invalid("파일 ID와 폴더 ID가 겹칩니다"));
-                    }
-                    *difference += previous.unwrap_or(0);
-                    if *difference < 0 {
-                        return Err(invalid("갱신 파일 경로 개수 오류"));
-                    }
-                }
-                for id in &pending {
-                    crate::output::check(cancelled)?;
-                    let count = link_changes
-                        .get(id)
-                        .or_else(|| self.validation.identities.get(id));
-                    if count.is_none_or(|count| *count == 0) {
-                        return Err(invalid("등록되지 않은 대기 파일 ID"));
-                    }
-                }
-                (
-                    None,
-                    u64::try_from(logical).map_err(|_| invalid("논리 크기 합계 초과"))?,
-                    u64::try_from(allocation).map_err(|_| invalid("할당 크기 합계 초과"))?,
-                )
+            if baseline {
+                Validation::Baseline(validate(&candidate, &pending, cancelled)?)
             } else {
-                let validated = validate(&candidate, &pending, cancelled)?;
-                (
-                    Some(validated.identities),
-                    validated.logical,
-                    validated.allocation,
-                )
+                validate_delta(
+                    &candidate,
+                    seen.iter().map(|(_, path)| path.as_path()).collect(),
+                    &self.validation,
+                    &pending,
+                    cancelled,
+                )?
             }
         };
         let changed = candidate.commit(cancelled, false)?;
@@ -731,19 +660,7 @@ impl Receiver {
         self.revision = revision;
         self.units = units;
         self.finished = header.finished;
-        self.validation.logical = logical;
-        self.validation.allocation = allocation;
-        if let Some(identities) = full_validation {
-            self.validation.identities = identities;
-        } else {
-            for (id, count) in link_changes {
-                if count == 0 {
-                    self.validation.identities.remove(&id);
-                } else {
-                    self.validation.identities.insert(id, count);
-                }
-            }
-        }
+        validation.commit(&mut self.validation);
         self.dirty |= changed;
         Ok(changed)
     }
@@ -766,7 +683,7 @@ impl Receiver {
             if !ready && self.published {
                 return Ok(None);
             }
-            let record = self.snapshot(cancelled)?;
+            let record = self.build_snapshot(cancelled, self.published)?;
             self.dirty = false;
             self.published = true;
             Ok(Some(Publication(super::WatchUpdate::Record(Box::new(
@@ -778,9 +695,17 @@ impl Receiver {
             ))))
         }
     }
+    #[allow(dead_code, reason = "개발용 비교 도구의 전체 Snapshot 검증 경계")]
     pub fn snapshot(
         &mut self,
         cancelled: &impl Fn() -> bool,
+    ) -> io::Result<crate::snapshot::SavedScan> {
+        self.build_snapshot(cancelled, false)
+    }
+    fn build_snapshot(
+        &mut self,
+        cancelled: &impl Fn() -> bool,
+        allow_partial: bool,
     ) -> io::Result<crate::snapshot::SavedScan> {
         let index = self
             .index
@@ -789,7 +714,13 @@ impl Receiver {
         let mut record = index.snapshot(cancelled)?;
         record.finished = self.finished;
         let _sample = super::cost::measure(super::cost::Stage::SnapshotValidation);
-        record.tracking.as_ref().unwrap().validate(&record.scan)?;
+        let checkpoint = record.tracking.as_ref().unwrap();
+        if allow_partial && record.scan.partial.is_some() {
+            // 이미 검증한 원본과 변경된 행으로 만든 내부 결과의 형상 확인.
+            checkpoint.validate_shape(&record.scan)?;
+        } else {
+            checkpoint.validate(&record.scan)?;
+        }
         Ok(record)
     }
     pub fn advance(&self) -> io::Result<Advance> {
@@ -810,11 +741,7 @@ impl Receiver {
         Ok(index)
     }
 }
-fn validate(
-    index: &Index,
-    pending: &[u64],
-    cancelled: &impl Fn() -> bool,
-) -> io::Result<Validated> {
+fn validate_root(index: &Index) -> io::Result<()> {
     let root = index
         .nodes
         .get(Path::new(""))
@@ -822,21 +749,174 @@ fn validate(
     if root.id != index.checkpoint.root || !root.dir() || root.excluded() {
         return Err(invalid("추적 루트 불일치"));
     }
+    Ok(())
+}
+
+fn available_directory(index: &Index, path: &Path) -> bool {
+    index.nodes.get(path).and_then(Node::directory_id).is_some()
+        && !index.unavailable.get(path).is_some_and(|e| e.listing)
+}
+
+fn validate_unavailable(index: &Index, path: &Path, value: &Unavailable) -> io::Result<()> {
+    if !path.parent().is_some_and(|parent| {
+        available_directory(index, parent)
+            && index.nodes.get(parent).and_then(Node::directory_id) == Some(value.parent)
+    }) || !matches!(
+        value.reason,
+        super::UnavailableReason::Os(5 | 32 | 33)
+            | super::UnavailableReason::Changing
+            | super::UnavailableReason::Redirected
+    ) || value.previous_id == Some(0)
+        || matches!(value.reason, super::UnavailableReason::Changing) && value.listing
+        || value.reason == super::UnavailableReason::Redirected
+            && (value.listing || !value.directory)
+        || value.listing
+            && (!value.directory
+                || index.nodes.get(path).and_then(Node::directory_id) != value.previous_id
+                || value.previous_id.is_none())
+        || !value.listing && index.nodes.contains_key(path)
+    {
+        return Err(invalid("확인 불가 항목 부모·상태 오류"));
+    }
+    Ok(())
+}
+
+enum Validation {
+    Baseline(Validated),
+    Delta {
+        ids: HashMap<u64, Option<i64>>,
+        logical: u64,
+        allocation: u64,
+    },
+}
+impl Validation {
+    fn commit(self, current: &mut Validated) {
+        match self {
+            Self::Baseline(value) => *current = value,
+            Self::Delta {
+                ids,
+                logical,
+                allocation,
+            } => {
+                for (id, value) in ids {
+                    if let Some(count) = value {
+                        current.identities.insert(id, count);
+                    } else {
+                        current.identities.remove(&id);
+                    }
+                }
+                current.logical = logical;
+                current.allocation = allocation;
+            }
+        }
+    }
+}
+
+fn validate_delta(
+    index: &Index,
+    paths: HashSet<&Path>,
+    previous: &Validated,
+    pending: &[u64],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Validation> {
+    validate_root(index)?;
+    let mut changes = HashMap::<u64, (i64, i64)>::new();
+    let mut logical = i128::from(previous.logical);
+    let mut allocation = i128::from(previous.allocation);
+    for path in paths {
+        crate::output::check(cancelled)?;
+        let after = index.nodes.get(path);
+        let before = index.nodes.original(path);
+        if after.is_some()
+            && path
+                .parent()
+                .is_some_and(|parent| !available_directory(index, parent))
+        {
+            return Err(invalid("갱신 항목 부모 누락"));
+        }
+        if let Some(issue) = index.unavailable.get(path) {
+            validate_unavailable(index, path, issue)?;
+        }
+        if before.and_then(Node::directory_id).is_some() {
+            if !available_directory(index, path)
+                && (index.nodes.subtree_keys(path).any(|child| child != path)
+                    || index
+                        .unavailable
+                        .subtree_keys(path)
+                        .any(|child| child != path))
+            {
+                return Err(invalid("갱신 항목 부모 누락"));
+            }
+            if before.and_then(Node::directory_id) != after.and_then(Node::directory_id) {
+                for child in index.unavailable.subtree_keys(path) {
+                    crate::output::check(cancelled)?;
+                    if child.parent() == Some(path) {
+                        validate_unavailable(index, child, &index.unavailable[child])?;
+                    }
+                }
+            }
+        }
+        for (node, sign) in [(before, -1i64), (after, 1)] {
+            let Some(node) = node.filter(|n| !n.excluded()) else {
+                continue;
+            };
+            let (folders, files) = changes.entry(node.id).or_default();
+            if node.dir() {
+                *folders += sign;
+            } else {
+                *files += sign;
+                let (size, allocated) = file_sizes(node);
+                logical += i128::from(sign) * i128::from(size);
+                allocation += i128::from(sign) * i128::from(allocated);
+            }
+        }
+    }
+    let mut ids = HashMap::with_capacity(changes.len());
+    for (id, (folders, files)) in changes {
+        crate::output::check(cancelled)?;
+        let old = previous.identities.get(&id).copied();
+        let folders = folders + i64::from(old == Some(0));
+        let files = files + old.unwrap_or(0);
+        let count = match (folders, files) {
+            (0, 0) => None,
+            (1, 0) => Some(0),
+            (0, count) if count > 0 => Some(count),
+            _ => return Err(invalid("폴더 ID 중복 또는 갱신 파일 경로 개수 오류")),
+        };
+        ids.insert(id, count);
+    }
+    for id in pending {
+        crate::output::check(cancelled)?;
+        if ids
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| previous.identities.get(id).copied())
+            .is_none_or(|count| count == 0)
+        {
+            return Err(invalid("등록되지 않은 대기 파일 ID"));
+        }
+    }
+    Ok(Validation::Delta {
+        ids,
+        logical: u64::try_from(logical).map_err(|_| invalid("논리 크기 합계 초과"))?,
+        allocation: u64::try_from(allocation).map_err(|_| invalid("할당 크기 합계 초과"))?,
+    })
+}
+
+fn validate(
+    index: &Index,
+    pending: &[u64],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Validated> {
+    validate_root(index)?;
     let mut dirs = HashMap::new();
     let mut files = HashMap::<u64, i64>::new();
     let mut bytes = 0u64;
     let mut allocation = 0u64;
     for (p, n) in &index.nodes {
         crate::output::check(cancelled)?;
-        if !p.as_os_str().is_empty()
-            && (index
-                .unavailable
-                .get(p.parent().unwrap())
-                .is_some_and(|e| e.listing)
-                || !index
-                    .nodes
-                    .get(p.parent().unwrap())
-                    .is_some_and(|parent| parent.dir() && !parent.excluded()))
+        if p.parent()
+            .is_some_and(|parent| !available_directory(index, parent))
         {
             return Err(invalid("갱신 항목 부모 누락"));
         }
@@ -866,26 +946,7 @@ fn validate(
     }
     for (p, e) in &index.unavailable {
         crate::output::check(cancelled)?;
-        if p.as_os_str().is_empty()
-            || !index
-                .nodes
-                .get(p.parent().unwrap())
-                .is_some_and(|n| n.dir() && !n.excluded() && n.id == e.parent)
-            || !matches!(
-                e.reason,
-                super::UnavailableReason::Os(5 | 32 | 33)
-                    | super::UnavailableReason::Changing
-                    | super::UnavailableReason::Redirected
-            )
-            || e.previous_id == Some(0)
-            || matches!(e.reason, super::UnavailableReason::Changing) && e.listing
-            || e.reason == super::UnavailableReason::Redirected && (e.listing || !e.directory)
-            || e.listing && (!e.directory || index.nodes.get(p).map(|n| n.id) != e.previous_id)
-            || !e.listing && index.nodes.contains_key(p)
-            || e.listing && !index.nodes.get(p).is_some_and(|n| n.dir() && !n.excluded())
-        {
-            return Err(invalid("확인 불가 항목 부모·상태 오류"));
-        }
+        validate_unavailable(index, p, e)?;
     }
     if dirs.keys().any(|id| files.contains_key(id))
         || pending.iter().any(|id| !files.contains_key(id))
@@ -1534,6 +1595,313 @@ pub(crate) mod tests {
             source.clock
         );
         assert_same(&index.snapshot(&|| false).unwrap(), &after);
+    }
+
+    #[test]
+    fn file_exclusion_and_recovery_only_revisit_affected_entries() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        std::fs::create_dir(root.join("affected")).unwrap();
+        std::fs::create_dir(root.join("unrelated")).unwrap();
+        for row in 0..512 {
+            std::fs::write(root.join(format!("unrelated/{row:04}")), b"x").unwrap();
+        }
+        let locked = root.join("affected/locked");
+        let deleted = root.join("affected/deleted");
+        std::fs::write(&locked, b"lock").unwrap();
+        std::fs::write(&deleted, b"del").unwrap();
+        let saved = record(root);
+        let start = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: start.volume.clone(),
+                id: start.journal,
+                first: 0,
+                lowest: 0,
+                next: start.next,
+            },
+            events: vec![],
+        };
+        let mut index = Index::begin(root, true, &mut source, &|| false).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        assert!(receiver.publication(true, &|| false).unwrap().is_some());
+        let mut previous = receiver.snapshot(&|| false).unwrap();
+        let branch = previous.scan.folder_index(Path::new("affected")).unwrap();
+        let parent = previous.tracking.as_ref().unwrap().folders[branch];
+        event(&mut source, &deleted, parent, 0x80000200);
+        std::fs::remove_file(&deleted).unwrap();
+        event(&mut source, &locked, parent, 0x80000001);
+        source.blocked = Some(locked.clone());
+        for (bytes, errors) in [(512, 1), (516, 0)] {
+            index.refresh(&mut source, &|| false).unwrap();
+            wire.clear();
+            sender.write(&mut wire, &mut index, &|| false).unwrap();
+            if errors == 1 {
+                let corrupt = rewrite(&wire, |frame| {
+                    if let Frame::Change(Change::Unavailable {
+                        value: Some(issue), ..
+                    }) = frame
+                    {
+                        issue.parent = start.root;
+                    }
+                });
+                assert!(receiver
+                    .receive(&mut corrupt.as_slice(), &|| false)
+                    .is_err());
+                let checks = std::cell::Cell::new(0);
+                let error = receiver
+                    .receive(&mut wire.as_slice(), &|| {
+                        checks.set(checks.get() + 1);
+                        checks.get() > 8
+                    })
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                let kept = receiver.snapshot(&|| false).unwrap();
+                assert!(Arc::ptr_eq(&kept.scan, &previous.scan));
+                assert_eq!(kept.tracking, previous.tracking);
+            }
+            let checks = std::cell::Cell::new(0);
+            assert!(receiver
+                .receive(&mut wire.as_slice(), &|| {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 128
+                })
+                .unwrap());
+            assert!(receiver.publication(true, &|| false).unwrap().is_some());
+            let current = receiver.snapshot(&|| false).unwrap();
+            assert!(current.scan.has_partial_update_from(&previous.scan));
+            assert_eq!(current.scan.folders[0].logical_bytes, bytes);
+            assert_eq!(current.scan.error_count, errors);
+            assert_same(&index.snapshot(&|| false).unwrap(), &current);
+            previous = current;
+            source.blocked = None;
+            source.clock += Duration::from_secs(31);
+        }
+    }
+
+    #[test]
+    fn excluded_reparse_entries_do_not_rebuild_visible_file_rows() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        std::fs::write(root.join("visible"), b"abc").unwrap();
+        let saved = record(root);
+        let before = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: before.volume.clone(),
+                id: before.journal,
+                first: 0,
+                lowest: 0,
+                next: before.next,
+            },
+            events: vec![],
+        };
+        let mut index = Index::begin(root, true, &mut source, &|| false).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let initial = receiver.snapshot(&|| false).unwrap();
+        let alias = root.join("alias");
+        std::fs::write(&alias, b"skip").unwrap();
+        event(&mut source, &alias, before.root, 0x80000100);
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let reparse = rewrite(&wire, |frame| {
+            if let Frame::Change(Change::Node {
+                path,
+                value: Some(node),
+                ..
+            }) = frame
+            {
+                if path.as_slice() == crate::snapshot::wide(std::ffi::OsStr::new("alias")) {
+                    node.attributes |= 0x400;
+                }
+            }
+        });
+        receiver
+            .receive(&mut reparse.as_slice(), &|| false)
+            .unwrap();
+        let added = receiver.snapshot(&|| false).unwrap();
+        assert!(added.scan.has_partial_update_from(&initial.scan));
+        assert_eq!(added.scan.files.len(), 1);
+        assert_eq!(added.scan.folders[0].logical_bytes, 3);
+        assert_eq!(added.scan.skipped_reparse_points, 1);
+        assert_eq!(added.tracking.as_ref().unwrap().excluded.len(), 1);
+
+        event(&mut source, &alias, before.root, 0x80000200);
+        std::fs::remove_file(&alias).unwrap();
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let removed = receiver.snapshot(&|| false).unwrap();
+        assert!(removed.scan.has_partial_update_from(&added.scan));
+        assert_eq!(removed.scan.files.len(), 1);
+        assert_eq!(removed.scan.skipped_reparse_points, 0);
+        assert!(removed.tracking.as_ref().unwrap().excluded.is_empty());
+    }
+
+    #[test]
+    fn adding_nested_folders_and_deleting_a_file_preserves_unrelated_rows() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        std::fs::create_dir(root.join("kept")).unwrap();
+        let removed_folder = root.join("b-remove");
+        std::fs::create_dir(&removed_folder).unwrap();
+        for row in 0..512 {
+            std::fs::write(root.join(format!("kept/{row:04}")), b"x").unwrap();
+        }
+        let file = root.join("delete");
+        std::fs::write(&file, b"old").unwrap();
+        let saved = record(root);
+        let checkpoint = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            journal: crate::usn::Journal {
+                volume: checkpoint.volume.clone(),
+                id: checkpoint.journal,
+                first: 0,
+                lowest: 0,
+                next: checkpoint.next,
+            },
+            events: vec![],
+        };
+        let mut index = Index::begin(root, true, &mut source, &|| false).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let before = receiver.snapshot(&|| false).unwrap();
+        let kept = before.scan.folder_index(Path::new("kept")).unwrap();
+        let directory = root.join("aaa");
+        std::fs::create_dir_all(directory.join("child")).unwrap();
+        std::fs::write(directory.join("child/file"), b"copy").unwrap();
+        event(&mut source, &directory, checkpoint.root, 0x80000100);
+        event(&mut source, &file, checkpoint.root, 0x80000200);
+        std::fs::remove_file(&file).unwrap();
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let duplicate = rewrite(&wire, |frame| {
+            if let Frame::Change(Change::Node {
+                path,
+                value: Some(node),
+                ..
+            }) = frame
+            {
+                if path.as_slice() == crate::snapshot::wide(std::ffi::OsStr::new("aaa")) {
+                    node.id = before.tracking.as_ref().unwrap().folders[kept];
+                }
+            }
+        });
+        let error = receiver
+            .receive(&mut duplicate.as_slice(), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("폴더 ID 중복"));
+        assert_eq!(receiver.advance().unwrap().next, checkpoint.next);
+        let checks = std::cell::Cell::new(0);
+        assert!(receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 128
+            })
+            .unwrap());
+        let after = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folder_index(Path::new("kept")).unwrap(), kept);
+        assert!(after.scan.has_partial_update_from(&before.scan));
+        assert_eq!(after.scan.folders[0].logical_bytes, 516);
+        assert_eq!(after.scan.folders[0].folder_count, 4);
+        let child = after.scan.folder_index(Path::new("aaa/child")).unwrap();
+        assert_eq!(after.scan.folders[child].logical_bytes, 4);
+        assert_eq!(after.scan.file_children[child].len(), 1);
+
+        let query = crate::search::SearchInput {
+            text: "aaa".into(),
+            ..Default::default()
+        }
+        .compile(0)
+        .unwrap();
+        let old = crate::search::search(&before.scan, &query, || false).unwrap();
+        let result =
+            crate::search::refresh_matches(&before.scan, &after.scan, &query, old, || false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            result.items,
+            crate::search::search(&after.scan, &query, || false)
+                .unwrap()
+                .items
+        );
+        event(&mut source, &removed_folder, checkpoint.root, 0x80000200);
+        std::fs::remove_dir(removed_folder).unwrap();
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let orphan = rewrite(&wire, |frame| {
+            if let Frame::Change(Change::Node {
+                path,
+                expected,
+                value: None,
+            }) = frame
+            {
+                if path.as_slice() == crate::snapshot::wide(std::ffi::OsStr::new("b-remove")) {
+                    *path = crate::snapshot::wide(std::ffi::OsStr::new("aaa"));
+                    let folder = after.scan.folder_index(Path::new("aaa")).unwrap();
+                    *expected = Some(after.tracking.as_ref().unwrap().folders[folder]);
+                }
+            }
+        });
+        let error = receiver
+            .receive(&mut orphan.as_slice(), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("부모 누락"));
+        assert!(Arc::ptr_eq(
+            &receiver.snapshot(&|| false).unwrap().scan,
+            &after.scan
+        ));
+        checks.set(0);
+        assert!(receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 128
+            })
+            .unwrap());
+        let compacted = receiver.snapshot(&|| false).unwrap();
+        assert!(compacted.scan.has_partial_update_from(&after.scan));
+        assert!(compacted.scan.folder_index(Path::new("b-remove")).is_err());
+        assert_eq!(compacted.scan.folders[0].folder_count, 3);
+        assert_eq!(compacted.scan.folders[0].logical_bytes, 516);
+        let ancestor = compacted.scan.folder_index(Path::new("aaa")).unwrap();
+        let child = compacted.scan.folder_index(Path::new("aaa/child")).unwrap();
+        assert!(ancestor < child);
+        assert_eq!(compacted.scan.folders[child].parent, Some(ancestor));
+        assert_eq!(
+            compacted.scan.files[compacted.scan.file_children[child][0]].parent,
+            child
+        );
+        let updated =
+            crate::search::refresh_matches(&after.scan, &compacted.scan, &query, result, || false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            updated.items,
+            crate::search::search(&compacted.scan, &query, || false)
+                .unwrap()
+                .items
+        );
     }
 
     #[test]

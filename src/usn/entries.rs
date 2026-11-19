@@ -110,6 +110,7 @@ impl Projection {
         &self,
         removed: impl Iterator<Item = (usize, &'a Path)>,
         added: impl Iterator<Item = (&'a Path, u64)>,
+        appended_folders: impl Iterator<Item = (&'a Path, u64)>,
     ) -> Option<(Self, RowRemap)> {
         if self.paths.depth() >= 8 || self.items.depth() >= 8 {
             return None;
@@ -138,6 +139,17 @@ impl Projection {
             files.push(key);
             paths.insert(Arc::from(path), Some(key));
         }
+        let folders: Arc<[u64]> = if appended_folders.size_hint().1 == Some(0) {
+            Arc::clone(&self.folders)
+        } else {
+            let mut folders = self.folders.to_vec();
+            for (path, key) in appended_folders {
+                items.insert(key, Some(Item::Folder(folders.len())));
+                folders.push(key);
+                paths.insert(Arc::from(path), Some(key));
+            }
+            folders.into()
+        };
         Some((
             Self {
                 scope: self.scope,
@@ -146,7 +158,7 @@ impl Projection {
                     depth: self.paths.depth() + 1,
                     paths,
                 }),
-                folders: Arc::clone(&self.folders),
+                folders,
                 files,
                 items: Arc::new(ItemIndex::Changed {
                     parent: Arc::clone(&self.items),
@@ -156,6 +168,26 @@ impl Projection {
             },
             RowRemap::with_changes(self.files.len(), old_rows),
         ))
+    }
+
+    pub(super) fn compact_folders(&mut self, removed: &[(usize, &Path)], moves: &[(usize, usize)]) {
+        let Some(ItemIndex::Changed { items, .. }) = Arc::get_mut(&mut self.items) else {
+            unreachable!("현재 묶음의 항목 변경표");
+        };
+        let Some(PathIndex::Changes { paths, .. }) = Arc::get_mut(&mut self.paths) else {
+            unreachable!("현재 묶음의 경로 변경표");
+        };
+        let mut keys = self.folders.to_vec();
+        for &(row, path) in removed {
+            items.insert(keys[row], None);
+            paths.insert(Arc::from(path), None);
+        }
+        for &(from, to) in moves {
+            keys[to] = keys[from];
+            items.insert(keys[to], Some(Item::Folder(to)));
+        }
+        keys.truncate(keys.len() - removed.len());
+        self.folders = keys.into();
     }
     pub fn path_key(&self, relative: &Path) -> Option<Key> {
         let number = self.paths.get(relative)?;

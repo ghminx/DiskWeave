@@ -1,4 +1,4 @@
-use super::{stream, Index, Node, Unavailable};
+use super::{stream, Excluded, Index, Node, Unavailable};
 use crate::{
     explorer::Item,
     metadata::Allocation,
@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     io,
     ops::{Deref, DerefMut},
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -320,6 +321,9 @@ impl<'a> Edit<'a> {
                 self.index.checkpoint.unavailable = unavailable;
             }
             self.index.scan = patched.map(|patch| {
+                if let Some(excluded) = patch.excluded {
+                    self.index.checkpoint.excluded = excluded;
+                }
                 if let Some((projection, ids, folders)) = patch.rows {
                     self.index.projection = Some(Arc::new(projection));
                     self.index.checkpoint.files = ids;
@@ -360,6 +364,7 @@ impl Drop for Edit<'_> {
 struct ScanPatch {
     scan: ScanResult,
     rows: Option<(super::entries::Projection, Vec<u64>, Option<Vec<u64>>)>,
+    excluded: Option<Vec<Excluded>>,
 }
 
 fn patch_scan(
@@ -368,47 +373,99 @@ fn patch_scan(
     structural: bool,
     cancelled: &impl Fn() -> bool,
 ) -> io::Result<Option<ScanPatch>> {
+    const MAX_PATCH_CHANGES: usize = 4096;
     let (Some(previous), Some(projection)) = (&index.scan, &index.projection) else {
         return Ok(None);
     };
-    let find = |path: &Path| {
+    let find_existing = |path: &Path| {
         projection
             .path_key(path)
             .and_then(|key| projection.item(key))
     };
+    let mut appended = Vec::new();
+    for change in changes {
+        crate::output::check(cancelled)?;
+        let Change::Node {
+            path,
+            value: Some(node),
+            ..
+        } = change
+        else {
+            continue;
+        };
+        if node.directory_id().is_some() && index.nodes.original(path).is_none_or(Node::excluded) {
+            let key = index.nodes.key_number(path).expect("추가한 폴더의 고정 ID");
+            appended.push((path.as_path(), node, key));
+        }
+    }
+    if !appended.is_empty() && changes.len() > MAX_PATCH_CHANGES {
+        return patch_tree(index, previous, projection, changes, cancelled);
+    }
+    appended.sort_unstable_by(|a, b| {
+        a.0.components()
+            .count()
+            .cmp(&b.0.components().count())
+            .then_with(|| a.0.cmp(b.0))
+    });
+    let appended_rows: std::collections::HashMap<_, _> = appended
+        .iter()
+        .enumerate()
+        .map(|(offset, &(path, _, _))| (path, previous.folders.len() + offset))
+        .collect();
+    let find = |path: &Path| {
+        appended_rows
+            .get(path)
+            .copied()
+            .map(Item::Folder)
+            .or_else(|| find_existing(path))
+    };
     let mut edits = Vec::with_capacity(changes.len());
     let mut changed_paths = HashSet::new();
+    let mut access_changes = Vec::new();
+    let mut excluded_changes = BTreeMap::new();
+    let mut removed_folders = Vec::new();
     for change in changes {
         crate::output::check(cancelled)?;
         let (path, value) = match change {
             Change::Node { path, value, .. } => (path, value),
             Change::Unavailable { path, value, .. } => {
-                if index
-                    .unavailable
-                    .original(path)
-                    .zip(value.as_ref())
-                    .is_some_and(|(old, new)| old.same_status(new))
-                {
-                    continue;
+                let old = index.unavailable.original(path);
+                let new = value.as_ref();
+                if !old.zip(new).is_some_and(|(old, new)| old.same_status(new)) {
+                    access_changes.push(path.as_path());
                 }
-                return Ok(None);
+                continue;
             }
         };
         let relative = path.as_path();
         let old = index.nodes.original(relative);
         let new = value.as_ref();
+        if old.into_iter().chain(new).any(Node::excluded) {
+            excluded_changes.insert(relative, new.filter(|node| node.excluded()));
+        }
+        if appended_rows.contains_key(relative) {
+            continue;
+        }
+        let old = old.filter(|node| !node.excluded());
+        let new = new.filter(|node| !node.excluded());
+        if old.is_none() && new.is_none() {
+            continue;
+        }
         if old.and_then(|n| n.issue.as_ref()) != new.and_then(|n| n.issue.as_ref()) {
             return Ok(None);
         }
-        if old.into_iter().chain(new).any(|n| n.dir() || n.excluded()) {
+        if old.into_iter().chain(new).any(Node::dir) {
+            if let (Some(Item::Folder(row)), Some(_), None) = (find(relative), old, new) {
+                if row != 0 {
+                    removed_folders.push((row, relative));
+                    continue;
+                }
+            }
             if !old
                 .zip(new)
                 .is_some_and(|(a, b)| a.id == b.id && a.attributes & 0x410 == b.attributes & 0x410)
             {
                 return patch_tree(index, previous, projection, changes, cancelled);
-            }
-            if old.is_some_and(super::Node::excluded) {
-                continue;
             }
             let Some(Item::Folder(row)) = find(relative) else {
                 return Ok(None);
@@ -425,11 +482,18 @@ fn patch_scan(
             edits.push((relative, item, parent, old, new));
         }
     }
+    let folder_rows_changed = !appended.is_empty() || !removed_folders.is_empty();
+    let structural = folder_rows_changed
+        || structural
+            && edits.iter().any(|(_, item, _, old, new)| {
+                !matches!(item, Some(Item::Folder(_)))
+                    && old.map(|node| node.id) != new.map(|node| node.id)
+            });
 
     // 작은 일반 파일 묶음은 무관한 파일 행을 순회하지 않고 바뀐 행만 교체.
     let mut removed = Vec::new();
     let mut added = Vec::new();
-    let local_change = if structural && changes.len() <= 256 {
+    let local_change = if structural && changes.len() <= MAX_PATCH_CHANGES {
         for &(path, item, parent, old, new) in &edits {
             if matches!(item, Some(Item::Folder(_))) || old.map(|n| n.id) == new.map(|n| n.id) {
                 continue;
@@ -446,15 +510,54 @@ fn patch_scan(
         projection.change_files(
             removed.iter().copied(),
             added.iter().map(|&(path, _, _, key)| (path, key)),
+            appended.iter().map(|&(path, _, key)| (path, key)),
         )
     } else {
         None
     };
+    if folder_rows_changed && local_change.is_none() {
+        return patch_tree(index, previous, projection, changes, cancelled);
+    }
 
     let mut result = previous.copy_for_update(!structural || local_change.is_some());
     let mut affected = HashSet::new();
     let mut file_parents = HashSet::new();
     let mut folder_parents = HashSet::new();
+    let mut folder_ids = folder_rows_changed.then(|| index.checkpoint.folders.clone());
+    for (path, node, _) in appended {
+        crate::output::check(cancelled)?;
+        let Some(Item::Folder(parent)) = path.parent().and_then(find) else {
+            return Ok(None);
+        };
+        let row = result.folders.len();
+        if parent >= row {
+            return Ok(None);
+        }
+        folder_ids.as_mut().unwrap().push(node.id);
+        result.folders.push(crate::scanner::Folder {
+            access: Default::default(),
+            path: index.root.join(path),
+            parent: Some(parent),
+            logical_bytes: 0,
+            allocation: Allocation::default(),
+            file_count: 0,
+            folder_count: 0,
+            created: node.created,
+            modified: node.modified,
+            attributes: node.attributes,
+        });
+        result.children.push(Arc::default());
+        result.file_children.push(Arc::default());
+        Arc::make_mut(&mut result.children[parent]).push(row);
+        folder_parents.insert(parent);
+        mark_ancestors(&result, &mut affected, row);
+        let mut ancestor = Some(parent);
+        while let Some(id) = ancestor {
+            let folder = &mut result.folders[id];
+            folder.folder_count += 1;
+            ancestor = folder.parent;
+        }
+    }
     // 감소를 먼저 반영하여 같은 배치의 증가분으로 인한 중간 합계 초과 방지.
     for add in [false, true] {
         for &(_, item, parent, old, new) in &edits {
@@ -514,7 +617,7 @@ fn patch_scan(
 
     let mut file_rows = None;
     let used_local_change = local_change.is_some();
-    let rows = if let Some((next, remap)) = local_change {
+    let mut rows = if let Some((next, remap)) = local_change {
         let mut ids = index.checkpoint.files.clone();
         for (removed, _) in removed {
             crate::output::check(cancelled)?;
@@ -552,7 +655,7 @@ fn patch_scan(
             }
         }
         file_rows = Some(remap);
-        Some((next, ids, None))
+        Some((next, ids, folder_ids))
     } else if structural {
         let mut files = RowProjection::new(&previous.files, |(path, parent, node)| {
             file_entry(path, parent, node)
@@ -623,15 +726,70 @@ fn patch_scan(
                 .then_with(|| result.folders[a].path.cmp(&result.folders[b].path))
         });
     }
-    let search_folders = (changes.len() <= 256).then(|| {
+    if !access_changes.is_empty()
+        && !update_access(
+            index,
+            &mut result,
+            &mut affected,
+            &access_changes,
+            find,
+            cancelled,
+        )?
+    {
+        return Ok(None);
+    }
+    let mut search_before = (changes.len() <= 256).then(|| {
         affected
             .iter()
             .copied()
             .map(Item::Folder)
             .collect::<Vec<_>>()
     });
+    let mut search_after = search_before.clone();
+    let mut folder_rows = None;
+    if !removed_folders.is_empty() {
+        removed_folders.sort_unstable_by_key(|&(row, _)| std::cmp::Reverse(row));
+        let Some((next, _, Some(ids))) = rows.as_mut() else {
+            unreachable!("폴더 행과 기준점 필요");
+        };
+        let Some((positions, moves)) = compact_folder_rows(
+            &mut result,
+            ids,
+            &removed_folders,
+            &index.root,
+            find,
+            &mut affected,
+            cancelled,
+        )?
+        else {
+            return patch_tree(index, previous, projection, changes, cancelled);
+        };
+        next.compact_folders(&removed_folders, &moves);
+        if let Some(items) = search_after.as_mut() {
+            items.retain_mut(|item| {
+                let Item::Folder(old) = *item else {
+                    unreachable!()
+                };
+                let Some(row) = positions.get(&old).copied().unwrap_or(Some(old)) else {
+                    return false;
+                };
+                *item = Item::Folder(row);
+                true
+            });
+        }
+        folder_rows = Some(crate::scanner::RowRemap::with_changes(
+            previous.folders.len(),
+            positions
+                .into_iter()
+                .filter(|(old, _)| *old < previous.folders.len())
+                .collect(),
+        ));
+        if let Some(folders) = search_before.as_mut() {
+            folders.extend(removed_folders.iter().map(|(row, _)| Item::Folder(*row)));
+        }
+    }
     if !used_local_change {
-        if let (Some(_), Some((next, _, _))) = (&search_folders, &rows) {
+        if let (Some(_), Some((next, _, _))) = (&search_before, &rows) {
             file_rows = Some(remap_rows(
                 previous.files.len(),
                 Item::File,
@@ -641,8 +799,9 @@ fn patch_scan(
             )?);
         }
     }
-    let search = search_folders.map(|mut before| {
-        let mut after = before.clone();
+    let search = search_before.map(|mut before| {
+        let mut after = search_after.unwrap();
+        before.retain(|item| !matches!(item, Item::Folder(row) if *row >= previous.folders.len()));
         before.extend(edits.iter().filter_map(|(_, item, _, old, _)| {
             old.and(item.filter(|item| matches!(item, Item::File(_))))
         }));
@@ -655,7 +814,7 @@ fn patch_scan(
             before,
             after,
             file_rows,
-            folder_rows: None,
+            folder_rows,
         }
     });
     result.partial = Some(Arc::new(PartialUpdate {
@@ -663,7 +822,200 @@ fn patch_scan(
         affected,
         search,
     }));
-    Ok(Some(ScanPatch { scan: result, rows }))
+    let excluded = if excluded_changes.is_empty() {
+        None
+    } else {
+        let updated = update_excluded(&index.checkpoint.excluded, excluded_changes, cancelled)?;
+        result.skipped_reparse_points = updated.len() as u64;
+        Some(updated)
+    };
+    Ok(Some(ScanPatch {
+        scan: result,
+        rows,
+        excluded,
+    }))
+}
+
+type FolderPositions = BTreeMap<usize, Option<usize>>;
+type FolderMoves = Vec<(usize, usize)>;
+
+fn compact_folder_rows(
+    scan: &mut ScanResult,
+    ids: &mut Vec<u64>,
+    removed: &[(usize, &Path)],
+    root: &Path,
+    find: impl Fn(&Path) -> Option<Item>,
+    affected: &mut HashSet<usize>,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Option<(FolderPositions, FolderMoves)>> {
+    let mut positions = BTreeMap::new();
+    let mut moves = Vec::new();
+    let mut relocated = HashSet::new();
+    for &(removed, _) in removed {
+        crate::output::check(cancelled)?;
+        if !scan.children[removed].is_empty() || !scan.file_children[removed].is_empty() {
+            return Ok(None);
+        }
+        positions.insert(removed, None);
+        let parent = scan.folders[removed].parent.unwrap();
+        Arc::make_mut(&mut scan.children[parent]).retain(|&row| row != removed);
+        mark_ancestors(scan, affected, parent);
+        let mut ancestor = Some(parent);
+        while let Some(row) = ancestor {
+            let folder = &mut scan.folders[row];
+            folder.folder_count -= 1;
+            ancestor = folder.parent;
+        }
+
+        let last = scan.folders.len() - 1;
+        let mut empty = removed;
+        while empty < last {
+            crate::output::check(cancelled)?;
+            let mut from = last;
+            // 부모가 빈 행보다 앞서는 후보를 찾아 부모 우선 순서 유지.
+            while let Some(parent) = scan.folders[from].parent {
+                if parent < empty {
+                    break;
+                }
+                from = parent;
+            }
+            if from <= empty {
+                return Ok(None);
+            }
+            let folder = scan.folders[from].clone();
+            let path = folder.path.strip_prefix(root).expect("추적 범위 폴더");
+            let Some(Item::Folder(original)) = find(path) else {
+                return Ok(None);
+            };
+            positions.insert(original, Some(empty));
+            relocated.insert(original);
+            moves.push((from, empty));
+            let parent = folder.parent.unwrap();
+            let siblings = Arc::make_mut(&mut scan.children[parent]);
+            *siblings
+                .iter_mut()
+                .find(|row| **row == from)
+                .expect("이동하는 폴더 행") = empty;
+            scan.folders[empty] = folder;
+            scan.children[empty] = Arc::clone(&scan.children[from]);
+            scan.file_children[empty] = Arc::clone(&scan.file_children[from]);
+            ids[empty] = ids[from];
+            for &child in scan.children[empty].iter() {
+                crate::output::check(cancelled)?;
+                scan.folders[child].parent = Some(empty);
+            }
+            for &file in scan.file_children[empty].iter() {
+                crate::output::check(cancelled)?;
+                scan.files[file].parent = empty;
+            }
+            empty = from;
+        }
+        scan.folders.swap_remove(last);
+        scan.children.pop();
+        scan.file_children.pop();
+        ids.pop();
+    }
+    *affected = std::mem::take(affected)
+        .into_iter()
+        .filter_map(|old| positions.get(&old).copied().unwrap_or(Some(old)))
+        .collect();
+    for original in relocated {
+        if let Some(Some(row)) = positions.get(&original) {
+            mark_ancestors(scan, affected, *row);
+            affected.extend(scan.children[*row].iter().copied());
+        }
+    }
+    Ok(Some((positions, moves)))
+}
+
+fn update_excluded(
+    previous: &[Excluded],
+    changes: BTreeMap<&Path, Option<&Node>>,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Vec<Excluded>> {
+    let mut entries = BTreeMap::new();
+    for entry in previous {
+        crate::output::check(cancelled)?;
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&entry.path));
+        if !changes.contains_key(path.as_path()) {
+            entries.insert(path, entry.clone());
+        }
+    }
+    for (path, node) in changes {
+        crate::output::check(cancelled)?;
+        if let Some(node) = node {
+            entries.insert(
+                path.to_path_buf(),
+                Excluded {
+                    path: path.as_os_str().encode_wide().collect(),
+                    id: node.id,
+                    attributes: node.attributes,
+                },
+            );
+        }
+    }
+    Ok(entries.into_values().collect())
+}
+
+fn update_access(
+    index: &Index,
+    scan: &mut ScanResult,
+    affected: &mut HashSet<usize>,
+    paths: &[&Path],
+    find: impl Fn(&Path) -> Option<Item>,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<bool> {
+    use crate::scanner::{FolderAccess, ScanIssue};
+    let mut access = std::collections::HashMap::new();
+    scan.error_count = index.unavailable.len() as u64;
+    scan.issues.clear();
+    for (path, issue) in &index.unavailable {
+        crate::output::check(cancelled)?;
+        let Some(Item::Folder(parent)) = path.parent().and_then(&find) else {
+            return Ok(false);
+        };
+        let mut row = Some(parent);
+        while let Some(id) = row {
+            access.entry(id).or_insert(FolderAccess::Partial);
+            row = scan.folders[id].parent;
+        }
+        if issue.listing {
+            let Some(Item::Folder(row)) = find(path) else {
+                return Ok(false);
+            };
+            access.insert(
+                row,
+                if issue.reason == super::UnavailableReason::Os(5) {
+                    FolderAccess::Denied
+                } else {
+                    FolderAccess::Unavailable
+                },
+            );
+        }
+        if scan.issues.len() < 20 {
+            scan.issues.push(ScanIssue {
+                path: index.root.join(path),
+                error: issue.reason.error(),
+            });
+        }
+    }
+    for path in paths {
+        crate::output::check(cancelled)?;
+        let Some(Item::Folder(parent)) = path.parent().and_then(&find) else {
+            return Ok(false);
+        };
+        let mut row = match find(path) {
+            Some(Item::Folder(row)) => Some(row),
+            _ => Some(parent),
+        };
+        while let Some(id) = row {
+            let folder = &mut scan.folders[id];
+            folder.access = access.get(&id).copied().unwrap_or_default();
+            row = folder.parent;
+            affected.insert(id);
+        }
+    }
+    Ok(true)
 }
 
 fn mark_ancestors(scan: &ScanResult, affected: &mut HashSet<usize>, mut folder: usize) {
@@ -860,6 +1212,7 @@ fn patch_tree(
     Ok(Some(ScanPatch {
         scan,
         rows: Some((next, file_ids, Some(folder_ids))),
+        excluded: None,
     }))
 }
 

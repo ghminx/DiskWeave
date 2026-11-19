@@ -364,7 +364,7 @@ struct RefreshPlan {
     now: SystemTime,
 }
 impl Checkpoint {
-    pub fn validate(&self, scan: &ScanResult) -> io::Result<()> {
+    fn validate_shape(&self, scan: &ScanResult) -> io::Result<()> {
         if !matches!(self.version, 1 | 3 | 4)
             || self.version == 1 && !self.unavailable.is_empty()
             || self.version != 4
@@ -379,8 +379,14 @@ impl Checkpoint {
             || self.folders.len() != scan.folders.len()
             || self.files.len() != scan.files.len()
             || self.folders.first() != Some(&self.root)
-            || self.folders.iter().chain(&self.files).any(|id| *id == 0)
         {
+            return Err(invalid("변경 추적 기준점과 분석 결과가 일치하지 않습니다"));
+        }
+        Ok(())
+    }
+    pub fn validate(&self, scan: &ScanResult) -> io::Result<()> {
+        self.validate_shape(scan)?;
+        if self.folders.iter().chain(&self.files).any(|id| *id == 0) {
             return Err(invalid("변경 추적 기준점과 분석 결과가 일치하지 않습니다"));
         }
         let mut dirs = HashSet::new();
@@ -2815,7 +2821,7 @@ mod tests {
             before.entries.as_ref().unwrap(),
             added.entries.as_ref().unwrap(),
         );
-        assert_ne!(folder, next.folder());
+        assert_eq!(folder, next.folder());
         assert_eq!(
             added.scan.folders[next.folder()].path,
             scope.join("folder/deep")
