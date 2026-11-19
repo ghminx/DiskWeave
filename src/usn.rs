@@ -172,6 +172,15 @@ impl Unavailable {
     pub fn relative(&self) -> PathBuf {
         std::ffi::OsString::from_wide(&self.path).into()
     }
+
+    fn same_status(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.parent == other.parent
+            && self.previous_id == other.previous_id
+            && self.directory == other.directory
+            && self.reason == other.reason
+            && self.listing == other.listing
+    }
 }
 fn unavailable_reason(error: &io::Error) -> Option<UnavailableReason> {
     match error.raw_os_error() {
@@ -242,18 +251,26 @@ pub struct Checkpoint {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn conflicting_directories(nodes: &entries::Entries) -> Vec<(u64, PathBuf, PathBuf)> {
-    let mut by_id = HashMap::new();
+fn conflicting_directories(
+    nodes: &entries::Entries,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Vec<(u64, PathBuf, PathBuf)>> {
     let mut conflicts = Vec::new();
-    for (path, node) in nodes
-        .iter()
-        .filter(|(_, node)| node.dir() && !node.excluded())
-    {
-        if let Some(previous) = by_id.insert(node.id, path) {
-            conflicts.push((node.id, previous.clone(), path.clone()));
+    for (id, aliases) in nodes.shared_ids() {
+        crate::output::check(cancelled)?;
+        let mut previous = None;
+        for path in aliases {
+            crate::output::check(cancelled)?;
+            let path = path.as_ref();
+            let node = &nodes[path];
+            if node.dir() && !node.excluded() {
+                if let Some(before) = previous.replace(path) {
+                    conflicts.push((id, before.to_owned(), path.to_owned()));
+                }
+            }
         }
     }
-    conflicts
+    Ok(conflicts)
 }
 fn recheck_directory_parent(
     path: &Path,
@@ -519,6 +536,7 @@ impl Index {
             confirmed_after: None,
         };
         let mut nodes = entries::Entries::new();
+        nodes.enable_id_lookup();
         nodes.insert(PathBuf::new(), first)?;
         let mut unavailable = edit::Issues::new();
         Self::collect(
@@ -670,6 +688,7 @@ impl Index {
             .map(|issue| (issue.path.as_path(), issue.error.to_string()))
             .collect();
         let mut nodes = entries::Entries::new();
+        nodes.enable_id_lookup();
         for (i, f) in record.scan.folders.iter().enumerate() {
             nodes.insert(
                 f.path
@@ -819,36 +838,19 @@ impl Index {
             return Ok(false);
         }
         let lookup_cost = cost::measure(cost::Stage::ReverseLookup);
-        // 폴더 ID 충돌 검사는 범위 전체에 유지하고 파일 경로는 필요한 ID만 모음.
-        let mut needed: HashSet<_> = self
-            .nodes
-            .values()
-            .filter(|node| node.dir() && !node.excluded())
-            .map(|node| node.id)
-            .collect();
-        needed.extend(events.iter().flat_map(|event| [event.id, event.parent]));
-        needed.extend(self.checkpoint.pending.iter().copied());
-        let mut by_id: HashMap<u64, Vec<&PathBuf>> = HashMap::new();
         let mut directories = HashSet::new();
-        for (path, n) in &self.nodes {
-            crate::output::check(cancelled)?;
-            if !needed.contains(&n.id) {
-                continue;
+        for (_, before, after) in conflicting_directories(&self.nodes, cancelled)? {
+            for path in [before, after] {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| invalid("추적 루트와 중복된 폴더 ID"))?;
+                directories.insert(parent.to_owned());
             }
-            let paths = by_id.entry(n.id).or_default();
-            if n.dir() && !n.excluded() && !paths.is_empty() {
-                for &p in paths.iter().chain(std::iter::once(&path)) {
-                    let parent = p
-                        .parent()
-                        .ok_or_else(|| invalid("추적 루트와 중복된 폴더 ID"))?;
-                    directories.insert(parent.to_owned());
-                }
-            }
-            paths.push(path);
         }
         let mut files = HashSet::new();
         let mut pending: HashSet<_> = self.checkpoint.pending.iter().copied().collect();
         for e in &events {
+            crate::output::check(cancelled)?;
             if e.id == self.checkpoint.root && e.reason & 0x3200 != 0 {
                 return Err(invalid(
                     "추적 루트의 이름·위치가 변경되었습니다. 폴더를 다시 지정해 주세요",
@@ -863,26 +865,26 @@ impl Index {
                 pending.insert(e.id);
             }
             let structural = e.reason & 0x00373300 != 0;
-            if let Some(paths) = by_id.get(&e.id) {
-                for &p in paths {
-                    let n = &self.nodes[p];
-                    if p.as_os_str().is_empty() {
-                        continue;
-                    }
-                    if structural || n.dir() || n.excluded() {
-                        directories.insert(p.parent().unwrap_or(Path::new("")).to_owned());
-                    } else {
-                        files.insert(p.clone());
-                    }
+            let paths = self.nodes.paths_with_id(e.id);
+            for p in paths {
+                crate::output::check(cancelled)?;
+                let p = p.as_ref();
+                let n = &self.nodes[p];
+                if p.as_os_str().is_empty() {
+                    continue;
+                }
+                if structural || n.dir() || n.excluded() {
+                    directories.insert(p.parent().unwrap_or(Path::new("")).to_owned());
+                } else {
+                    files.insert(p.to_owned());
                 }
             }
-            if let Some(paths) = by_id.get(&e.parent) {
-                for &p in paths {
-                    if self.nodes[p].dir()
-                        && !self.nodes[p].excluded()
-                        && (structural || !by_id.contains_key(&e.id))
-                    {
-                        directories.insert(p.clone());
+            if structural || paths.is_empty() {
+                for p in self.nodes.paths_with_id(e.parent) {
+                    crate::output::check(cancelled)?;
+                    let n = &self.nodes[p.as_ref()];
+                    if n.dir() && !n.excluded() {
+                        directories.insert(p.to_path_buf());
                     }
                 }
             }
@@ -895,11 +897,11 @@ impl Index {
             }
         }
         for id in &pending {
-            if let Some(paths) = by_id.get(id) {
-                for &p in paths {
-                    if !self.nodes[p].dir() {
-                        files.insert(p.clone());
-                    }
+            crate::output::check(cancelled)?;
+            for p in self.nodes.paths_with_id(*id) {
+                crate::output::check(cancelled)?;
+                if !self.nodes[p.as_ref()].dir() {
+                    files.insert(p.to_path_buf());
                 }
             }
         }
@@ -920,21 +922,19 @@ impl Index {
         let final_journal = source.journal()?;
         edit.verify_at(&final_journal, journal.next)?;
         crate::output::check(cancelled)?;
-        let mut pending: Vec<_> = if pending.is_empty() {
-            Vec::new()
-        } else {
-            let mut found = HashSet::new();
-            for n in edit.nodes.values() {
+        let mut open_files = Vec::new();
+        for id in pending {
+            crate::output::check(cancelled)?;
+            for path in edit.nodes.paths_with_id(id) {
                 crate::output::check(cancelled)?;
-                if !n.dir() && !n.excluded() && pending.contains(&n.id) {
-                    found.insert(n.id);
-                    if found.len() == pending.len() {
-                        break;
-                    }
+                let node = &edit.nodes[path.as_ref()];
+                if !node.dir() && !node.excluded() {
+                    open_files.push(id);
+                    break;
                 }
             }
-            found.into_iter().collect()
-        };
+        }
+        let mut pending = open_files;
         pending.sort_unstable();
         let changed = edit.commit(cancelled, true)?;
         self.checkpoint.next = journal.next;
@@ -1183,9 +1183,9 @@ impl Index {
                 }
                 let removed: Vec<_> = next
                     .subtree_keys(&directory)
-                    .chain(unavailable.subtree_keys(&directory))
+                    .chain(unavailable.subtree_keys(&directory).map(PathBuf::as_path))
                     .filter(|p| p.parent() == Some(directory.as_path()) && !seen.contains(*p))
-                    .cloned()
+                    .map(Path::to_owned)
                     .collect();
                 for p in removed {
                     next.remove_subtree(&p, false, cancelled)?;
@@ -1239,7 +1239,7 @@ impl Index {
             }
             if check_directories {
                 // USN 확인 이후 이동한 폴더는 양쪽 부모의 현재 이름으로 재연결.
-                let conflicts = conflicting_directories(next);
+                let conflicts = conflicting_directories(next, cancelled)?;
                 let mut this_round = HashSet::new();
                 for (id, before, after) in conflicts {
                     if repaired.contains(&id) {
@@ -1304,7 +1304,7 @@ impl Index {
                             .ok_or_else(|| invalid("부모 없는 추적 폴더"))?,
                     )
                 };
-                folders.insert(p.clone(), scan.folders.len());
+                folders.insert(p, scan.folders.len());
                 refs.push(n.id);
                 folder_keys.push(key);
                 scan.folders.push(Folder {
@@ -1372,7 +1372,7 @@ impl Index {
                 scan.folders[parent].access = crate::scanner::FolderAccess::Partial;
                 if e.listing {
                     let id = *folders
-                        .get(p)
+                        .get(p.as_path())
                         .ok_or_else(|| invalid("미수집 폴더 ID가 없습니다"))?;
                     scan.folders[id].access = if e.reason == UnavailableReason::Os(5) {
                         crate::scanner::FolderAccess::Denied
@@ -2830,6 +2830,48 @@ mod tests {
             .key(crate::explorer::Item::File(0))
             .is_some());
     }
+    #[test]
+    fn updating_linked_file_looks_up_only_relevant_paths() {
+        let mut source = Fixture::new();
+        let root = source.root.clone();
+        let branch = root.join("branch");
+        fs::create_dir(&branch).unwrap();
+        let first = root.join("probe");
+        let alias = branch.join("alias");
+        fs::write(&first, b"old").unwrap();
+        fs::hard_link(&first, &alias).unwrap();
+        for i in 0..128 {
+            fs::write(branch.join(format!("unrelated-{i}")), []).unwrap();
+        }
+        let mut index = Index::begin(&root, false, &mut source, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        let parent = source.id(&root);
+        let id = source.id(&first);
+        fs::write(&first, b"changed").unwrap();
+        source.event(id, parent, 1);
+        let attempts = std::cell::Cell::new(0);
+        assert!(index
+            .refresh(&mut source, &|| {
+                attempts.set(attempts.get() + 1);
+                attempts.get() > 48
+            })
+            .unwrap());
+        let after = index.snapshot(&|| false).unwrap();
+        assert_eq!(before.scan.folders[0].logical_bytes, 6);
+        assert_eq!(after.scan.folders[0].logical_bytes, 14);
+        assert_eq!(after.tracking.as_ref().unwrap().pending, vec![id]);
+        assert_eq!(after.scan.files.len(), 130);
+        assert_eq!(
+            after
+                .scan
+                .files
+                .iter()
+                .filter(|f| f.logical_bytes == 7)
+                .count(),
+            2
+        );
+    }
+
     #[test]
     fn hard_link_paths_have_distinct_keys_and_removed_or_replaced_entries_get_new_keys() {
         let mut f = Fixture::new();

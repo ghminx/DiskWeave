@@ -623,7 +623,11 @@ impl Receiver {
                             }
                         }
                         Change::Unavailable { present, value, .. } => {
-                            local_validation = false;
+                            local_validation &= candidate
+                                .unavailable
+                                .get(&p)
+                                .zip(value.as_ref())
+                                .is_some_and(|(old, new)| old.same_status(new));
                             if candidate.unavailable.contains_key(&p) != present
                                 || baseline && present
                             {
@@ -801,7 +805,9 @@ impl Receiver {
         })
     }
     pub fn into_index(self) -> io::Result<Index> {
-        self.index.ok_or_else(|| invalid("기준 목록 없음"))
+        let mut index = self.index.ok_or_else(|| invalid("기준 목록 없음"))?;
+        index.nodes.enable_id_lookup();
+        Ok(index)
     }
 }
 fn validate(
@@ -1307,6 +1313,230 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mixed_file_changes_do_not_rebuild_unrelated_rows() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        for name in ["a-remove", "m-keep", "z-tail"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let removed = root.join("a-remove/probe");
+        std::fs::write(&removed, b"abc").unwrap();
+        std::fs::write(root.join("z-tail/tail"), b"12345").unwrap();
+        for i in 0..520 {
+            std::fs::write(root.join(format!("m-keep/{i:04}")), []).unwrap();
+        }
+        let saved = record(root);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: None,
+            events: vec![],
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: state.journal,
+                first: 0,
+                lowest: 0,
+                next: state.next,
+            },
+        };
+        let mut index = Index::begin(root, true, &mut source, &|| false).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = vec![];
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        let previous = receiver.snapshot(&|| false).unwrap();
+        let old_projection = previous.entries.as_ref().unwrap();
+        let keep = old_projection.path_key(Path::new("m-keep/0300")).unwrap();
+        let tail = old_projection.path_key(Path::new("z-tail/tail")).unwrap();
+        let parent = state.folders[saved.scan.folder_index(Path::new("a-remove")).unwrap()];
+        event(&mut source, &removed, parent, 0x80000200);
+        std::fs::remove_file(removed).unwrap();
+        let updated = root.join("m-keep/0000");
+        let updated_parent = state.folders[saved.scan.folder_index(Path::new("m-keep")).unwrap()];
+        std::fs::write(&updated, b"x").unwrap();
+        event(&mut source, &updated, updated_parent, 0x80000001);
+        let next_removed = root.join("m-keep/0519");
+        event(&mut source, &next_removed, updated_parent, 0x80000200);
+        std::fs::remove_file(next_removed).unwrap();
+        let inserted = root.join("a-remove/inserted");
+        std::fs::write(&inserted, b"ab").unwrap();
+        event(&mut source, &inserted, parent, 0x80000100);
+
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let checks = std::cell::Cell::new(0);
+        assert!(receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                false
+            })
+            .unwrap());
+        assert!(
+            checks.get() < 256,
+            "수신 취소 확인 {}회 / 송신 {:?} / 수신 {:?}",
+            checks.get(),
+            index.edit_stats(),
+            receiver.edit_stats()
+        );
+        let current = receiver.snapshot(&|| false).unwrap();
+        let entries = current.entries.as_ref().unwrap();
+        assert_eq!(entries.item(keep), old_projection.item(keep));
+        assert_eq!(entries.path_key(Path::new("z-tail/tail")), Some(tail));
+        assert!(entries.path_key(Path::new("a-remove/probe")).is_none());
+        assert!(entries.path_key(Path::new("m-keep/0519")).is_none());
+        assert!(entries.path_key(Path::new("a-remove/inserted")).is_some());
+        assert_eq!(current.scan.folders[0].logical_bytes, 8);
+        assert_eq!(current.scan.files.len(), 521);
+        let query = crate::search::SearchInput {
+            text: "tail".into(),
+            ..Default::default()
+        }
+        .compile(0)
+        .unwrap();
+        let old_results = crate::search::search(&previous.scan, &query, || false).unwrap();
+        let new_results = crate::search::refresh_matches(
+            &previous.scan,
+            &current.scan,
+            &query,
+            old_results,
+            || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            new_results.items,
+            crate::search::search(&current.scan, &query, || false)
+                .unwrap()
+                .items
+        );
+
+        let added = root.join("a-remove/new");
+        std::fs::write(&added, b"1234567").unwrap();
+        event(&mut source, &added, parent, 0x80000100);
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        checks.set(0);
+        assert!(receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 96
+            })
+            .unwrap());
+        let added_record = receiver.snapshot(&|| false).unwrap();
+        let added_entries = added_record.entries.as_ref().unwrap();
+        assert_eq!(added_entries.item(keep), entries.item(keep));
+        assert_eq!(added_entries.item(tail), entries.item(tail));
+        let new_key = added_entries.path_key(Path::new("a-remove/new")).unwrap();
+        let Some(crate::explorer::Item::File(row)) = added_entries.item(new_key) else {
+            panic!("새 파일 행 필요");
+        };
+        assert_eq!(added_record.scan.files[row].logical_bytes, 7);
+        assert_eq!(added_record.scan.folders[0].logical_bytes, 15);
+        let query = crate::search::SearchInput {
+            text: "new".into(),
+            ..Default::default()
+        }
+        .compile(0)
+        .unwrap();
+        let old_results = crate::search::search(&current.scan, &query, || false).unwrap();
+        assert!(old_results.items.is_empty());
+        let results = crate::search::refresh_matches(
+            &current.scan,
+            &added_record.scan,
+            &query,
+            old_results,
+            || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(results.items, vec![crate::explorer::Item::File(row)]);
+    }
+
+    #[test]
+    fn repeated_unavailable_check_does_not_rebuild_unrelated_files_when_a_file_is_deleted() {
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        for name in ["changes", "unrelated"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let deleted = root.join("changes/deleted");
+        let blocked = root.join("changes/blocked");
+        std::fs::write(&deleted, b"123").unwrap();
+        std::fs::write(&blocked, b"hidden").unwrap();
+        for row in 0..512 {
+            std::fs::write(root.join(format!("unrelated/{row:04}")), b"x").unwrap();
+        }
+        let saved = record(root);
+        let state = saved.tracking.as_ref().unwrap();
+        let mut source = Source {
+            clock: SystemTime::now(),
+            blocked: Some(blocked),
+            journal: crate::usn::Journal {
+                volume: state.volume.clone(),
+                id: state.journal,
+                first: 0,
+                lowest: 0,
+                next: state.next,
+            },
+            events: vec![],
+        };
+        let mut index = Index::begin(root, true, &mut source, &|| false).unwrap();
+        let mut sender = Sender::new(17, Default::default());
+        let mut receiver = Receiver::new(root.clone(), true, Default::default());
+        let mut wire = Vec::new();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        receiver.receive(&mut wire.as_slice(), &|| false).unwrap();
+        assert!(receiver.publication(true, &|| false).unwrap().is_some());
+        let before = receiver.snapshot(&|| false).unwrap();
+        let before_checkpoint = before.tracking.as_ref().unwrap();
+        assert_eq!(before_checkpoint.unavailable.len(), 1);
+        let parent =
+            before_checkpoint.folders[before.scan.folder_index(Path::new("changes")).unwrap()];
+
+        source.clock += Duration::from_secs(31);
+        event(&mut source, &deleted, parent, 0x80000200);
+        std::fs::remove_file(&deleted).unwrap();
+        index.refresh(&mut source, &|| false).unwrap();
+        wire.clear();
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let error = receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 7
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let kept = receiver.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&kept.scan, &before.scan));
+        assert_eq!(kept.tracking.as_ref(), Some(before_checkpoint));
+        checks.set(0);
+        assert!(receiver
+            .receive(&mut wire.as_slice(), &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 96
+            })
+            .unwrap());
+        let Some(published) = receiver.publication(true, &|| false).unwrap() else {
+            panic!("삭제와 재확인 시각을 포함한 결과 필요");
+        };
+        let super::super::WatchUpdate::Record(after) = published.into_update() else {
+            panic!("변경 목록 필요");
+        };
+        assert_eq!(after.scan.files.len(), 512);
+        assert_eq!(after.scan.folders[0].logical_bytes, 512);
+        assert_eq!(after.scan.error_count, 1);
+        assert_eq!(
+            after.tracking.as_ref().unwrap().unavailable[0].checked,
+            source.clock
+        );
+        assert_same(&index.snapshot(&|| false).unwrap(), &after);
+    }
+
+    #[test]
     fn structural_delta_budget_failure_rolls_back_deleted_paths_and_can_retry_the_same_revision() {
         let fixture = Fixture::new();
         for n in 0..20 {
@@ -1439,7 +1669,8 @@ pub(crate) mod tests {
             assert!(current.scan.has_partial_update_from(&previous.scan));
             assert_eq!(
                 current.scan.subtree_unchanged_from(&previous.scan, z),
-                stage == 1
+                current.scan.file_children[z] == previous.scan.file_children[z],
+                "다른 폴더의 행 주소가 실제로 바뀐 경우에만 다시 계산 (단계 {stage})"
             );
             let query = crate::search::SearchInput {
                 text: "file".into(),
@@ -1991,11 +2222,33 @@ pub(crate) mod tests {
         let mut b = Vec::new();
         crate::snapshot::write_to(expected, &mut a, || false).unwrap();
         crate::snapshot::write_to(actual, &mut b, || false).unwrap();
-        let a: serde_json::Value = serde_json::from_slice(&a).unwrap();
-        let b: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let mut a: serde_json::Value = serde_json::from_slice(&a).unwrap();
+        let mut b: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        // 내부 파일 행의 순서와 별개로 각 경로의 메타데이터와 기준점 ID 일치 확인.
+        let files_by_path = |scan: &mut serde_json::Value| {
+            let files = scan["files"].take();
+            let ids = scan["tracking"]["files"].take();
+            let files = files.as_array().unwrap();
+            let ids = ids.as_array().unwrap();
+            assert_eq!(files.len(), ids.len());
+            files
+                .iter()
+                .zip(ids)
+                .map(|(file, id)| {
+                    let parent = file["parent"].as_u64().unwrap();
+                    let name = serde_json::from_value::<Vec<u16>>(file["name"].clone()).unwrap();
+                    ((parent, name), (file.clone(), id.clone()))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let expected_files = files_by_path(&mut a);
+        let actual_files = files_by_path(&mut b);
+        assert_eq!(expected_files.len(), actual_files.len());
+        for (path, file) in &expected_files {
+            assert_eq!(Some(file), actual_files.get(path), "{path:?}");
+        }
         for field in [
             "folders",
-            "files",
             "tracking",
             "error_count",
             "metadata_error_count",

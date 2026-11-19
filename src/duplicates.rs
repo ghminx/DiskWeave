@@ -226,29 +226,13 @@ pub fn inspect(
     }
     let mut sizes: BTreeMap<u64, Vec<Member>> = BTreeMap::new();
     for (source, snapshot) in report.sources.iter().enumerate() {
-        if let Scope::Folder { location, .. } = scope {
-            if snapshot.id != location {
-                continue;
-            }
-        }
-        for (file, entry) in snapshot.scan.files.iter().enumerate() {
+        let mut collect = |file: usize| -> io::Result<()> {
             crate::output::check(cancelled)?;
-            if let Scope::Folder { folder, .. } = scope {
-                let mut parent = Some(entry.parent);
-                while let Some(id) = parent {
-                    if id == folder {
-                        break;
-                    }
-                    parent = snapshot.scan.folders[id].parent;
-                }
-                if parent.is_none() {
-                    continue;
-                }
-            }
+            let entry = &snapshot.scan.files[file];
             report.progress.files += 1;
             if entry.logical_bytes == 0 {
                 report.empty += 1;
-                continue;
+                return Ok(());
             }
             let path = snapshot.scan.folders[entry.parent].path.join(&entry.name);
             if entry.attributes & REMOTE_CONTENT != 0 {
@@ -256,21 +240,21 @@ pub fn inspect(
                     path,
                     reason: "로컬에 없는 파일 내용은 검사하지 않음".into(),
                 });
-                continue;
+                return Ok(());
             }
             let Some(id) = entry.extra.identity.value() else {
                 report.issues.push(Issue {
                     path,
                     reason: "파일 ID 미확인".into(),
                 });
-                continue;
+                return Ok(());
             };
             let Some(modified) = entry.modified else {
                 report.issues.push(Issue {
                     path,
                     reason: "수정 시각 미확인".into(),
                 });
-                continue;
+                return Ok(());
             };
 
             sizes.entry(entry.logical_bytes).or_default().push(Member {
@@ -284,6 +268,25 @@ pub fn inspect(
                     modified,
                 },
             });
+            Ok(())
+        };
+        match scope {
+            Scope::Folder { location, folder } if snapshot.id == location => {
+                let mut pending = vec![folder];
+                while let Some(folder) = pending.pop() {
+                    crate::output::check(cancelled)?;
+                    for &file in snapshot.scan.file_children[folder].iter() {
+                        collect(file)?;
+                    }
+                    pending.extend(snapshot.scan.children[folder].iter().copied());
+                }
+            }
+            Scope::Folder { .. } => {}
+            Scope::All => {
+                for file in 0..snapshot.scan.files.len() {
+                    collect(file)?;
+                }
+            }
         }
     }
     let mut buffer = vec![0; 1024 * 1024];
@@ -503,21 +506,29 @@ pub(crate) mod tests {
         fs::write(fixture.0.join("inside/a"), b"same").unwrap();
         fs::write(fixture.0.join("inside/deep/b"), b"same").unwrap();
         fs::write(fixture.0.join("outside"), b"same").unwrap();
+        for i in 0..512 {
+            fs::write(fixture.0.join(format!("outside-{i:04}")), b"same").unwrap();
+        }
         let snapshot = fixture.snapshot();
         let folder = snapshot
             .scan
             .folder_index(std::path::Path::new("inside"))
             .unwrap();
+        let checks = std::cell::Cell::new(0);
         let report = inspect(
             vec![snapshot],
             Scope::Folder {
                 location: 1,
                 folder,
             },
-            &|| false,
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 64
+            },
             &mut |_| {},
         )
         .unwrap();
+        assert_eq!(report.progress.files, 2);
         assert_eq!(report.groups[0].len(), 2);
         assert!(report.groups[0]
             .iter()

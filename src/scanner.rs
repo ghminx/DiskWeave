@@ -113,6 +113,27 @@ impl RowRemap {
         self.runs.push((old, old + 1, new));
     }
 
+    pub(crate) fn with_changes(
+        len: usize,
+        changes: std::collections::BTreeMap<usize, Option<usize>>,
+    ) -> Self {
+        let mut runs = Vec::with_capacity(2 * changes.len() + 1);
+        let mut start = 0;
+        for (old, new) in changes {
+            if start < old {
+                runs.push((start, old, start));
+            }
+            if let Some(new) = new {
+                runs.push((old, old + 1, new));
+            }
+            start = old + 1;
+        }
+        if start < len {
+            runs.push((start, len, start));
+        }
+        Self { runs }
+    }
+
     pub(crate) fn get(&self, old: usize) -> Option<usize> {
         let at = self
             .runs
@@ -175,6 +196,22 @@ impl<T> Rows<T> {
         Arc::make_mut(self.chunks.last_mut().unwrap()).push(file);
         self.len += 1;
     }
+    pub(crate) fn swap_remove(&mut self, index: usize)
+    where
+        T: Clone,
+    {
+        assert!(index < self.len);
+        let chunk = Arc::make_mut(self.chunks.last_mut().unwrap());
+        let last = chunk.pop().unwrap();
+        if chunk.is_empty() {
+            self.chunks.pop();
+        }
+        self.len -= 1;
+        if index < self.len {
+            self[index] = last;
+        }
+    }
+
     pub fn first(&self) -> Option<&T> {
         self.get(0)
     }
