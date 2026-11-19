@@ -72,9 +72,11 @@ pub fn collect_folder(
         Strategy::Experimental(value) => value,
         _ => Experiment::default(),
     };
-    if experiment.shared_handle {
+    if strategy == Strategy::Bulk || experiment.shared_handle {
+        let mut observed = false;
         let source = Native::open_observed(path, &mut |metadata| {
-            observe(Entry::from_metadata(path.to_owned(), metadata))
+            observed = true;
+            observe(Entry::from_metadata(path.to_owned(), metadata));
         });
         drop(checking);
         return match source {
@@ -85,17 +87,35 @@ pub fn collect_folder(
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                 collect_folder(path, Strategy::LargeFetch, cancel, emit, observe, trace)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // 열거 권한 없이도 조회 가능한 폴더 시각·속성 보존.
+                if strategy == Strategy::Bulk && !observed {
+                    observe_path(path, observe, trace)?;
+                }
+                Err(e)
+            }
         };
     }
-    let metadata = fs::symlink_metadata(path)?;
+    observe_path(path, observe, trace)?;
+    drop(checking);
+    let _enumeration = scope(trace, Stage::Enumerate);
+    collect(path, strategy, cancel, emit)
+}
+fn observe_path(
+    path: &Path,
+    observe: &mut impl FnMut(Entry),
+    trace: Option<&crate::scanner::profile::Trace>,
+) -> io::Result<()> {
+    use super::profile::{scope, Stage};
+    let metadata = {
+        let _path_check = scope(trace, Stage::FolderPathCheck);
+        fs::symlink_metadata(path)?
+    };
     if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
         return Err(io::Error::other("열거 대상의 종류가 변경되었습니다"));
     }
     observe(Entry::from_metadata(path.to_owned(), metadata));
-    drop(checking);
-    let _enumeration = scope(trace, Stage::Enumerate);
-    collect(path, strategy, cancel, emit)
+    Ok(())
 }
 impl Entry {
     pub(super) fn from_metadata(path: PathBuf, m: fs::Metadata) -> Self {
@@ -851,6 +871,47 @@ mod tests {
             .unwrap_err()
             .kind(),
             io::ErrorKind::Interrupted
+        );
+    }
+    #[test]
+    fn native_folder_observation_and_entries_do_not_repeat_a_path_lookup() {
+        let root =
+            std::env::temp_dir().join(format!("diskweave-folder-handle-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sample"), b"abc").unwrap();
+        let expected = fs::symlink_metadata(&root).unwrap();
+        let trace = crate::scanner::profile::Trace::default();
+        let mut observed = None;
+        let mut entries = Vec::new();
+        collect_folder(
+            &root,
+            Strategy::Bulk,
+            &|| false,
+            &mut |page| {
+                entries.extend(page.into_iter().map(Result::unwrap));
+                Ok(())
+            },
+            &mut |entry| observed = Some(entry),
+            Some(&trace),
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].logical_bytes, 3);
+        assert!(entries[0].extra.identity.value().is_some());
+        let observed = observed.unwrap();
+        assert_eq!(observed.attributes, expected.file_attributes());
+        assert_eq!(observed.created, expected.created().ok());
+        assert_eq!(observed.modified, expected.modified().ok());
+        let lookups = trace
+            .snapshot()
+            .stages
+            .into_iter()
+            .find(|stage| stage.stage == "folder_path_check")
+            .unwrap();
+        assert_eq!(
+            lookups.calls, 0,
+            "네이티브 열거가 성공하면 핸들 관찰만 필요"
         );
     }
     #[test]

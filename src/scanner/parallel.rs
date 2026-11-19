@@ -151,6 +151,17 @@ pub(super) fn scan_observed<'a>(
 ) -> io::Result<ScanResult> {
     let Collection { strategy, metrics } = collection;
     let trace = metrics.map(|m| &m.trace);
+    let reuse_enumerated = detailed && probe.reuse_enumerated_metadata();
+    let needs_metadata = |attributes, extra: crate::metadata::Extra| {
+        detailed
+            && (!reuse_enumerated
+                || complete_enumerated_metadata(
+                    attributes,
+                    extra.identity.value(),
+                    extra.allocation.value(),
+                )
+                .is_none())
+    };
     let mut result = empty_result(root, detailed)?;
     let mut preview = preview::Recorder::new(observer)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -251,6 +262,17 @@ pub(super) fn scan_observed<'a>(
                         continue;
                     }
                     let building = scope(trace, Stage::TaskBuild);
+                    if reuse_enumerated {
+                        while let Some(file) = result.files.get(next_file) {
+                            if needs_metadata(file.attributes, file.extra) {
+                                break;
+                            }
+                            next_file += 1;
+                            if next_file % BATCH == 0 {
+                                crate::output::check(&cancelled)?;
+                            }
+                        }
+                    }
                     let metadata_ready = detailed && next_file < result.files.len();
                     let task =
                         if next_folder < result.folders.len() && (!metadata_ready || alternate) {
@@ -260,15 +282,15 @@ pub(super) fn scan_observed<'a>(
                         } else if metadata_ready {
                             let end = (next_file + BATCH).min(result.files.len());
                             let paths = (next_file..end)
-                                .map(|index| {
+                                .filter_map(|index| {
                                     let f = &result.files[index];
-                                    MetadataRequest {
+                                    needs_metadata(f.attributes, f.extra).then(|| MetadataRequest {
                                         attributes: f.attributes,
                                         index,
                                         path: result.folders[f.parent].path.join(&f.name),
                                         identity: f.extra.identity.value(),
                                         allocation: f.extra.allocation.value(),
-                                    }
+                                    })
                                 })
                                 .collect();
                             next_file = end;
@@ -336,6 +358,7 @@ pub(super) fn scan_observed<'a>(
                                 } else {
                                     crate::metadata::Extra::default()
                                 };
+                                let pending = needs_metadata(m.attributes, extra);
                                 result.files.push(FileEntry {
                                     extra,
                                     created: m.created,
@@ -353,8 +376,8 @@ pub(super) fn scan_observed<'a>(
                                         io::Error::other("논리 크기 합계가 표현 범위를 넘습니다")
                                     })?;
                                 folder.file_count += 1;
-                                preview.file(parent, m.logical_bytes, detailed);
-                                if !detailed {
+                                preview.file(parent, m.logical_bytes, pending);
+                                if !pending {
                                     folder.allocation.add(extra.allocation)?;
                                     counts.files_scanned += 1;
                                 }

@@ -441,11 +441,29 @@ pub struct MetadataRequest {
     pub allocation: Option<u64>,
 }
 pub trait MetadataProbe: Sync {
+    fn reuse_enumerated_metadata(&self) -> bool {
+        false
+    }
+
     fn read_batch(
         &self,
         requests: &[MetadataRequest],
         stop: &std::sync::atomic::AtomicBool,
     ) -> Vec<crate::metadata::Report>;
+}
+fn complete_enumerated_metadata(
+    attributes: u32,
+    identity: Option<crate::metadata::Identity>,
+    allocation: Option<u64>,
+) -> Option<crate::metadata::Extra> {
+    if attributes & 0xA00 != 0 {
+        return None;
+    }
+    Some(crate::metadata::Extra {
+        identity: crate::metadata::Field::Value(identity?),
+        allocation: crate::metadata::Field::Value(allocation?),
+        links: Default::default(),
+    })
 }
 impl<F: Fn(&Path) -> crate::metadata::Report + Sync> MetadataProbe for F {
     fn read_batch(
@@ -2110,6 +2128,10 @@ pub fn scan_unified<'a>(
     let source = crate::metadata::Named::for_root(root)?;
     struct Probe<'a>(&'a crate::metadata::Named);
     impl MetadataProbe for Probe<'_> {
+        fn reuse_enumerated_metadata(&self) -> bool {
+            true
+        }
+
         fn read_batch(
             &self,
             requests: &[MetadataRequest],
@@ -2119,17 +2141,13 @@ pub fn scan_unified<'a>(
                 .iter()
                 .take_while(|_| !stop.load(std::sync::atomic::Ordering::Relaxed))
                 .map(|r| {
-                    if r.attributes & 0xA00 == 0 {
-                        if let (Some(identity), Some(allocation)) = (r.identity, r.allocation) {
-                            return crate::metadata::Report {
-                                values: crate::metadata::Extra {
-                                    identity: crate::metadata::Field::Value(identity),
-                                    allocation: crate::metadata::Field::Value(allocation),
-                                    links: Default::default(),
-                                },
-                                issue: None,
-                            };
-                        }
+                    if let Some(values) =
+                        complete_enumerated_metadata(r.attributes, r.identity, r.allocation)
+                    {
+                        return crate::metadata::Report {
+                            values,
+                            issue: None,
+                        };
                     }
                     let report = crate::metadata::read_combined(&r.path, self.0, None);
                     if report.issue.is_none()
@@ -2159,6 +2177,68 @@ pub fn scan_unified<'a>(
 
 #[cfg(test)]
 mod unified_tests {
+    #[test]
+    fn observed_scan_only_sends_files_that_need_supplemental_metadata() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct ReusingProbe(AtomicUsize);
+        impl MetadataProbe for ReusingProbe {
+            fn reuse_enumerated_metadata(&self) -> bool {
+                true
+            }
+
+            fn read_batch(
+                &self,
+                requests: &[MetadataRequest],
+                _: &AtomicBool,
+            ) -> Vec<crate::metadata::Report> {
+                self.0.fetch_add(requests.len(), Ordering::Relaxed);
+                requests
+                    .iter()
+                    .map(|r| crate::metadata::read(&r.path))
+                    .collect()
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("diskweave-ready-files-{}", std::process::id()));
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let original = root.join("sample");
+        fs::write(&original, b"abc").unwrap();
+        fs::hard_link(&original, root.join("sub/alias")).unwrap();
+        let expected = crate::metadata::read(&original).values;
+        let probe = ReusingProbe::default();
+        let mut model = preview::Model::new(root.clone());
+        let result = scan_metadata_observed(
+            &root,
+            true,
+            Parallelism::Two,
+            || false,
+            |_| {},
+            &probe,
+            Some(&mut |batch| model.apply(batch)),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.folders[0].logical_bytes, 6);
+        assert_eq!(
+            result.folders[0].allocation.bytes,
+            expected.allocation.value().unwrap() * 2
+        );
+        assert!(result
+            .files
+            .iter()
+            .all(|f| f.extra.identity == expected.identity));
+        assert_eq!((model.folders[0].bytes, model.folders[0].files), (6, 2));
+        assert_eq!(
+            probe.0.load(Ordering::Relaxed),
+            0,
+            "열거에서 확인한 파일의 보완 조회 작업 생략"
+        );
+    }
+
     #[test]
     fn unified_scan_keeps_required_allocation_identity_and_preview_without_requiring_link_counts() {
         use super::*;

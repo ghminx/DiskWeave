@@ -22,8 +22,9 @@ pub enum Stage {
     WorkerIdle,
     Finish,
     MetadataTask,
+    FolderPathCheck,
 }
-const N: usize = 14;
+const N: usize = 15;
 #[allow(dead_code, reason = "개발 도구의 보고서에서만 사용하는 단계 이름")]
 const NAMES: [&str; N] = [
     "overall",
@@ -40,6 +41,7 @@ const NAMES: [&str; N] = [
     "worker_idle",
     "finish",
     "metadata_task",
+    "folder_path_check",
 ];
 static ALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 thread_local! {
