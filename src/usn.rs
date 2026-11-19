@@ -256,7 +256,7 @@ fn conflicting_directories(
     cancelled: &impl Fn() -> bool,
 ) -> io::Result<Vec<(u64, PathBuf, PathBuf)>> {
     let mut conflicts = Vec::new();
-    for (id, aliases) in nodes.shared_ids() {
+    for (id, aliases) in nodes.conflicting_directory_ids() {
         crate::output::check(cancelled)?;
         let mut previous = None;
         for path in aliases {
@@ -326,6 +326,9 @@ impl Node {
     }
     fn excluded(&self) -> bool {
         self.attributes & 0x400 != 0
+    }
+    fn directory_id(&self) -> Option<u64> {
+        (self.dir() && !self.excluded()).then_some(self.id)
     }
 }
 /// 변경 없는 주기의 성공 확인. 전체 파일 목록과 분리한 전송 값.
@@ -1863,6 +1866,16 @@ mod tests {
         let after = index.snapshot(&|| false).unwrap();
         assert!(Arc::ptr_eq(&before.scan, &after.scan));
         assert_eq!(before.tracking, after.tracking);
+        f.identity_alias = None;
+        index.refresh(&mut f, &|| false).unwrap();
+        let retried = index.snapshot(&|| false).unwrap();
+        retried
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&retried.scan)
+            .unwrap();
+        assert_eq!(retried.tracking.as_ref().unwrap().next, f.journal.next);
     }
 
     #[test]
@@ -2211,6 +2224,66 @@ mod tests {
             .as_ref()
             .unwrap()
             .validate(&record.scan)
+            .unwrap();
+    }
+    #[test]
+    fn file_only_hard_link_groups_do_not_delay_unrelated_deletion() {
+        let mut source = Fixture::new();
+        let scope = source.root.join("scope");
+        let links = scope.join("links");
+        fs::create_dir(&links).unwrap();
+        for i in 0..128 {
+            let file = links.join(format!("original-{i}"));
+            fs::write(&file, b"x").unwrap();
+            fs::hard_link(&file, links.join(format!("alias-{i}"))).unwrap();
+        }
+        let probe = scope.join("probe");
+        fs::write(&probe, b"abc").unwrap();
+        let parent = source.id(&scope);
+        let id = source.id(&probe);
+        let mut index = Index::begin(&scope, true, &mut source, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        source.event(id, parent, 0x80000200);
+        fs::remove_file(probe).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let cancelled = index.refresh(&mut source, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 6
+        });
+        assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let retained = index.snapshot(&|| false).unwrap();
+        assert!(Arc::ptr_eq(&before.scan, &retained.scan));
+        assert_eq!(before.tracking, retained.tracking);
+        checks.set(0);
+        assert!(
+            index
+                .refresh(&mut source, &|| {
+                    checks.set(checks.get() + 1);
+                    checks.get() > 120
+                })
+                .unwrap(),
+            "삭제가 보존한 경로의 Hard Link 검색과 독립적으로 반영"
+        );
+        let after = index.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 256);
+        assert_eq!(after.scan.files.len(), 256);
+        assert_eq!(
+            after
+                .tracking
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            128
+        );
+        after
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&after.scan)
             .unwrap();
     }
     #[test]

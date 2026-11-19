@@ -5,7 +5,7 @@ use crate::{
 };
 use std::io;
 use std::{
-    collections::{btree_map, hash_map, BTreeMap, HashMap},
+    collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -175,6 +175,7 @@ struct Undo {
 struct IdPaths {
     single: HashMap<u64, Arc<Path>>,
     shared: HashMap<u64, Vec<Arc<Path>>>,
+    directory_conflicts: HashSet<u64>,
 }
 impl IdPaths {
     fn insert(&mut self, id: u64, path: &Arc<Path>) {
@@ -216,6 +217,26 @@ impl IdPaths {
             .or_else(|| self.single.get(&id).map(std::slice::from_ref))
             .unwrap_or_default()
     }
+
+    fn update_directory_conflict(
+        &mut self,
+        id: u64,
+        paths: &BTreeMap<Arc<Path>, u64>,
+        values: &HashMap<u64, Node>,
+    ) {
+        let conflict = self.shared.get(&id).is_some_and(|aliases| {
+            aliases
+                .iter()
+                .filter(|path| values[&paths[path.as_ref()]].directory_id().is_some())
+                .nth(1)
+                .is_some()
+        });
+        if conflict {
+            self.directory_conflicts.insert(id);
+        } else {
+            self.directory_conflicts.remove(&id);
+        }
+    }
 }
 /// 경로 인덱스와 메타데이터 소유 저장소를 분리한 추적 수명 내 고정 ID 보관.
 pub(super) struct Entries {
@@ -242,7 +263,11 @@ impl Entries {
         if self.ids.is_none() {
             let mut lookup = IdPaths::default();
             for (path, number) in &self.paths {
-                lookup.insert(self.values[number].id, path);
+                let node = &self.values[number];
+                lookup.insert(node.id, path);
+                if let Some(id) = node.directory_id() {
+                    lookup.update_directory_conflict(id, &self.paths, &self.values);
+                }
             }
             self.ids = Some(lookup);
         }
@@ -252,13 +277,20 @@ impl Entries {
         self.ids.as_ref().expect("수집기 ID 조회").get(id)
     }
 
-    pub fn shared_ids(&self) -> impl Iterator<Item = (u64, &[Arc<Path>])> {
-        self.ids
-            .as_ref()
-            .expect("수집기 ID 조회")
-            .shared
-            .iter()
-            .map(|(&id, paths)| (id, paths.as_slice()))
+    pub fn conflicting_directory_ids(&self) -> impl Iterator<Item = (u64, &[Arc<Path>])> {
+        let ids = self.ids.as_ref().expect("수집기 ID 조회");
+        ids.directory_conflicts.iter().map(|&id| (id, ids.get(id)))
+    }
+
+    fn update_directory_conflicts(&mut self, before: Option<u64>, after: Option<u64>) {
+        if before == after {
+            return;
+        }
+        if let Some(ids) = &mut self.ids {
+            for id in [before, after].into_iter().flatten() {
+                ids.update_directory_conflict(id, &self.paths, &self.values);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -352,7 +384,9 @@ impl Entries {
                 ids.insert(node.id, &path);
             }
         }
+        let after = node.directory_id();
         self.values.insert(number, node);
+        self.update_directory_conflicts(old.as_ref().and_then(Node::directory_id), after);
         Ok(old)
     }
     pub fn remove(&mut self, path: &Path) -> io::Result<Option<Node>> {
@@ -369,6 +403,7 @@ impl Entries {
         if let Some(ids) = &mut self.ids {
             ids.remove(old.id, path);
         }
+        self.update_directory_conflicts(old.directory_id(), None);
         Ok(Some(old))
     }
     pub fn subtree_keys<'a>(&'a self, root: &'a Path) -> impl Iterator<Item = &'a Path> + 'a {
@@ -433,12 +468,15 @@ impl Entries {
     pub fn rollback(&mut self) {
         if let Some(undo) = self.undo.take() {
             for (path, old) in undo.before {
+                let mut before = None;
                 if let Some(number) = self.paths.remove(&path) {
                     let removed = self.values.remove(&number).expect("변경 중 추적 항목");
+                    before = removed.directory_id();
                     if let Some(ids) = &mut self.ids {
                         ids.remove(removed.id, &path);
                     }
                 }
+                let after = old.as_ref().and_then(|(_, node)| node.directory_id());
                 if let Some((number, node)) = old {
                     if let Some(ids) = &mut self.ids {
                         ids.insert(node.id, &path);
@@ -446,6 +484,7 @@ impl Entries {
                     self.paths.insert(path, number);
                     self.values.insert(number, node);
                 }
+                self.update_directory_conflicts(before, after);
             }
             self.next = undo.next;
         }
