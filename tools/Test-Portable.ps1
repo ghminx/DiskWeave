@@ -1,12 +1,22 @@
 param([Parameter(Mandatory)][string]$Executable, [switch]$Gui)
 $ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot
 $exe = (Resolve-Path -LiteralPath $Executable).Path
 $bytes = [IO.File]::ReadAllBytes($exe)
+$binary = [Text.Encoding]::Latin1.GetString($bytes)
+foreach ($root in @($repo, $env:USERPROFILE, $env:CARGO_HOME) | Where-Object { $_ }) {
+    foreach ($prefix in @($root, $root.Replace('\', '/')) | Select-Object -Unique) {
+        foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode)) {
+            $needle = [Text.Encoding]::Latin1.GetString($encoding.GetBytes($prefix))
+            if ($binary.Contains($needle, [StringComparison]::OrdinalIgnoreCase)) { throw '실행 파일에 개발 환경 경로 포함' }
+        }
+    }
+}
 $pe = [BitConverter]::ToInt32($bytes, 60)
 if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'x64 실행 파일이 아님' }
 if ([BitConverter]::ToUInt16($bytes, $pe + 24 + 68) -ne 2) { throw 'GUI 기본 실행용 Windows subsystem이 아님' }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
-$manifest = Get-Content -Raw -LiteralPath (Join-Path (Split-Path $PSScriptRoot) 'Cargo.toml')
+$manifest = Get-Content -Raw -LiteralPath (Join-Path $repo 'Cargo.toml')
 if ($manifest -notmatch '(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"') { throw 'Cargo.toml 제품 버전 누락' }
 $expectedVersion = $Matches[1] + '.0'
 if ($version.ProductName -ne 'DiskWeave' -or $version.FileVersion -ne $expectedVersion) { throw "제품·버전 리소스 불일치: $expectedVersion" }

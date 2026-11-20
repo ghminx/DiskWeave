@@ -4,11 +4,12 @@ $path = (Resolve-Path -LiteralPath $Zip).Path
 $repo = Split-Path $PSScriptRoot
 $archive = [IO.Compression.ZipFile]::OpenRead($path)
 try {
-    $names = @($archive.Entries | Where-Object Length -GT 0 | ForEach-Object FullName)
-    foreach ($name in $names) {
+    foreach ($entry in $archive.Entries) {
+        $name = $entry.FullName
         if ($name.Contains('..') -or $name.Contains(':') -or $name.StartsWith('/')) { throw "잘못된 ZIP 경로: $name" }
         if ($name -notin @('DiskWeave.exe','README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md') -and !$name.StartsWith('licenses/')) { throw "허용하지 않은 ZIP 내용: $name" }
     }
+    $names = @($archive.Entries | Where-Object Length -GT 0 | ForEach-Object FullName)
     foreach ($name in @('DiskWeave.exe','README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','licenses/Pretendard/OFL.txt','licenses/Rust/COPYRIGHT-library.html')) {
         if ($name -notin $names) { throw "필수 ZIP 내용 누락: $name" }
     }
@@ -36,14 +37,5 @@ try {
 $extract = Join-Path ([IO.Path]::GetTempPath()) ('DiskWeave 압축 해제 시험 '+[guid]::NewGuid().ToString('N'))
 [IO.Compression.ZipFile]::ExtractToDirectory($path,$extract)
 $exe = Join-Path $extract 'DiskWeave.exe'
-$binary = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($exe))
-foreach ($root in @($repo, $env:USERPROFILE, $env:CARGO_HOME) | Where-Object { $_ }) {
-    foreach ($prefix in @($root, $root.Replace('\', '/')) | Select-Object -Unique) {
-        foreach ($encoding in @([Text.Encoding]::UTF8, [Text.Encoding]::Unicode)) {
-            $needle = [Text.Encoding]::Latin1.GetString($encoding.GetBytes($prefix))
-            if ($binary.Contains($needle, [StringComparison]::OrdinalIgnoreCase)) { throw '실행 파일에 개발 환경 경로 포함' }
-        }
-    }
-}
 & (Join-Path $PSScriptRoot 'Test-Portable.ps1') -Executable $exe -Gui:$Gui
 Write-Output ('PASS: ZIP whitelist/privacy/licenses; files='+$names.Count)
