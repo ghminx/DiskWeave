@@ -2,7 +2,7 @@ use crate::{locations::Locations, scanner::ScanResult, snapshot::SavedScan};
 use std::{
     collections::HashMap,
     io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
@@ -70,12 +70,7 @@ impl Controller {
                 continue;
             }
             self.pending.insert(entry.id, entry.generation);
-            targets.push((
-                entry.id,
-                entry.generation,
-                entry.path.clone(),
-                entry.scan.completed().is_none_or(|c| c.result.detailed),
-            ));
+            targets.push((entry.id, entry.generation, entry.path.clone()));
         }
         if targets.is_empty() {
             return Ok(());
@@ -85,7 +80,7 @@ impl Controller {
         let parallelism = locations.parallelism();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            for (id, generation, path, detailed) in targets {
+            for (id, generation, path) in targets {
                 let stop = || cancel.load(Ordering::Relaxed);
                 if stop() {
                     break;
@@ -94,23 +89,8 @@ impl Controller {
                 let clock = Instant::now();
                 let result = (|| {
                     let root = crate::file_ops::Target::capture(&path)?;
-                    let scan = if detailed {
-                        crate::scanner::scan_unified(
-                            Path::new(&path),
-                            parallelism,
-                            stop,
-                            |_| {},
-                            None,
-                        )?
-                    } else {
-                        crate::scanner::scan_configured(
-                            Path::new(&path),
-                            false,
-                            parallelism,
-                            stop,
-                            |_| {},
-                        )?
-                    };
+                    let scan =
+                        crate::scanner::scan_unified(&path, parallelism, stop, |_| {}, None)?;
                     root.verify()?;
                     let mut record =
                         SavedScan::new(Arc::new(scan), started, SystemTime::now(), clock.elapsed());

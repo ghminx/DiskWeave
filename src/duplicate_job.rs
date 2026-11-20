@@ -93,21 +93,18 @@ impl Controller {
             self.status = "취소 중".into();
         }
     }
-    pub fn poll(&mut self, current: &[Snapshot]) {
-        let matches = |versions: &[(u64, u64)]| {
-            versions
+    pub fn poll(&mut self, is_current: impl Fn(u64, u64) -> bool) {
+        if let Some(report) = &self.report {
+            self.stale = !report
+                .sources
                 .iter()
-                .all(|(id, g)| current.iter().any(|s| s.id == *id && s.generation == *g))
-        };
-        if let Some(r) = &self.report {
-            self.stale = !r.sources.iter().all(|s| {
-                current
-                    .iter()
-                    .any(|c| c.id == s.id && c.generation == s.generation)
-            });
+                .all(|s| is_current(s.id, s.generation));
         }
         let Some(a) = &self.active else { return };
-        let valid = matches(&a.versions);
+        let valid = a
+            .versions
+            .iter()
+            .all(|&(id, generation)| is_current(id, generation));
         if !valid {
             a.cancel.store(true, Ordering::Relaxed);
         }
@@ -185,6 +182,11 @@ mod tests {
         std::fs::write(fixture.0.join("a"), b"same").unwrap();
         std::fs::write(fixture.0.join("b"), b"same").unwrap();
         let sources = vec![fixture.snapshot()];
+        let current = |id, generation| {
+            sources
+                .iter()
+                .any(|s| s.id == id && s.generation == generation)
+        };
         let mut job = Controller::default();
         job.start(sources.clone(), Scope::All, "첫 범위".into(), false)
             .unwrap();
@@ -193,7 +195,7 @@ mod tests {
             .is_err());
         let limit = Instant::now() + std::time::Duration::from_secs(5);
         while job.running() {
-            job.poll(&sources);
+            job.poll(current);
             assert!(Instant::now() < limit);
             std::thread::yield_now();
         }
@@ -205,7 +207,7 @@ mod tests {
             .unwrap();
         job.cancel();
         while job.running() {
-            job.poll(&sources);
+            job.poll(current);
             assert!(Instant::now() < limit);
             std::thread::yield_now();
         }
@@ -223,7 +225,7 @@ mod tests {
         )
         .unwrap();
         while job.running() {
-            job.poll(&sources);
+            job.poll(current);
             assert!(Instant::now() < limit);
             std::thread::yield_now();
         }
@@ -232,10 +234,13 @@ mod tests {
         assert_eq!(job.report.as_ref().unwrap().groups.len(), 1);
         job.start(sources.clone(), Scope::All, "다음 검사".into(), false)
             .unwrap();
-        let mut changed = sources.clone();
-        changed[0].generation += 1;
+        let changed = |id, generation| {
+            sources
+                .iter()
+                .any(|s| s.id == id && s.generation + 1 == generation)
+        };
         while job.running() {
-            job.poll(&changed);
+            job.poll(changed);
             assert!(Instant::now() < limit);
             std::thread::yield_now();
         }

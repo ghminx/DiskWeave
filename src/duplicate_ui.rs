@@ -516,7 +516,11 @@ mod tests {
         .unwrap();
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while job.running() {
-            job.poll(&sources);
+            job.poll(|id, generation| {
+                sources
+                    .iter()
+                    .any(|s| s.id == id && s.generation == generation)
+            });
             assert!(std::time::Instant::now() < limit);
             std::thread::yield_now();
         }

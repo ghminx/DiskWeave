@@ -50,6 +50,10 @@ impl ListSelection {
         self.rows = (0..len).collect();
         self.anchor = (len > 0).then_some(0);
     }
+    pub fn insert(&mut self, row: usize) {
+        self.rows.insert(row);
+        self.anchor = Some(row);
+    }
     pub fn clear(&mut self) {
         self.rows.clear();
         self.anchor = None;

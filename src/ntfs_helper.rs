@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::scanner::ScanResult;
 use crate::{
     engine::{FastMode, Progress, Stage},
     ntfs_native::Target,
@@ -60,22 +58,6 @@ impl Drop for Worker {
     }
 }
 
-/// 부모·도우미 양쪽에서 대상과 계산 옵션이 일치한 완료 응답만 수락.
-#[cfg(test)]
-pub fn validate_response(record: SavedScan, root: &Path, detailed: bool) -> io::Result<ScanResult> {
-    let correct = record.engine.as_ref().is_some_and(|r| {
-        r.requested == crate::engine::Method::Ntfs
-            && r.actual == crate::engine::Method::Ntfs
-            && r.fallback.is_none()
-    });
-    if !correct
-        || record.scan.detailed != detailed
-        || record.scan.folders.first().is_none_or(|f| f.path != root)
-    {
-        return Err(invalid("스캔 도우미의 응답 대상·방식이 일치하지 않습니다"));
-    }
-    Arc::try_unwrap(record.scan).map_err(|_| invalid("공유 중인 도우미 응답"))
-}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
@@ -266,95 +248,6 @@ impl Write for Pipe<'_> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-#[cfg(test)]
-struct Chunks<R> {
-    pipe: R,
-    remaining: usize,
-    total: u64,
-    ended: bool,
-}
-#[cfg(test)]
-impl<R: Read> Read for Chunks<R> {
-    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        if b.is_empty() || self.ended {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            let mut n = [0u8; 4];
-            self.pipe.read_exact(&mut n)?;
-            self.remaining = u32::from_le_bytes(n) as usize;
-            if self.remaining == 0 {
-                self.ended = true;
-                return Ok(0);
-            }
-            if self.remaining > 65536 {
-                return Err(invalid("도우미 데이터 조각 길이 초과"));
-            }
-            self.total += self.remaining as u64;
-            if self.total > 1_073_741_824 {
-                return Err(invalid("도우미 데이터 크기 초과"));
-            }
-        }
-        let len = b.len().min(self.remaining);
-        self.pipe.read_exact(&mut b[..len])?;
-        self.remaining -= len;
-        Ok(len)
-    }
-}
-#[cfg(test)]
-struct ChunkWriter<W> {
-    pipe: W,
-    total: u64,
-}
-#[cfg(test)]
-impl<W: Write> Write for ChunkWriter<W> {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        if b.is_empty() {
-            return Ok(0);
-        }
-        let n = b.len().min(65536);
-        self.total += n as u64;
-        if self.total > 1_073_741_824 {
-            return Err(invalid("도우미 데이터 크기 초과"));
-        }
-        self.pipe.write_all(&(n as u32).to_le_bytes())?;
-        self.pipe.write_all(&b[..n])?;
-        Ok(n)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-/// 결과 끝 표시를 포함한 유한 응답 전송. 연결 유지 상태에서도 수신 종료 보장.
-#[cfg(test)]
-pub fn write_completed(mut writer: impl Write, record: &SavedScan) -> io::Result<()> {
-    let chunks = ChunkWriter {
-        pipe: &mut writer,
-        total: 0,
-    };
-    let mut buffer = io::BufWriter::with_capacity(65536, chunks);
-    crate::snapshot::write_to(record, &mut buffer, || false)?;
-    buffer.flush()?;
-    drop(buffer);
-    writer.write_all(&0u32.to_le_bytes())
-}
-#[cfg(test)]
-fn read_record_from(reader: impl Read) -> io::Result<SavedScan> {
-    crate::snapshot::read_from(
-        Chunks {
-            pipe: reader,
-            remaining: 0,
-            total: 0,
-            ended: false,
-        },
-        || false,
-    )
-}
-#[allow(dead_code, reason = "기존 전송·도구 공개 API의 회귀 대조")]
-#[cfg(test)]
-pub fn read_completed(reader: impl Read, root: &Path, detailed: bool) -> io::Result<ScanResult> {
-    validate_response(read_record_from(reader)?, root, detailed)
 }
 use crate::usn::stream::Publication;
 pub struct WatchControl<'a> {
@@ -764,7 +657,6 @@ pub fn worker(arguments: &[OsString]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Report;
     use std::time::SystemTime;
 
     #[test]
@@ -804,9 +696,27 @@ mod tests {
         };
         control(&mut wire, Message::Stream);
         sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let mut baseline = wire.as_slice();
+        assert!(matches!(
+            receive_message::<Message>(&mut baseline).unwrap(),
+            Message::Stream
+        ));
+        for (expected_root, detailed, reason) in [
+            (root.join("other"), false, "대상 경로 불일치"),
+            (root.clone(), true, "수집 옵션"),
+        ] {
+            let mut rejected =
+                crate::usn::stream::Receiver::new(expected_root, detailed, Default::default());
+            let mut input = baseline;
+            let error = rejected.receive(&mut input, &|| false).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(reason));
+            assert!(rejected.publication(true, &|| false).is_err());
+        }
         control(&mut wire, Message::Checking);
         control(&mut wire, Message::Stream);
         sender.write(&mut wire, &mut index, &|| false).unwrap();
+        wire.extend_from_slice(b"NEXT");
         struct Counted<'a> {
             data: &'a [u8],
             reads: usize,
@@ -844,44 +754,13 @@ mod tests {
             receiver.snapshot(&|| false).unwrap().scan.folders[0].logical_bytes,
             100
         );
+        let mut next = [0; 4];
+        reader.read_exact(&mut next).unwrap();
+        assert_eq!(&next, b"NEXT");
         assert!(reader.get_ref().reads < 8);
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn persistent_response_stops_at_its_frame_without_waiting_for_process_exit() {
-        let root =
-            std::env::temp_dir().join(format!("diskweave-helper-frame-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("known"), b"123").unwrap();
-        let now = SystemTime::now();
-        let mut record = SavedScan::new(
-            Arc::new(crate::scanner::scan(&root, || false).unwrap()),
-            now,
-            now,
-            Duration::ZERO,
-        );
-        record.engine = Some(Report {
-            requested: crate::engine::Method::Ntfs,
-            actual: crate::engine::Method::Ntfs,
-            fallback: None,
-            ..Default::default()
-        });
-        let mut wire = Vec::new();
-        write_completed(&mut wire, &record).unwrap();
-        write_completed(&mut wire, &record).unwrap();
-        wire.extend_from_slice(b"NEXT");
-        let mut reader = wire.as_slice();
-        for _ in 0..2 {
-            let result = read_completed(&mut reader, &root, false).unwrap();
-            assert_eq!(
-                (result.folders[0].logical_bytes, result.files.len()),
-                (3, 1)
-            );
-        }
-        assert_eq!(reader, b"NEXT");
-        std::fs::remove_dir_all(root).unwrap();
-    }
     #[test]
     fn cancelled_transport_returns_without_retrying_the_read() {
         let (done, wait) = std::sync::mpsc::channel();
@@ -907,30 +786,7 @@ mod tests {
         );
     }
     #[test]
-    fn helper_responses_must_match_requested_root_mode_and_details() {
-        let root = std::env::temp_dir().join(format!("diskweave-response-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let make = || {
-            let mut r = crate::snapshot::SavedScan::new(
-                std::sync::Arc::new(crate::scanner::scan(&root, || false).unwrap()),
-                std::time::SystemTime::now(),
-                std::time::SystemTime::now(),
-                std::time::Duration::ZERO,
-            );
-            r.engine = Some(crate::engine::Report {
-                requested: crate::engine::Method::Ntfs,
-                actual: crate::engine::Method::Ntfs,
-                fallback: None,
-                ..Default::default()
-            });
-            r
-        };
-        assert!(validate_response(make(), &root, false).is_ok());
-        assert!(validate_response(make(), &root, true).is_err());
-        assert!(validate_response(make(), &root.join("other"), false).is_err());
-        let mut r = make();
-        r.engine = None;
-        assert!(validate_response(r, &root, false).is_err());
+    fn unsupported_volume_targets_are_rejected() {
         for p in [
             "C:\\folder",
             "\\\\server\\share\\",
@@ -940,6 +796,5 @@ mod tests {
         ] {
             assert!(crate::ntfs_native::target(std::path::Path::new(p)).is_err());
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

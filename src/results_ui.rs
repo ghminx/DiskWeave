@@ -239,17 +239,22 @@ impl ResultsUi {
     pub fn windows(&mut self, ctx: &egui::Context, context: &ExportContext) {
         if self.export_open {
             let mut open = true;
+            let available = [
+                context.selected.is_some() && context.folder.is_some(),
+                context.selected.is_some(),
+                context.matches.is_some(),
+                !context.sources.is_empty(),
+            ];
             dialog("파일 목록 내보내기",ctx,440.0).vscroll(false).open(&mut open).show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y=6.0;
                 egui::ScrollArea::vertical().id_salt("export_body").max_height((ctx.content_rect().height()-if matches!(self.job.status,Status::Idle){200.0}else{280.0}).max(100.0)).show(ui,|ui| {
                 ui.label("저장할 범위");
                 ui.small("이 창을 열었을 때의 결과를 저장합니다.");
-                for (index, label, enabled) in [
-                    (0,"현재 폴더와 하위 항목",context.selected.is_some() && context.folder.is_some()),
-                    (1,"현재 분석 대상 전체",context.selected.is_some()),
-                    (2,"현재 검색 결과",context.matches.is_some()),
-                    (3,"모든 분석 위치",!context.sources.is_empty()),
-                ] { ui.add_enabled(enabled, egui::RadioButton::new(self.scope == index, label)).clicked().then(|| self.scope = index); }
+                for (index, label) in ["현재 폴더와 하위 항목", "현재 분석 대상 전체", "현재 검색 결과", "모든 분석 위치"].into_iter().enumerate() {
+                    if ui.add_enabled(available[index], egui::RadioButton::new(self.scope == index, label)).clicked() {
+                        self.scope = index;
+                    }
+                }
                 if self.scope < 2 {
                     if let Some(source) = context.selected.and_then(|id| context.sources.get(id)) {
                         let folder = if self.scope == 0 { context.folder.unwrap_or(0) } else { 0 };
@@ -267,17 +272,22 @@ impl ResultsUi {
                 ui.small("CSV에서는 파일명이 수식으로 실행되지 않도록 텍스트로 저장합니다. 이름·전체 경로·종류·크기·할당 크기·수정 날짜만 저장합니다.");
                 });
                 self.status(ui);
-                let scope = match self.scope {
-                    0 => context.selected.zip(context.folder).map(|(source,folder)| ExportScope::Folder{source,folder}),
-                    1 => context.selected.map(ExportScope::Location),
-                    2 => context.matches.as_ref().map(|(_,hits)|ExportScope::Matches(hits.clone())),
-                    _ => (!context.sources.is_empty()).then_some(ExportScope::All),
-                };
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(scope.is_some() && !self.busy(), egui::Button::new(egui::RichText::new("저장 위치 선택…").color(crate::ui_style::BG)).fill(crate::ui_style::ACCENT)).clicked() {
-                        let sources = if self.scope == 2 { context.matches.as_ref().unwrap().0.clone() } else { context.sources.clone() };
-                        self.destination(Draft::Export{sources,scope:scope.unwrap()},"csv","DiskWeave.csv");
+                    if ui.add_enabled(available[self.scope.min(3)] && !self.busy(), egui::Button::new(egui::RichText::new("저장 위치 선택…").color(crate::ui_style::BG)).fill(crate::ui_style::ACCENT)).clicked() {
+                        let (sources, scope) = match self.scope {
+                            0 => (&context.sources, ExportScope::Folder {
+                                source: context.selected.unwrap(),
+                                folder: context.folder.unwrap(),
+                            }),
+                            1 => (&context.sources, ExportScope::Location(context.selected.unwrap())),
+                            2 => {
+                                let (sources, hits) = context.matches.as_ref().unwrap();
+                                (sources, ExportScope::Matches(hits.clone()))
+                            }
+                            _ => (&context.sources, ExportScope::All),
+                        };
+                        self.destination(Draft::Export{sources:sources.clone(),scope},"csv","DiskWeave.csv");
                         self.export_open = false;
                     }
                     if ui.button("닫기").clicked() { self.export_open = false; }

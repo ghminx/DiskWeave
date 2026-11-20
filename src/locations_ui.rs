@@ -207,12 +207,13 @@ impl LocationsView {
         }
     }
     pub fn refresh(&mut self, locations: &Locations, input: &SearchInput) {
+        let waiting_for_results = self.job.running;
         self.job.poll();
-        if self
+        let request_changed = self
             .key
             .as_ref()
-            .is_none_or(|(epoch, previous)| *epoch != locations.epoch || previous != input)
-        {
+            .is_none_or(|(epoch, previous)| *epoch != locations.epoch || previous != input);
+        if request_changed {
             if self
                 .live_selection
                 .as_ref()
@@ -228,14 +229,14 @@ impl LocationsView {
         }
         if !self.job.running {
             if let (Some((_, paths)), Some(results)) = (
-                self.live_selection
-                    .take()
-                    .filter(|(_, paths)| !paths.is_empty()),
+                self.live_selection.take().filter(|(_, paths)| {
+                    (request_changed || waiting_for_results) && !paths.is_empty()
+                }),
                 &self.job.results,
             ) {
                 let names: std::collections::HashSet<_> = paths
                     .keys()
-                    .filter_map(|(id, path)| Some((*id, path.file_name()?)))
+                    .map(|(id, path)| (*id, path.file_name().unwrap_or(path.as_os_str())))
                     .collect();
                 for (row, hit) in results.hits.iter().enumerate() {
                     let source = &results.sources[hit.source];
@@ -251,7 +252,8 @@ impl LocationsView {
                             _ => true,
                         })
                     {
-                        self.selection.click(row, true, false);
+                        self.selection.insert(row);
+                        self.selection_changed = true;
                     }
                 }
             }
@@ -598,6 +600,47 @@ impl LocationsView {
 
 #[cfg(test)]
 mod search_ui_tests {
+    #[test]
+    fn preserving_selection_without_a_result_change_keeps_selected_rows() {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        let fixture = crate::duplicates::tests::Fixture::new();
+        for name in ["selected-a.txt", "selected-b.txt"] {
+            std::fs::write(fixture.0.join(name), b"keep").unwrap();
+        }
+        let mut locations = Locations::default();
+        locations.start(fixture.0.clone()).unwrap();
+        let limit = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() {
+            locations.poll();
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let mut view = LocationsView {
+            global_mode: true,
+            ..Default::default()
+        };
+        let input = SearchInput {
+            text: "selected-".into(),
+            ..Default::default()
+        };
+        while view.results().is_none() {
+            view.refresh(&locations, &input);
+            assert!(Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        view.select_result(0, false, false);
+        view.select_result(1, true, false);
+        let selected = view.selected_targets();
+        assert_eq!(selected.len(), 2);
+        for _ in 0..2 {
+            view.preserve_live_selection(&locations);
+            view.refresh(&locations, &input);
+            assert_eq!(view.selected_targets(), selected);
+        }
+    }
+
     #[test]
     fn tracked_searches_keep_existing_entries_but_do_not_select_replaced_paths() {
         use crate::usn::{Event, Index, Journal, Source};

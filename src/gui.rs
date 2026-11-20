@@ -688,9 +688,7 @@ impl DiskWeaveApp {
                 self.input_error = Some(error.to_string());
             }
         }
-        if self.file_refresh.busy() {
-            self.locations_view.preserve_live_selection(&self.scan);
-        }
+        let previous_epoch = self.scan.epoch;
         let tracking = self
             .tracking
             .location
@@ -699,6 +697,9 @@ impl DiskWeaveApp {
             if self.scan.selected_id() == Some(update.id) {
                 self.replace_live_result(update.old.as_deref(), &update.new, None);
             }
+        }
+        if self.scan.epoch != previous_epoch {
+            self.locations_view.preserve_live_selection(&self.scan);
         }
     }
     fn replace_live_result(
@@ -734,8 +735,8 @@ impl DiskWeaveApp {
             return;
         }
         let was_running = self.tracking.running();
+        let previous_epoch = self.scan.epoch;
         if let Some(update) = self.tracking.poll() {
-            self.locations_view.preserve_live_selection(&self.scan);
             let accepted = match update {
                 crate::tracking::Update::Record(record) => {
                     let old = self
@@ -769,8 +770,10 @@ impl DiskWeaveApp {
             }
         }
         if was_running && matches!(self.tracking.status, crate::tracking::Status::Failed(_)) {
-            self.locations_view.preserve_live_selection(&self.scan);
             self.scan.tracking_failed(id);
+        }
+        if self.scan.epoch != previous_epoch {
+            self.locations_view.preserve_live_selection(&self.scan);
         }
     }
     fn start_tracking(&mut self, fresh: bool) {
@@ -1133,7 +1136,13 @@ impl DiskWeaveApp {
             }
             self.sync_tracking();
             self.file_tick();
-            self.duplicates.poll(&self.scan.snapshots());
+            self.duplicates.poll(|id, generation| {
+                self.scan.get(id).is_some_and(|location| {
+                    !location.stale
+                        && location.generation == generation
+                        && location.scan.completed().is_some()
+                })
+            });
             self.close_windows(ctx);
             if self.scan.is_running()
                 || self.duplicates.running()
@@ -1364,7 +1373,9 @@ impl DiskWeaveApp {
         let selected = sources
             .iter()
             .position(|s| Some(s.id) == self.scan.selected_id());
-        let matches = if self.locations_view.global_mode {
+        let matches = if !self.search.input.is_active() {
+            None
+        } else if self.locations_view.global_mode {
             self.locations_view
                 .results()
                 .map(|r| (r.sources.clone(), r.hits.clone()))
@@ -1387,7 +1398,7 @@ impl DiskWeaveApp {
                 .as_ref()
                 .map(Explorer::folder)
                 .filter(|_| !self.locations_view.global_mode),
-            matches: matches.filter(|_| self.search.input.is_active()),
+            matches,
         }
     }
     fn start_open(&mut self, request: OpenRequest) {

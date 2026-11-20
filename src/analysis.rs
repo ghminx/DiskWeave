@@ -128,31 +128,31 @@ impl Statistics {
         let Some(local) = &mut self.local else {
             return false;
         };
-        let scope = |scan: &crate::scanner::ScanResult, item, folder: usize| matches!(item, Item::File(row) if scan.folders[scan.files[row].parent].path.starts_with(&scan.folders[folder].path));
+        let scoped_row = |scan: &crate::scanner::ScanResult, item, folder: usize| match item {
+            Item::File(row)
+                if scan.folders[scan.files[row].parent]
+                    .path
+                    .starts_with(&scan.folders[folder].path) =>
+            {
+                Some(row)
+            }
+            _ => None,
+        };
         let old = delta
             .before
             .iter()
-            .copied()
-            .filter(|&item| scope(&previous.scan, item, folder));
+            .filter_map(|&item| scoped_row(&previous.scan, item, folder))
+            .map(|row| (false, previous.scan.as_ref(), row));
         let new = delta
             .after
             .iter()
-            .copied()
-            .filter(|&item| scope(&current.scan, item, new_folder));
-        let mut identities = HashSet::new();
-        for (scan, items) in [
-            (&previous.scan, old.clone().collect::<Vec<_>>()),
-            (&current.scan, new.clone().collect()),
-        ] {
-            for item in items {
-                let Item::File(row) = item else {
-                    unreachable!()
-                };
-                if let Field::Value(id) = scan.files[row].extra.identity {
-                    identities.insert(id);
-                }
-            }
-        }
+            .filter_map(|&item| scoped_row(&current.scan, item, new_folder))
+            .map(|row| (true, current.scan.as_ref(), row));
+        let edits = old.chain(new);
+        let identities: HashSet<_> = edits
+            .clone()
+            .filter_map(|(_, scan, row)| scan.files[row].extra.identity.value())
+            .collect();
         for id in &identities {
             if let Some((allocation, conflict)) =
                 local.links.get(id).and_then(LinkAllocations::total)
@@ -166,49 +166,41 @@ impl Statistics {
             .iter()
             .map(|g| (g.name.clone(), (g.bytes, g.files)))
             .collect();
-        for (add, scan, items) in [
-            (false, &previous.scan, old.collect::<Vec<_>>()),
-            (true, &current.scan, new.collect()),
-        ] {
-            for item in items {
-                let Item::File(row) = item else {
-                    unreachable!()
-                };
-                let file = &scan.files[row];
-                let key = (
-                    file.logical_bytes,
-                    Reverse(crate::search::item_path(scan, item)),
-                );
-                let group = groups.entry(extension(&file.name)).or_default();
-                if add {
-                    local.ranked.insert(key, row);
-                    group.0 += file.logical_bytes;
-                    group.1 += 1;
-                    if let Field::Missing(reason) = file.extra.identity {
-                        self.unique_allocation
-                            .add(Field::Missing(reason))
-                            .expect("파일 개수 범위");
-                    } else if let Field::Value(id) = file.extra.identity {
-                        local
-                            .links
-                            .entry(id)
-                            .or_default()
-                            .add(file.extra.allocation);
+        for (add, scan, row) in edits {
+            let file = &scan.files[row];
+            let key = (
+                file.logical_bytes,
+                Reverse(crate::search::item_path(scan, Item::File(row))),
+            );
+            let group = groups.entry(extension(&file.name)).or_default();
+            if add {
+                local.ranked.insert(key, row);
+                group.0 += file.logical_bytes;
+                group.1 += 1;
+                if let Field::Missing(reason) = file.extra.identity {
+                    self.unique_allocation
+                        .add(Field::Missing(reason))
+                        .expect("파일 개수 범위");
+                } else if let Field::Value(id) = file.extra.identity {
+                    local
+                        .links
+                        .entry(id)
+                        .or_default()
+                        .add(file.extra.allocation);
+                }
+            } else {
+                local.ranked.remove(&key);
+                group.0 -= file.logical_bytes;
+                group.1 -= 1;
+                match file.extra.identity {
+                    Field::Missing(reason) => {
+                        remove_allocation(&mut self.unique_allocation, Field::Missing(reason))
                     }
-                } else {
-                    local.ranked.remove(&key);
-                    group.0 -= file.logical_bytes;
-                    group.1 -= 1;
-                    match file.extra.identity {
-                        Field::Missing(reason) => {
-                            remove_allocation(&mut self.unique_allocation, Field::Missing(reason))
-                        }
-                        Field::Value(id) => local
-                            .links
-                            .get_mut(&id)
-                            .unwrap()
-                            .remove(file.extra.allocation),
-                    }
+                    Field::Value(id) => local
+                        .links
+                        .get_mut(&id)
+                        .unwrap()
+                        .remove(file.extra.allocation),
                 }
             }
         }
