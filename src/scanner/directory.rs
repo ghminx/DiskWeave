@@ -44,6 +44,18 @@ impl Default for Experiment {
         }
     }
 }
+impl Experiment {
+    fn for_strategy(strategy: Strategy) -> Self {
+        match strategy {
+            Strategy::Bulk => Self {
+                reuse_buffer: true,
+                ..Self::default()
+            },
+            Strategy::Experimental(options) => options,
+            _ => Self::default(),
+        }
+    }
+}
 // worker별 동기 열거 저장소. 전달하는 항목에는 이 버퍼의 참조를 보관하지 않음.
 thread_local! {static PAGE_BUFFER:std::cell::RefCell<Vec<u64>>=const{std::cell::RefCell::new(Vec::new())};}
 pub struct Entry {
@@ -68,10 +80,7 @@ pub fn collect_folder(
     use crate::scanner::profile::{scope, Stage};
     crate::output::check(cancel)?;
     let checking = scope(trace, Stage::FolderCheck);
-    let experiment = match strategy {
-        Strategy::Experimental(value) => value,
-        _ => Experiment::default(),
-    };
+    let experiment = Experiment::for_strategy(strategy);
     if strategy == Strategy::Bulk || experiment.shared_handle {
         let mut observed = false;
         let source = Native::open_observed(path, &mut |metadata| {
@@ -165,10 +174,7 @@ pub fn collect(
                 &mut source,
                 cancel,
                 emit,
-                match strategy {
-                    Strategy::Experimental(value) => value,
-                    _ => Experiment::default(),
-                },
+                Experiment::for_strategy(strategy),
             ),
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                 collect(path, Strategy::LargeFetch, cancel, emit)
