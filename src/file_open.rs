@@ -98,19 +98,11 @@ impl OpenRequest {
         item: crate::explorer::Item,
         action: OpenAction,
     ) -> Self {
-        match item {
-            crate::explorer::Item::Folder(id) => {
-                Self::new(result.folders[id].path.clone(), TargetKind::Folder, action)
-            }
-            crate::explorer::Item::File(id) => {
-                let file = &result.files[id];
-                Self::new(
-                    result.folders[file.parent].path.join(&file.name),
-                    TargetKind::File,
-                    action,
-                )
-            }
-        }
+        let kind = match item {
+            crate::explorer::Item::Folder(_) => TargetKind::Folder,
+            crate::explorer::Item::File(_) => TargetKind::File,
+        };
+        Self::new(crate::search::item_path(result, item), kind, action)
     }
 }
 

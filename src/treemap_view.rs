@@ -187,10 +187,7 @@ impl MapView {
                     if ui.button("경로 복사").clicked() {
                         let path =
                             crate::search::item_path(&output.sources[hit.source].scan, hit.item);
-                        if let Err(error) = crate::path_copy::copy_with(&[path], |text| {
-                            ui.ctx().copy_text(text);
-                            Ok(())
-                        }) {
+                        if let Err(error) = crate::path_copy::copy_to_clipboard(ui.ctx(), &[path]) {
                             ui.label(error.to_string());
                         } else {
                             ui.close();

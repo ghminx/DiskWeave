@@ -87,13 +87,7 @@ impl FileUi {
         self.importing = false;
         Ok(None)
     }
-    pub fn folder_drop(
-        &mut self,
-        paths: Vec<PathBuf>,
-        destination: PathBuf,
-        mut context: Context,
-    ) -> io::Result<()> {
-        context.paths = paths;
+    pub fn folder_drop(&mut self, destination: PathBuf, context: Context) -> io::Result<()> {
         self.begin(Kind::Copy, context)?;
         let dialog = self.dialog.as_mut().unwrap();
         dialog.destination = destination.display().to_string();
@@ -676,8 +670,14 @@ mod tests {
         ui.dialog.as_mut().unwrap().kind = Kind::Move;
         assert!(matches!(ui.request().unwrap().action, Action::Move { .. }));
         let mut ui = FileUi::default();
-        ui.folder_drop(paths.clone(), "C:\\fixture\\to".into(), context.clone())
-            .unwrap();
+        ui.folder_drop(
+            "C:\\fixture\\to".into(),
+            Context {
+                paths: paths.clone(),
+                ..context.clone()
+            },
+        )
+        .unwrap();
         assert_eq!(ui.dialog.as_ref().unwrap().destination, "C:\\fixture\\to");
         assert_eq!(ui.request().unwrap().paths, paths);
         let mut readonly = context;

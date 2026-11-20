@@ -282,12 +282,9 @@ impl AnalysisPanel {
                         response.context_menu(|ui| {
                             crate::ui_style::menu_spacing(ui);
                             if ui.button("경로 복사").clicked() {
-                                if let Err(error) = crate::path_copy::copy_with(
+                                if let Err(error) = crate::path_copy::copy_to_clipboard(
+                                    ui.ctx(),
                                     &[crate::search::item_path(&source.scan, hit.item)],
-                                    |text| {
-                                        ui.ctx().copy_text(text);
-                                        Ok(())
-                                    },
                                 ) {
                                     ui.label(error.to_string());
                                 } else {

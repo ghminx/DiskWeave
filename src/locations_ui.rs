@@ -524,10 +524,9 @@ impl LocationsView {
                                         )
                                     })
                                     .collect();
-                                if let Err(error) = crate::path_copy::copy_with(&paths, |text| {
-                                    ui.ctx().copy_text(text);
-                                    Ok(())
-                                }) {
+                                if let Err(error) =
+                                    crate::path_copy::copy_to_clipboard(ui.ctx(), &paths)
+                                {
                                     ui.label(error.to_string());
                                 } else {
                                     ui.close();

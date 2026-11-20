@@ -1,5 +1,12 @@
 use std::{io, path::PathBuf};
 
+pub fn copy_to_clipboard(ctx: &eframe::egui::Context, paths: &[PathBuf]) -> io::Result<()> {
+    copy_with(paths, |text| {
+        ctx.copy_text(text);
+        Ok(())
+    })
+}
+
 /// 파일 접근 없이 선택 경로를 그대로 클립보드 전달 경계에 제공.
 pub fn copy_with(
     paths: &[PathBuf],

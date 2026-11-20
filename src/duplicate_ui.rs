@@ -387,12 +387,9 @@ impl DuplicateUi {
                                     }
                                 });
                                 if ui.button("경로 복사").clicked() {
-                                    self.error = crate::path_copy::copy_with(
+                                    self.error = crate::path_copy::copy_to_clipboard(
+                                        ui.ctx(),
                                         std::slice::from_ref(&member.path),
-                                        |text| {
-                                            ui.ctx().copy_text(text);
-                                            Ok(())
-                                        },
                                     )
                                     .err()
                                     .map(|e| e.to_string());

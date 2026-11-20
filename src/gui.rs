@@ -589,31 +589,6 @@ impl DiskWeaveApp {
         paths
     }
     fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
-        let mut selected = if self.locations_view.global_mode {
-            self.locations_view.selected_targets()
-        } else {
-            self.source()
-                .map(|s| {
-                    self.search
-                        .job
-                        .results()
-                        .map(|r| {
-                            self.search
-                                .selection
-                                .rows()
-                                .filter_map(|row| r.items.get(row).copied())
-                                .map(|item| (s.id, s.generation, item))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default()
-        };
-        if selected.is_empty() {
-            if let Some(target) = self.selection_target() {
-                selected.push(target);
-            }
-        }
         let mut writable = self.archive_record.is_none()
             && self.tab != 4
             && !self.duplicates.running()
@@ -632,6 +607,24 @@ impl DiskWeaveApp {
             }
             paths
         } else {
+            let mut selected = if self.locations_view.global_mode {
+                self.locations_view.selected_targets()
+            } else {
+                self.source()
+                    .zip(self.search.job.results())
+                    .map(|(source, results)| {
+                        self.search
+                            .selection
+                            .rows()
+                            .filter_map(|row| results.items.get(row).copied())
+                            .map(|item| (source.id, source.generation, item))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            if selected.is_empty() {
+                selected.extend(self.selection_target());
+            }
             selected
                 .iter()
                 .filter_map(|(id, generation, item)| {
@@ -1285,10 +1278,7 @@ impl DiskWeaveApp {
                             .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다"))?;
                         let path =
                             crate::search::item_path(&entry.scan.completed().unwrap().result, item);
-                        crate::path_copy::copy_with(&[path], |text| {
-                            ctx.copy_text(text);
-                            Ok(())
-                        })?;
+                        crate::path_copy::copy_to_clipboard(ctx, &[path])?;
                     }
                 }
                 Ok(())
@@ -1688,12 +1678,9 @@ impl DiskWeaveApp {
             }
             Some(Action::CopyPath) => {
                 let paths = self.copy_selection_paths();
-                self.input_error = crate::path_copy::copy_with(&paths, |text| {
-                    ctx.copy_text(text);
-                    Ok(())
-                })
-                .err()
-                .map(|e| e.to_string());
+                self.input_error = crate::path_copy::copy_to_clipboard(ctx, &paths)
+                    .err()
+                    .map(|e| e.to_string());
             }
             _ => {}
         }
@@ -3573,12 +3560,9 @@ impl eframe::App for DiskWeaveApp {
         }
         if let Some(paths) = self.file_ui.copy_requested.take() {
             let paths = paths.unwrap_or_else(|| self.copy_selection_paths());
-            self.input_error = crate::path_copy::copy_with(&paths, |text| {
-                ui.ctx().copy_text(text);
-                Ok(())
-            })
-            .err()
-            .map(|e| e.to_string());
+            self.input_error = crate::path_copy::copy_to_clipboard(ui.ctx(), &paths)
+                .err()
+                .map(|e| e.to_string());
         }
         if let Some((kind, paths)) = self.file_ui.requested.take() {
             self.begin_file_action(kind, paths);
@@ -3589,7 +3573,7 @@ impl eframe::App for DiskWeaveApp {
             .take()
             .or_else(|| self.locations_view.drop_requested.take())
         {
-            let mut context = self.file_context(Some(paths.clone()));
+            let mut context = self.file_context(Some(paths));
             for entry in &self.scan.entries {
                 if crate::file_ops::contains_path(&entry.path, &destination).unwrap_or(true) {
                     context.writable &= !entry.stale && entry.scan.completed().is_some();
@@ -3597,7 +3581,7 @@ impl eframe::App for DiskWeaveApp {
             }
             self.input_error = self
                 .file_ui
-                .folder_drop(paths, destination, context)
+                .folder_drop(destination, context)
                 .err()
                 .map(|e| e.to_string());
         }
@@ -3668,6 +3652,46 @@ impl eframe::App for DiskWeaveApp {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn explicit_file_actions_use_their_own_paths_and_keep_stale_locations_read_only() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let marked = fixture.0.join("선택한 파일.txt");
+        let dropped = fixture.0.join("내려놓을 파일.txt");
+        std::fs::write(&marked, b"selected").unwrap();
+        std::fs::write(&dropped, b"dropped").unwrap();
+        let mut app = DiskWeaveApp::new();
+        let id = app.scan.add(&fixture.0).unwrap();
+        app.scan.start_selected(&[id]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        let marked_id = source
+            .scan
+            .files
+            .iter()
+            .position(|file| file.name == "선택한 파일.txt")
+            .unwrap();
+        app.detail_target = Some((source.id, source.generation, Item::File(marked_id)));
+        assert_eq!(app.copy_selection_paths(), [marked]);
+
+        let context = app.file_context(Some(vec![dropped.clone()]));
+        assert!(context.writable);
+        assert_eq!(context.paths, std::slice::from_ref(&dropped));
+        assert_eq!(context.protected, std::slice::from_ref(&fixture.0));
+        app.scan.entries[0].stale = true;
+        let context = app.file_context(Some(vec![dropped]));
+        assert!(!context.writable);
+        assert!(app
+            .file_ui
+            .begin(crate::file_ui::Kind::Copy, context)
+            .is_err());
+    }
+
     #[test]
     fn search_match_statistics_and_whole_folder_map_keep_distinct_totals() {
         let fixture = crate::duplicates::tests::Fixture::new();
