@@ -1,4 +1,4 @@
-use crate::{locations::Snapshot, metadata::Identity};
+use crate::{explorer::Item, locations::Snapshot, metadata::Identity, search::item_path};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -171,22 +171,17 @@ fn digest(
             progress.bytes += 65536;
             notify(*progress);
         }
-        if stamp(&f)? != member.stamp {
-            return Err(io::Error::other("읽는 동안 파일이 변경됨"));
+    } else {
+        loop {
+            crate::output::check(cancelled)?;
+            let n = f.read(buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.add(&buffer[..n])?;
+            progress.bytes += n as u64;
+            notify(*progress);
         }
-
-        notify(*progress);
-        return hash.finish();
-    }
-    loop {
-        crate::output::check(cancelled)?;
-        let n = f.read(buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.add(&buffer[..n])?;
-        progress.bytes += n as u64;
-        notify(*progress);
     }
     if stamp(&f)? != member.stamp {
         return Err(io::Error::other("읽는 동안 파일이 변경됨"));
@@ -224,7 +219,7 @@ pub fn inspect(
             ));
         }
     }
-    let mut sizes: BTreeMap<u64, Vec<Member>> = BTreeMap::new();
+    let mut sizes: BTreeMap<u64, Vec<(usize, usize, Stamp)>> = BTreeMap::new();
     for (source, snapshot) in report.sources.iter().enumerate() {
         let mut collect = |file: usize| -> io::Result<()> {
             crate::output::check(cancelled)?;
@@ -234,40 +229,38 @@ pub fn inspect(
                 report.empty += 1;
                 return Ok(());
             }
-            let path = snapshot.scan.folders[entry.parent].path.join(&entry.name);
+            let path = || item_path(&snapshot.scan, Item::File(file));
             if entry.attributes & REMOTE_CONTENT != 0 {
                 report.issues.push(Issue {
-                    path,
+                    path: path(),
                     reason: "로컬에 없는 파일 내용은 검사하지 않음".into(),
                 });
                 return Ok(());
             }
             let Some(id) = entry.extra.identity.value() else {
                 report.issues.push(Issue {
-                    path,
+                    path: path(),
                     reason: "파일 ID 미확인".into(),
                 });
                 return Ok(());
             };
             let Some(modified) = entry.modified else {
                 report.issues.push(Issue {
-                    path,
+                    path: path(),
                     reason: "수정 시각 미확인".into(),
                 });
                 return Ok(());
             };
 
-            sizes.entry(entry.logical_bytes).or_default().push(Member {
+            sizes.entry(entry.logical_bytes).or_default().push((
                 source,
                 file,
-                path,
-                bytes: entry.logical_bytes,
-                stamp: Stamp {
+                Stamp {
                     id,
                     bytes: entry.logical_bytes,
                     modified,
                 },
-            });
+            ));
             Ok(())
         };
         match scope {
@@ -293,8 +286,15 @@ pub fn inspect(
     for members in sizes.into_values().filter(|v| v.len() > 1) {
         let mut objects: std::collections::HashMap<Identity, Vec<Member>> =
             std::collections::HashMap::new();
-        for member in members {
+        for (source, file, stamp) in members {
             crate::output::check(cancelled)?;
+            let member = Member {
+                source,
+                file,
+                path: item_path(&report.sources[source].scan, Item::File(file)),
+                bytes: stamp.bytes,
+                stamp,
+            };
             match open(&member) {
                 Ok(_) => objects.entry(member.stamp.id).or_default().push(member),
                 Err(e) => report.issues.push(Issue {
@@ -392,12 +392,11 @@ pub fn inspect(
         group.retain(|m| valid[&m.path]);
     }
     report.groups.retain(|group| {
-        group
-            .iter()
-            .map(|m| m.stamp.id)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            > 1
+        group.first().is_some_and(|first| {
+            group[1..]
+                .iter()
+                .any(|member| member.stamp.id != first.stamp.id)
+        })
     });
     report.links.retain(|group| group.len() > 1);
     let mut reported = std::collections::HashSet::new();
