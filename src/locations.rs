@@ -39,8 +39,8 @@ impl Snapshot {
             crate::explorer::Item::Folder(id) => id,
             crate::explorer::Item::File(id) => self.scan.files[id].parent,
         };
-        let mut explorer = crate::explorer::Explorer::new(&self.scan);
-        explorer.open_folder(&self.scan, folder);
+        let mut explorer =
+            crate::explorer::Explorer::with_expanded(&self.scan, folder, Default::default());
         explorer.select(item);
         explorer
     }

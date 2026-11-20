@@ -31,27 +31,27 @@ impl Explorer {
             return self.rebase(old, new);
         }
         let remap = |item| before.key(item).and_then(|key| after.item(key));
-        let mut next = Self::new(new);
-        let mut parent = Some(self.folder);
-        while let Some(folder) = parent {
-            if let Some(Item::Folder(folder)) = remap(Item::Folder(folder)) {
-                next.open_folder(new, folder);
-                break;
-            }
-            parent = old.folders[folder].parent;
+        let remap_folder = |folder| match remap(Item::Folder(folder)) {
+            Some(Item::Folder(id)) => Some(id),
+            _ => None,
+        };
+        let folder = std::iter::successors(Some(self.folder), |&id| old.folders[id].parent)
+            .find_map(remap_folder)
+            .unwrap_or(0);
+        let expanded = self
+            .expanded
+            .iter()
+            .copied()
+            .filter_map(remap_folder)
+            .collect();
+        let mut next = Self::with_expanded(new, folder, expanded);
+        if let Some(item) = remap(self.selected) {
+            next.select(item);
         }
-        for &folder in &self.expanded {
-            if let Some(Item::Folder(folder)) = remap(Item::Folder(folder)) {
-                next.expanded.insert(folder);
-            }
-        }
-        next.selected = remap(self.selected).unwrap_or(Item::Folder(next.folder));
-        next.rebuild_tree(new);
         next
     }
     /// 변경 세대의 인덱스를 경로로 다시 연결하고 사라진 폴더는 남은 상위로 복귀.
     pub fn rebase(&self, old: &ScanResult, new: &ScanResult) -> Self {
-        let mut next = Self::new(new);
         let folders: HashMap<_, _> = new
             .folders
             .iter()
@@ -68,26 +68,21 @@ impl Explorer {
             };
             path = parent;
         };
-        next.open_folder(new, folder);
-        for id in &self.expanded {
-            if let Some(&id) = folders.get(old.folders[*id].path.as_path()) {
-                next.expanded.insert(id);
-            }
-        }
-        let selected = match self.selected {
-            Item::Folder(id) => old.folders[id].path.clone(),
-            Item::File(id) => old.folders[old.files[id].parent]
-                .path
-                .join(&old.files[id].name),
-        };
+        let expanded = self
+            .expanded
+            .iter()
+            .filter_map(|&id| folders.get(old.folders[id].path.as_path()).copied())
+            .collect();
+        let mut next = Self::with_expanded(new, folder, expanded);
+        let selected = crate::search::item_path(old, self.selected);
         if let Some(&id) = folders.get(selected.as_path()) {
-            next.selected = Item::Folder(id);
-        } else if let Some(id) = new.files.iter().enumerate().find_map(|(id, f)| {
-            (new.folders[f.parent].path.join(&f.name) == selected).then_some(id)
-        }) {
-            next.selected = Item::File(id);
+            next.select(Item::Folder(id));
+        } else if let Some(id) = selected
+            .parent()
+            .and_then(|parent| new.file_named(*folders.get(parent)?, selected.file_name()?))
+        {
+            next.select(Item::File(id));
         }
-        next.rebuild_tree(new);
         next
     }
     pub fn new(result: &ScanResult) -> Self {

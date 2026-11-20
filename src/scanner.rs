@@ -376,6 +376,13 @@ impl ScanResult {
         Ok(index)
     }
 
+    pub(crate) fn file_named(&self, folder: usize, name: &std::ffi::OsStr) -> Option<usize> {
+        self.file_children[folder]
+            .iter()
+            .copied()
+            .find(|&id| self.files[id].name == name)
+    }
+
     pub fn search_folders(&self, query: &str) -> Vec<usize> {
         let query = query.to_lowercase();
         let mut matches: Vec<_> = self

@@ -1497,6 +1497,19 @@ impl DiskWeaveApp {
         }
         self.remember_navigation(previous);
     }
+    pub fn select_registered_location(&mut self, id: u64) {
+        let Some(location) = self.scan.get(id) else {
+            return;
+        };
+        let path = location.path.clone();
+        let previous = self.capture_navigation();
+        self.locations_view.set_global_mode(false);
+        self.scan.choose(id);
+        self.target.choose_registered(path);
+        self.input_error = None;
+        self.sync_scan();
+        self.remember_navigation(previous);
+    }
     pub fn capture_navigation(&self) -> Option<crate::navigation::ViewState> {
         if self.archive_record.is_some() {
             return None;
@@ -1539,8 +1552,8 @@ impl DiskWeaveApp {
         };
         self.scan.choose(resolved.source.id);
         self.sync_scan();
-        let mut explorer = Explorer::new(&resolved.source.scan);
-        explorer.open_folder(&resolved.source.scan, resolved.folder);
+        let mut explorer =
+            Explorer::with_expanded(&resolved.source.scan, resolved.folder, Default::default());
         if let Some(item) = resolved.selected.first() {
             explorer.select(*item);
         }
@@ -1999,16 +2012,12 @@ impl DiskWeaveApp {
                         ui.menu_button("분석 위치 관리", |ui| {
                             ui.set_max_width(420.0);
                             ui.add_enabled_ui(editable, |ui| {
-                                let previous = self.capture_navigation();
-                                if let Some(path) = self.locations_view.controls(
+                                if let Some(id) = self.locations_view.controls(
                                     ui,
                                     &mut self.scan,
                                     self.target.path(),
                                 ) {
-                                    self.target.choose_registered(path);
-                                    self.input_error = None;
-                                    self.sync_scan();
-                                    self.remember_navigation(previous);
+                                    self.select_registered_location(id);
                                 }
                             });
                         });
@@ -3796,6 +3805,59 @@ mod session_tests {
         assert!(!serialized.contains("find-me"));
         assert!(!serialized.contains(&fixture.0.display().to_string()));
     }
+    #[test]
+    fn selecting_an_offline_location_preserves_global_search_in_history() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let first = fixture.0.join("first");
+        let offline = fixture.0.join("offline");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&offline).unwrap();
+        let hit = first.join("자료.bin");
+        std::fs::write(&hit, b"data").unwrap();
+
+        let mut app = DiskWeaveApp::new();
+        let first_id = app.scan.add(&first).unwrap();
+        let offline_id = app.scan.add(&offline).unwrap();
+        app.scan.start_selected(&[first_id, offline_id]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        std::fs::remove_dir(&offline).unwrap();
+
+        app.search.input.text = "자료".into();
+        app.locations_view.set_global_mode(true);
+        app.locations_view.refresh(&app.scan, &app.search.input);
+        while app.locations_view.results().is_none() {
+            app.locations_view.refresh(&app.scan, &app.search.input);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.locations_view.select_result(0, false, false);
+        app.search.vertical_offset = 27.0;
+        app.select_registered_location(offline_id);
+        assert_eq!(app.target.path(), Some(offline.as_path()));
+        assert_eq!(app.scan.selected_id(), Some(offline_id));
+        assert!(!app.locations_view.global_mode);
+
+        app.history_move(false);
+        assert_eq!(app.scan.selected_id(), Some(first_id));
+        assert!(app.locations_view.global_mode);
+        assert_eq!(app.search.input.text, "자료");
+        assert_eq!(app.search.vertical_offset, 27.0);
+        while app.locations_view.selected_targets().is_empty() {
+            app.locations_view.refresh(&app.scan, &app.search.input);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.copy_selection_paths(), vec![hit]);
+        app.history_move(true);
+        assert_eq!(app.scan.selected_id(), Some(offline_id));
+        assert!(!app.locations_view.global_mode);
+    }
+
     #[test]
     fn a_new_app_starts_an_empty_general_session_and_does_not_restore_previous_results() {
         let app = DiskWeaveApp::new();

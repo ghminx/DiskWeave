@@ -675,15 +675,14 @@ mod tests {
             std::env::temp_dir().join(format!("diskweave-result-handoff-{}", std::process::id()));
         std::fs::create_dir_all(root.join("a/deep")).unwrap();
         std::fs::create_dir_all(root.join("b/child")).unwrap();
-        std::fs::write(root.join("a/deep/kept.bin"), b"123").unwrap();
+        std::fs::write(root.join("a/deep/자료.bin"), b"123").unwrap();
+        std::fs::write(root.join("b/child/자료.bin"), b"other").unwrap();
         let old = Arc::new(crate::scanner::scan(&root, || false).unwrap());
         let mut explorer = Explorer::new(&old);
         explorer.toggle_folder(&old, old.folder_index(std::path::Path::new("b")).unwrap());
-        explorer.open_folder(
-            &old,
-            old.folder_index(std::path::Path::new("a/deep")).unwrap(),
-        );
-        explorer.select(Item::File(0));
+        let folder = old.folder_index(std::path::Path::new("a/deep")).unwrap();
+        explorer.open_folder(&old, folder);
+        explorer.select(Item::File(old.file_children[folder][0]));
         let mut view = SearchView::default();
         view.input.text = "bin".into();
         view.refresh(&old, explorer.folder());
@@ -696,17 +695,18 @@ mod tests {
         assert_eq!(new.folders[explorer.folder()].path, root.join("a/deep"));
         assert_eq!(
             crate::search::item_path(&new, explorer.selected()),
-            root.join("a/deep/kept.bin")
+            root.join("a/deep/자료.bin")
         );
         assert!(explorer.is_expanded(new.folder_index(std::path::Path::new("b")).unwrap()));
         assert_eq!(view.input.text, "bin");
         assert_eq!(view.selection.count(), 1);
-        std::fs::remove_file(root.join("a/deep/kept.bin")).unwrap();
+        std::fs::remove_file(root.join("a/deep/자료.bin")).unwrap();
         std::fs::remove_dir(root.join("a/deep")).unwrap();
         let next = Arc::new(crate::scanner::scan(&root, || false).unwrap());
         let explorer = view.replace_result(Some(&explorer), Some(&new), &next, None);
         wait(&mut view);
         assert_eq!(next.folders[explorer.folder()].path, root.join("a"));
+        assert_eq!(explorer.selected(), Item::Folder(explorer.folder()));
         assert_eq!(view.selection.count(), 0);
         let initial = view.replace_result(None, None, &next, None);
         assert_eq!(initial.folder(), 0);

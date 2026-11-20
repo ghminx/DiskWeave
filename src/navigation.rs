@@ -50,9 +50,9 @@ impl ViewState {
                 .parent()
                 .and_then(|p| source.scan.folder_index(p).ok())
             {
-                if let Some(&id) = source.scan.file_children[parent]
-                    .iter()
-                    .find(|&&i| Some(source.scan.files[i].name.as_os_str()) == target.file_name())
+                if let Some(id) = target
+                    .file_name()
+                    .and_then(|name| source.scan.file_named(parent, name))
                 {
                     selected.push(Item::File(id));
                 }

@@ -115,14 +115,23 @@ impl LocationsView {
         });
     }
     pub fn choose_scope(&mut self, view: &mut SearchView, scope: crate::search_view::SearchScope) {
-        self.live_selection = None;
         view.invalidate();
+        self.invalidate_global_search();
+        self.global_mode = scope == crate::search_view::SearchScope::Registered;
+        view.whole_scan = scope == crate::search_view::SearchScope::Location;
+    }
+    pub(crate) fn set_global_mode(&mut self, global: bool) {
+        if self.global_mode != global {
+            self.global_mode = global;
+            self.invalidate_global_search();
+        }
+    }
+    fn invalidate_global_search(&mut self) {
+        self.live_selection = None;
         self.selection.clear();
         self.selection_changed = true;
         self.job.cancel();
         self.key = None;
-        self.global_mode = scope == crate::search_view::SearchScope::Registered;
-        view.whole_scan = scope == crate::search_view::SearchScope::Location;
     }
     pub fn select_result(&mut self, row: usize, ctrl: bool, shift: bool) {
         self.selection.click(row, ctrl, shift);
@@ -253,9 +262,8 @@ impl LocationsView {
         ui: &mut egui::Ui,
         locations: &mut Locations,
         target: Option<&Path>,
-    ) -> Option<PathBuf> {
-        let mut path = None;
-        let previous_global = self.global_mode;
+    ) -> Option<u64> {
+        let mut choose = None;
         ui.scope(|ui| {
             ui.strong("등록한 분석 위치");
             ui.small("목록에서 제거해도 원본 파일은 삭제되지 않습니다.");
@@ -288,7 +296,6 @@ impl LocationsView {
                     self.error = locations.start_selected(&ids).err().map(|e| e.to_string());
                 }
             });
-            let mut choose = None;
             let mut remove = None;
             let running = locations.is_running();
             let selected = locations.selected_id();
@@ -306,7 +313,6 @@ impl LocationsView {
                         .clicked()
                     {
                         choose = Some(entry.id);
-                        self.global_mode = false;
                     }
                     let state = if entry.scan.is_running() {
                         "스캔 중"
@@ -332,10 +338,6 @@ impl LocationsView {
                     }
                 });
             }
-            if let Some(id) = choose {
-                locations.choose(id);
-                path = locations.get(id).map(|entry| entry.path.clone());
-            }
             if let Some(id) = remove {
                 self.error = locations.remove(id).err().map(|e| e.to_string());
             }
@@ -343,17 +345,12 @@ impl LocationsView {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
         });
-        if locations.snapshots().len() > 1 || self.global_mode {
-            ui.checkbox(&mut self.global_mode, "모든 스캔 위치에서 검색");
+        let mut global = self.global_mode;
+        if locations.snapshots().len() > 1 || global {
+            ui.checkbox(&mut global, "모든 스캔 위치에서 검색");
+            self.set_global_mode(global);
         }
-        if previous_global != self.global_mode {
-            self.live_selection = None;
-            self.selection.clear();
-            self.selection_changed = true;
-            self.key = None;
-            self.job.cancel();
-        }
-        path
+        choose
     }
 
     pub fn global(
