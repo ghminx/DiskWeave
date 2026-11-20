@@ -45,20 +45,24 @@ impl QuickSearch {
         if !self.visible {
             return;
         }
-        let request = (self.text.clone(), self.mode, locations.epoch);
-        if self.request.as_ref() != Some(&request) {
-            if self
+        let edited = self
+            .request
+            .as_ref()
+            .is_none_or(|(text, mode, _)| text != &self.text || *mode != self.mode);
+        if edited
+            || self
                 .request
                 .as_ref()
-                .is_none_or(|previous| previous.0 != request.0 || previous.1 != request.1)
-            {
+                .is_some_and(|(_, _, epoch)| *epoch != locations.epoch)
+        {
+            if edited {
                 self.job.cancel();
                 self.due = Some(now + Duration::from_millis(150));
             } else if self.due.is_none() {
                 self.due = Some(now);
             }
             self.selection = None;
-            self.request = Some(request);
+            self.request = Some((self.text.clone(), self.mode, locations.epoch));
         }
         if self.text.trim().is_empty() {
             self.due = None;
@@ -169,6 +173,16 @@ mod tests {
         quick.step(-1);
         quick.step(-1);
         assert_eq!(quick.selection, Some(0));
+        let previous = quick.job.results.clone().unwrap();
+        fs::create_dir(root.join("unscanned")).unwrap();
+        locations.add(&root.join("unscanned")).unwrap();
+        quick.tick(&locations, Instant::now());
+        assert!(quick.selection.is_none());
+        assert!(!quick.pending());
+        assert!(std::sync::Arc::ptr_eq(
+            quick.job.results.as_ref().unwrap(),
+            &previous
+        ));
         // 이전 요청이 끝나기 전 조건 변경 시 최신 경로 검색만 게시
         quick.text = "no-match".into();
         quick.tick(&locations, Instant::now());

@@ -125,12 +125,27 @@ impl GlobalController {
             .latest
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        if self.cached.as_ref().is_some_and(|(key, _)| key != &input) {
-            self.cached = None;
+        self.error = None;
+        if let Some((key, cached)) = &self.cached {
+            if key != &input {
+                self.cached = None;
+            } else if sources.len() == cached.sources.len()
+                && sources.iter().zip(&cached.sources).all(|(now, old)| {
+                    now.id == old.id
+                        && now.generation == old.generation
+                        && Arc::ptr_eq(&now.scan, &old.scan)
+                        && now.entries.as_ref().map(Arc::as_ptr)
+                            == old.entries.as_ref().map(Arc::as_ptr)
+                })
+            {
+                self.pending = None;
+                self.results = Some(Arc::clone(cached));
+                self.running = false;
+                return;
+            }
         }
         self.pending = Some((id, sources, input));
         self.results = None;
-        self.error = None;
         self.running = true;
         self.launch();
     }
@@ -366,6 +381,37 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn unchanged_sources_keep_results_and_discard_an_obsolete_refresh() {
+        use std::time::{Duration, Instant};
+        let (source, _) = crate::usn::stream::tests::folder_move_snapshots();
+        let mut controller = GlobalController::default();
+        let input = SearchInput::default();
+        controller.submit(vec![source.clone()], input.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.running {
+            controller.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let cached = controller.results.clone().unwrap();
+        let mut renewed = source.clone();
+        renewed.generation += 1;
+        controller.submit(vec![renewed], input.clone());
+        assert!(controller.running);
+        controller.submit(vec![source], input);
+        assert!(!controller.running);
+        assert!(Arc::ptr_eq(controller.results.as_ref().unwrap(), &cached));
+
+        controller.submit(vec![], SearchInput::default());
+        while controller.running {
+            controller.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(controller.results.as_ref().unwrap().sources.is_empty());
+    }
+
     #[test]
     fn global_controller_only_publishes_latest_request_and_reports_errors() {
         use std::time::{Duration, Instant};

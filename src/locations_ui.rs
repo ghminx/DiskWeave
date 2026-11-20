@@ -208,8 +208,11 @@ impl LocationsView {
     }
     pub fn refresh(&mut self, locations: &Locations, input: &SearchInput) {
         self.job.poll();
-        let key = (locations.epoch, input.clone());
-        if self.key.as_ref() != Some(&key) {
+        if self
+            .key
+            .as_ref()
+            .is_none_or(|(epoch, previous)| *epoch != locations.epoch || previous != input)
+        {
             if self
                 .live_selection
                 .as_ref()
@@ -219,7 +222,7 @@ impl LocationsView {
             }
             self.reconnect_selection(locations);
             self.job.submit(locations.snapshots(), input.clone());
-            self.key = Some(key);
+            self.key = Some((locations.epoch, input.clone()));
             self.selection.clear();
             self.selection_changed = true;
         }
