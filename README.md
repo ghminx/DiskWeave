@@ -8,7 +8,7 @@ Windows 10/11 x64용 디스크 용량 분석·파일 관리 프로그램. 분석
 
 ## 실행
 
-Portable ZIP은 `tools/Build-Portable.ps1`로 생성함. 압축을 푼 뒤 `DiskWeave.exe`를 실행하며 설치가 필요하지 않음. 화면·단축키 설정만 사용자 LocalAppData에 저장하고 분석 목록·검색어·탐색 이력은 저장하지 않음. [사용 안내](docs/portable-readme.md), [v0.1.0 프리뷰](docs/releases/v0.1.0.md), [사용성·배포 검증 및 한계](docs/usability-release.md) 참조.
+Portable ZIP은 GitHub 릴리스에서 받거나 `tools/Build-Portable.ps1`로 생성할 수 있음. 압축을 푼 뒤 `DiskWeave.exe`를 실행하며 설치가 필요하지 않음. 화면·단축키 설정만 사용자 LocalAppData에 저장하고 분석 목록·검색어·탐색 이력은 저장하지 않음. [v0.1.0 프리뷰 다운로드](https://github.com/ghminx/DiskWeave/releases/tag/v0.1.0), [사용 안내](docs/portable-readme.md), [사용성·배포 검증 및 한계](docs/usability-release.md) 참조.
 
 현재 DiskWeave 프리뷰는 [Apache License 2.0](LICENSE)로 제공함. 프로젝트 저작권 및 출처는 [NOTICE](NOTICE)에 기록함. Portable ZIP에 의존성 및 글꼴의 별도 라이선스 고지를 포함함.
 
