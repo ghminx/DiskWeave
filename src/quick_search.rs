@@ -47,10 +47,18 @@ impl QuickSearch {
         }
         let request = (self.text.clone(), self.mode, locations.epoch);
         if self.request.as_ref() != Some(&request) {
-            self.job.cancel();
+            if self
+                .request
+                .as_ref()
+                .is_none_or(|previous| previous.0 != request.0 || previous.1 != request.1)
+            {
+                self.job.cancel();
+                self.due = Some(now + Duration::from_millis(150));
+            } else if self.due.is_none() {
+                self.due = Some(now);
+            }
             self.selection = None;
             self.request = Some(request);
-            self.due = Some(now + Duration::from_millis(150));
         }
         if self.text.trim().is_empty() {
             self.due = None;
@@ -179,8 +187,16 @@ mod tests {
         assert_eq!(quick.selected(&locations).unwrap().0, b);
         locations.tracking_failed(b);
         assert!(quick.selected(&locations).is_err());
-        quick.tick(&locations, Instant::now());
+        let changed_at = Instant::now();
+        quick.tick(&locations, changed_at);
         assert!(quick.selection.is_none());
+        assert!(quick.job.running || quick.job.results.is_some());
+        while quick.job.running {
+            quick.tick(&locations, changed_at);
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert!(quick.job.results.as_ref().unwrap().hits.is_empty());
         quick.hide();
         assert!(!quick.visible);
         assert_eq!(quick.text, "b\\model");

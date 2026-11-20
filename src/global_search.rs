@@ -45,12 +45,76 @@ pub fn search_all(
     })
 }
 
+// 같은 검색 조건의 직전 결과를 확인된 변경분으로 갱신하고 순서가 불명확하면 전체 검색.
+fn refresh_all(
+    previous: &GlobalResults,
+    sources: Vec<Snapshot>,
+    input: &SearchInput,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<GlobalResults> {
+    crate::output::check(&cancelled)?;
+    if sources.len() != previous.sources.len()
+        || sources
+            .iter()
+            .zip(&previous.sources)
+            .any(|(now, old)| now.id != old.id)
+    {
+        return search_all(sources, input, cancelled);
+    }
+    let query = input.compile(0)?;
+    let mut changes = Vec::with_capacity(sources.len());
+    let mut unknown_dates = previous.unknown_dates;
+    for (now, old) in sources.iter().zip(&previous.sources) {
+        if Arc::ptr_eq(&now.scan, &old.scan) {
+            changes.push(None);
+            continue;
+        }
+        let Some(change) =
+            crate::search::matching_changes(&old.scan, &now.scan, &query, 0, &cancelled)?
+        else {
+            return search_all(sources, input, cancelled);
+        };
+        unknown_dates = unknown_dates - change.unknown_before + change.unknown_after;
+        changes.push(Some(change));
+    }
+    let mut hits = Vec::with_capacity(previous.hits.len());
+    for chunk in previous.hits.chunks(4096) {
+        crate::output::check(&cancelled)?;
+        hits.extend(chunk.iter().filter_map(|&hit| match &changes[hit.source] {
+            Some(change) => change.retained(hit.item).map(|item| Hit { item, ..hit }),
+            None => Some(hit),
+        }));
+    }
+    for (source, change) in changes.into_iter().enumerate() {
+        let Some(change) = change else { continue };
+        for item in change.added {
+            crate::output::check(&cancelled)?;
+            let key = SortKey::new(&sources[source].scan, item, input.sort);
+            let at = hits.partition_point(|hit| {
+                SortKey::new(&sources[hit.source].scan, hit.item, input.sort)
+                    .compare(&key, input.descending, false)
+                    .is_lt()
+            });
+            hits.insert(at, Hit { source, item });
+        }
+    }
+    crate::output::check(&cancelled)?;
+    Ok(GlobalResults {
+        sources,
+        hits,
+        unknown_dates,
+    })
+}
+
+type SearchResponse = (u64, SearchInput, io::Result<GlobalResults>);
+
 #[derive(Default)]
 pub struct GlobalController {
     latest: Arc<std::sync::atomic::AtomicU64>,
-    active: Option<std::sync::mpsc::Receiver<(u64, io::Result<GlobalResults>)>>,
+    active: Option<std::sync::mpsc::Receiver<SearchResponse>>,
     pending: Option<(u64, Vec<Snapshot>, SearchInput)>,
-    pub results: Option<GlobalResults>,
+    cached: Option<(SearchInput, Arc<GlobalResults>)>,
+    pub results: Option<Arc<GlobalResults>>,
     pub error: Option<String>,
     pub running: bool,
 }
@@ -61,6 +125,9 @@ impl GlobalController {
             .latest
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        if self.cached.as_ref().is_some_and(|(key, _)| key != &input) {
+            self.cached = None;
+        }
         self.pending = Some((id, sources, input));
         self.results = None;
         self.error = None;
@@ -75,12 +142,15 @@ impl GlobalController {
             return;
         };
         let latest = Arc::clone(&self.latest);
+        let previous = self.cached.as_ref().map(|(_, results)| Arc::clone(results));
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = search_all(sources, &input, || {
-                latest.load(std::sync::atomic::Ordering::Relaxed) != id
-            });
-            let _ = sender.send((id, result));
+            let cancelled = || latest.load(std::sync::atomic::Ordering::Relaxed) != id;
+            let result = match previous {
+                Some(previous) => refresh_all(&previous, sources, &input, cancelled),
+                None => search_all(sources, &input, cancelled),
+            };
+            let _ = sender.send((id, input, result));
         });
         self.active = Some(receiver);
     }
@@ -95,11 +165,20 @@ impl GlobalController {
         };
         self.active = None;
         match response {
-            Some((id, result)) if id == self.latest.load(std::sync::atomic::Ordering::Relaxed) => {
+            Some((id, input, result))
+                if id == self.latest.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
                 self.running = false;
                 match result {
-                    Ok(results) => self.results = Some(results),
-                    Err(error) => self.error = Some(error.to_string()),
+                    Ok(results) => {
+                        let results = Arc::new(results);
+                        self.cached = Some((input, Arc::clone(&results)));
+                        self.results = Some(results);
+                    }
+                    Err(error) => {
+                        self.cached = None;
+                        self.error = Some(error.to_string());
+                    }
                 }
             }
             None if self.pending.is_none() && self.running => {
@@ -114,6 +193,7 @@ impl GlobalController {
         self.latest
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending = None;
+        self.cached = None;
         self.results = None;
         self.error = None;
         self.running = false;
@@ -128,6 +208,31 @@ impl Drop for GlobalController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_folder_move_updates_path_hits_without_traversing_unrelated_items() {
+        let (previous, current) = crate::usn::stream::tests::folder_move_snapshots();
+        let input = SearchInput {
+            text: "z\\a".into(),
+            mode: crate::search::SearchMode::Path,
+            kind: crate::search::EntryKind::Files,
+            ..Default::default()
+        };
+        let old = search_all(vec![previous], &input, || false).unwrap();
+        assert!(old.hits.is_empty());
+
+        let checks = std::cell::Cell::new(0);
+        let refreshed = refresh_all(&old, vec![current], &input, || {
+            checks.set(checks.get() + 1);
+            checks.get() > 100
+        })
+        .unwrap();
+        assert_eq!(refreshed.hits.len(), 1);
+        assert!(
+            crate::search::item_path(&refreshed.sources[0].scan, refreshed.hits[0].item)
+                .ends_with(std::path::Path::new("z/a/moved.bin"))
+        );
+    }
     use crate::search::SortField;
     #[test]
     fn sorting_across_locations_preserves_case_folding_path_ties_and_unknown_dates() {
@@ -170,6 +275,29 @@ mod tests {
                 }
             })
             .collect();
+        let mut edited = sources[0].scan.copy_for_update(true);
+        let row = edited
+            .files
+            .iter()
+            .position(|file| file.name == "Beta.bin")
+            .unwrap();
+        edited.files[row].logical_bytes = 11;
+        edited.folders[0].logical_bytes += 4;
+        edited.files[row].modified = Some(std::time::UNIX_EPOCH);
+        edited.partial = Some(Arc::new(crate::scanner::PartialUpdate {
+            previous: Arc::downgrade(&sources[0].scan),
+            affected: [0].into_iter().collect(),
+            search: Some(crate::scanner::SearchDelta {
+                before: vec![Item::File(row)],
+                after: vec![Item::File(row)],
+                file_rows: None,
+                folder_rows: None,
+            }),
+        }));
+        let edited = Arc::new(edited);
+        let mut updated = sources.clone();
+        updated[0].scan = edited;
+        updated[0].generation += 1;
         for (sort, ascending, descending) in [
             (
                 SortField::Name,
@@ -193,17 +321,13 @@ mod tests {
             ),
         ] {
             for (descending, expected) in [(false, ascending), (true, descending)] {
-                let result = search_all(
-                    sources.clone(),
-                    &SearchInput {
-                        kind: EntryKind::Files,
-                        sort,
-                        descending,
-                        ..Default::default()
-                    },
-                    || false,
-                )
-                .unwrap();
+                let input = SearchInput {
+                    kind: EntryKind::Files,
+                    sort,
+                    descending,
+                    ..Default::default()
+                };
+                let result = search_all(sources.clone(), &input, || false).unwrap();
                 let paths: Vec<_> = result
                     .hits
                     .iter()
@@ -214,8 +338,25 @@ mod tests {
                     expected.map(|p| root.join(p)),
                     "{sort:?} descending={descending}"
                 );
+                let patched = refresh_all(&result, updated.clone(), &input, || false).unwrap();
+                let full = search_all(updated.clone(), &input, || false).unwrap();
+                assert_eq!(patched.hits, full.hits, "{sort:?} descending={descending}");
+                assert_eq!(patched.sources[0].generation, 2);
             }
         }
+        let input = SearchInput {
+            from_date: "1969-01-01".into(),
+            to_date: "1971-01-01".into(),
+            kind: EntryKind::Files,
+            ..Default::default()
+        };
+        let old = search_all(sources.clone(), &input, || false).unwrap();
+        let patched = refresh_all(&old, updated.clone(), &input, || false).unwrap();
+        assert_eq!((old.unknown_dates, patched.unknown_dates), (2, 1));
+        assert_eq!(
+            patched.hits,
+            search_all(updated, &input, || false).unwrap().hits
+        );
         assert_eq!(
             search_all(sources, &SearchInput::default(), || true)
                 .err()

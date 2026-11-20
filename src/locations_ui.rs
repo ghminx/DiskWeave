@@ -216,11 +216,21 @@ impl LocationsView {
             self.selection_changed = true;
         }
         if !self.job.running {
-            if let (Some((_, paths)), Some(results)) =
-                (self.live_selection.take(), &self.job.results)
-            {
+            if let (Some((_, paths)), Some(results)) = (
+                self.live_selection
+                    .take()
+                    .filter(|(_, paths)| !paths.is_empty()),
+                &self.job.results,
+            ) {
+                let names: std::collections::HashSet<_> = paths
+                    .keys()
+                    .filter_map(|(id, path)| Some((*id, path.file_name()?)))
+                    .collect();
                 for (row, hit) in results.hits.iter().enumerate() {
                     let source = &results.sources[hit.source];
+                    if !names.contains(&(source.id, item_name(&source.scan, hit.item))) {
+                        continue;
+                    }
                     if paths
                         .get(&(source.id, crate::search::item_path(&source.scan, hit.item)))
                         .is_some_and(|key| match (key, &source.entries) {
@@ -237,7 +247,7 @@ impl LocationsView {
         }
     }
     pub fn results(&self) -> Option<&crate::global_search::GlobalResults> {
-        self.job.results.as_ref()
+        self.job.results.as_deref()
     }
     pub fn controls(
         &mut self,

@@ -357,16 +357,64 @@ pub(crate) fn refresh_matches(
     mut results: SearchResults,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<Option<SearchResults>> {
+    let Some(changes) = matching_changes(previous, current, query, results.scope, &cancelled)?
+    else {
+        return Ok(None);
+    };
+    results.items.retain_mut(|item| {
+        let Some(next) = changes.retained(*item) else {
+            return false;
+        };
+        *item = next;
+        true
+    });
+    for item in changes.added {
+        crate::output::check(&cancelled)?;
+        let key = SortKey::new(current, item, query.sort);
+        let at = results.items.partition_point(|&other| {
+            SortKey::new(current, other, query.sort)
+                .compare(&key, query.descending, !query.active)
+                .is_lt()
+        });
+        results.items.insert(at, item);
+    }
+    crate::output::check(&cancelled)?;
+    results.unknown_dates = results.unknown_dates - changes.unknown_before + changes.unknown_after;
+    results.scope = query.scope;
+    Ok(Some(results))
+}
+
+pub(crate) struct MatchChanges<'a> {
+    delta: &'a crate::scanner::SearchDelta,
+    removed: std::collections::HashSet<Item>,
+    pub added: Vec<Item>,
+    pub unknown_before: usize,
+    pub unknown_after: usize,
+}
+
+impl MatchChanges<'_> {
+    pub fn retained(&self, item: Item) -> Option<Item> {
+        if self.removed.contains(&item) {
+            return None;
+        }
+        self.delta.remap(item)
+    }
+}
+
+pub(crate) fn matching_changes<'a>(
+    previous: &ScanResult,
+    current: &'a ScanResult,
+    query: &Query,
+    previous_scope: usize,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Option<MatchChanges<'a>>> {
     let Some(delta) = current
-        .partial
-        .as_ref()
-        .filter(|delta| std::ptr::eq(delta.previous.as_ptr(), previous))
-        .and_then(|delta| delta.search.as_ref())
+        .changes_from(previous)
         .filter(|delta| delta.before.len().max(delta.after.len()) <= 256)
     else {
         return Ok(None);
     };
-    if delta.remap(Item::Folder(results.scope)) != Some(Item::Folder(query.scope)) {
+    if delta.remap(Item::Folder(previous_scope)) != Some(Item::Folder(query.scope)) {
         return Ok(None);
     }
     let in_scope = |scan: &ScanResult, item, scope| {
@@ -385,51 +433,34 @@ pub(crate) fn refresh_matches(
         }
         false
     };
-    let mut changed = std::collections::HashSet::new();
+    let mut changes = MatchChanges {
+        delta,
+        removed: std::collections::HashSet::new(),
+        added: Vec::new(),
+        unknown_before: 0,
+        unknown_after: 0,
+    };
     for &item in &delta.before {
         crate::output::check(&cancelled)?;
-        if !in_scope(previous, item, results.scope) || !changed.insert(item) {
+        if !in_scope(previous, item, previous_scope) || !changes.removed.insert(item) {
             continue;
         }
         if matches!(match_item(previous, query, item)?, Match::UnknownDate) {
-            results.unknown_dates -= 1;
+            changes.unknown_before += 1;
         }
     }
-    results.items.retain_mut(|item| {
-        if changed.contains(item) {
-            return false;
-        }
-        let Some(next) = delta.remap(*item) else {
-            return false;
-        };
-        *item = next;
-        true
-    });
-    let mut replacements = Vec::new();
     for &item in &delta.after {
         crate::output::check(&cancelled)?;
         if !in_scope(current, item, query.scope) {
             continue;
         }
         match match_item(current, query, item)? {
-            Match::UnknownDate => results.unknown_dates += 1,
-            Match::Yes => replacements.push(item),
+            Match::UnknownDate => changes.unknown_after += 1,
+            Match::Yes => changes.added.push(item),
             Match::No => {}
         }
     }
-    for item in replacements {
-        crate::output::check(&cancelled)?;
-        let key = SortKey::new(current, item, query.sort);
-        let at = results.items.partition_point(|&other| {
-            SortKey::new(current, other, query.sort)
-                .compare(&key, query.descending, !query.active)
-                .is_lt()
-        });
-        results.items.insert(at, item);
-    }
-    crate::output::check(&cancelled)?;
-    results.scope = query.scope;
-    Ok(Some(results))
+    Ok(Some(changes))
 }
 
 pub fn item_modified(result: &ScanResult, item: Item) -> Option<SystemTime> {

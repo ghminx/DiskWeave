@@ -2015,13 +2015,49 @@ pub(crate) mod tests {
         let (a_id, b_id) = (folders[a], folders[b]);
         let from = root.join("a/file");
         let to = root.join("b/file");
-        for (stage, totals) in [(0, [7, 0, 3]), (1, [0, 7, 3]), (2, [0, 0, 3])] {
+        let input = crate::search::SearchInput {
+            text: "file".into(),
+            ..Default::default()
+        };
+        let mut global = crate::global_search::GlobalController::default();
+        let publish = |job: &mut crate::global_search::GlobalController,
+                       record: &crate::snapshot::SavedScan,
+                       generation| {
+            job.submit(
+                vec![crate::locations::Snapshot {
+                    id: 1,
+                    generation,
+                    scan: Arc::clone(&record.scan),
+                    entries: record.entries.clone(),
+                }],
+                input.clone(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while job.running {
+                job.poll();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        publish(&mut global, &previous, 1);
+        assert!(global.results.as_ref().unwrap().hits.is_empty());
+
+        for (stage, totals, expected_hit) in [
+            (0, [7, 0, 3], Some((&from, 7))),
+            (1, [11, 0, 3], Some((&from, 11))),
+            (2, [0, 11, 3], Some((&to, 11))),
+            (3, [0, 0, 3], None),
+        ] {
             match stage {
                 0 => {
                     std::fs::write(&from, b"1234567").unwrap();
                     event(&mut source, &from, a_id, 0x80000100);
                 }
                 1 => {
+                    std::fs::write(&from, b"12345678901").unwrap();
+                    event(&mut source, &from, a_id, 0x80000001);
+                }
+                2 => {
                     event(&mut source, &from, a_id, 0x80001000);
                     std::fs::rename(&from, &to).unwrap();
                     event(&mut source, &to, b_id, 0x80002000);
@@ -2040,12 +2076,7 @@ pub(crate) mod tests {
                 current.scan.file_children[z] == previous.scan.file_children[z],
                 "다른 폴더의 행 주소가 실제로 바뀐 경우에만 다시 계산 (단계 {stage})"
             );
-            let query = crate::search::SearchInput {
-                text: "file".into(),
-                ..Default::default()
-            }
-            .compile(0)
-            .unwrap();
+            let query = input.compile(0).unwrap();
             let old_matches = crate::search::search(&previous.scan, &query, || false).unwrap();
             let patched = crate::search::refresh_matches(
                 &previous.scan,
@@ -2058,6 +2089,27 @@ pub(crate) mod tests {
             .unwrap();
             let full = crate::search::search(&current.scan, &query, || false).unwrap();
             assert_eq!(patched.items, full.items);
+            publish(&mut global, &current, stage + 2);
+            let results = global.results.as_ref().unwrap();
+            assert_eq!(results.sources[0].generation, stage + 2);
+            let actual_hits: Vec<_> = results
+                .hits
+                .iter()
+                .map(|hit| {
+                    let scan = &results.sources[hit.source].scan;
+                    (
+                        crate::search::item_path(scan, hit.item),
+                        crate::search::item_bytes(scan, hit.item),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                actual_hits,
+                expected_hit
+                    .map(|(path, bytes)| (path.clone(), bytes))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
             let independent = record(root);
             for ((name, row), bytes) in [("a", a), ("b", b), ("z", z)].into_iter().zip(totals) {
                 let actual = &current.scan.folders[row];
