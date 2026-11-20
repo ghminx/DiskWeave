@@ -88,37 +88,53 @@ fn hash(mut value: u64, bytes: &[u8]) -> u64 {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn emit(
-    writer: &mut impl Write,
-    frame: &Frame,
-    limit: Limits,
-    digest: &mut u64,
-    stats: &mut Stats,
-) -> io::Result<()> {
-    let bytes = serde_json::to_vec(frame).map_err(crate::output::json_error)?;
-    if bytes.len() > limit.frame_bytes || bytes.len() > u32::MAX as usize {
-        return Err(invalid("갱신 메시지 크기 초과"));
-    }
-    let size = (bytes.len() as u32).to_le_bytes();
-    writer.write_all(&size)?;
-    writer.write_all(&bytes)?;
-    *digest = hash(hash(*digest, &size), &bytes);
-    stats.bytes += 4 + bytes.len() as u64;
-    Ok(())
+struct FrameCodec {
+    bytes: Vec<u8>,
+    digest: u64,
+    limit: usize,
 }
-fn read_frame(reader: &mut impl Read, limit: Limits, digest: &mut u64) -> io::Result<Frame> {
-    let mut size = [0; 4];
-    reader.read_exact(&mut size)?;
-    let n = u32::from_le_bytes(size) as usize;
-    if n == 0 || n > limit.frame_bytes {
-        return Err(invalid("갱신 메시지 길이 오류"));
+impl FrameCodec {
+    fn new(limits: Limits) -> Self {
+        Self {
+            bytes: Vec::with_capacity(128),
+            digest: HASH_START,
+            limit: limits.frame_bytes,
+        }
     }
-    let mut bytes = vec![0; n];
-    reader.read_exact(&mut bytes)?;
-    *digest = hash(hash(*digest, &size), &bytes);
-    match serde_json::from_slice(&bytes).map_err(crate::output::json_error)? {
-        Frame::Failed(error) => Err(io::Error::other(error)),
-        frame => Ok(frame),
+
+    fn write(
+        &mut self,
+        writer: &mut impl Write,
+        frame: &Frame,
+        stats: &mut Stats,
+    ) -> io::Result<()> {
+        self.bytes.clear();
+        serde_json::to_writer(&mut self.bytes, frame).map_err(crate::output::json_error)?;
+        if self.bytes.len() > self.limit || self.bytes.len() > u32::MAX as usize {
+            return Err(invalid("갱신 메시지 크기 초과"));
+        }
+        let size = (self.bytes.len() as u32).to_le_bytes();
+        writer.write_all(&size)?;
+        writer.write_all(&self.bytes)?;
+        self.digest = hash(hash(self.digest, &size), &self.bytes);
+        stats.bytes += 4 + self.bytes.len() as u64;
+        Ok(())
+    }
+
+    fn read(&mut self, reader: &mut impl Read) -> io::Result<Frame> {
+        let mut size = [0; 4];
+        reader.read_exact(&mut size)?;
+        let n = u32::from_le_bytes(size) as usize;
+        if n == 0 || n > self.limit {
+            return Err(invalid("갱신 메시지 길이 오류"));
+        }
+        self.bytes.resize(n, 0);
+        reader.read_exact(&mut self.bytes)?;
+        self.digest = hash(hash(self.digest, &size), &self.bytes);
+        match serde_json::from_slice(&self.bytes).map_err(crate::output::json_error)? {
+            Frame::Failed(error) => Err(io::Error::other(error)),
+            frame => Ok(frame),
+        }
     }
 }
 fn path(value: &[u16]) -> io::Result<PathBuf> {
@@ -229,10 +245,10 @@ impl Sender {
             confirmed_after: index.checkpoint.confirmed_after,
             finished: SystemTime::now(),
         };
-        let mut digest = HASH_START;
+        let mut codec = FrameCodec::new(self.limits);
         let mut stats = Stats::default();
         let mut frames = 1;
-        emit(
+        codec.write(
             writer,
             &Frame::Begin {
                 session: self.session,
@@ -241,19 +257,11 @@ impl Sender {
                 quiet,
                 header,
             },
-            self.limits,
-            &mut digest,
             &mut stats,
         )?;
         let mut send = |change: Change| -> io::Result<()> {
             crate::output::check(cancelled)?;
-            emit(
-                writer,
-                &Frame::Change(change),
-                self.limits,
-                &mut digest,
-                &mut stats,
-            )?;
+            codec.write(writer, &Frame::Change(change), &mut stats)?;
             frames += 1;
             stats.changes += 1;
             Ok(())
@@ -307,20 +315,14 @@ impl Sender {
         }
         for pending in index.checkpoint.pending.chunks(8192) {
             crate::output::check(cancelled)?;
-            emit(
-                writer,
-                &Frame::Pending(pending.to_vec()),
-                self.limits,
-                &mut digest,
-                &mut stats,
-            )?;
+            codec.write(writer, &Frame::Pending(pending.to_vec()), &mut stats)?;
             frames += 1;
         }
         let end = Frame::End {
             frames,
-            hash: digest,
+            hash: codec.digest,
         };
-        emit(writer, &end, self.limits, &mut digest, &mut stats)?;
+        codec.write(writer, &end, &mut stats)?;
         writer.flush()?;
         self.revision = revision;
         self.units = units;
@@ -393,14 +395,14 @@ impl Receiver {
         cancelled: &impl Fn() -> bool,
     ) -> io::Result<bool> {
         crate::output::check(cancelled)?;
-        let mut digest = HASH_START;
+        let mut codec = FrameCodec::new(self.limits);
         let Frame::Begin {
             session,
             revision,
             base,
             quiet,
             header,
-        } = read_frame(reader, self.limits, &mut digest)?
+        } = codec.read(reader)?
         else {
             return Err(invalid("갱신 시작 메시지 누락"));
         };
@@ -449,8 +451,8 @@ impl Receiver {
             let mut frames = 1;
             loop {
                 crate::output::check(cancelled)?;
-                let before = digest;
-                match read_frame(reader, self.limits, &mut digest)? {
+                let before = codec.digest;
+                match codec.read(reader)? {
                     Frame::Pending(ids) => {
                         for id in ids {
                             if self
@@ -535,8 +537,8 @@ impl Receiver {
         let mut pending_seen = HashSet::new();
         loop {
             crate::output::check(cancelled)?;
-            let before_hash = digest;
-            match read_frame(reader, self.limits, &mut digest)? {
+            let before_hash = codec.digest;
+            match codec.read(reader)? {
                 Frame::End {
                     frames: expected,
                     hash,
@@ -2315,36 +2317,22 @@ pub(crate) mod tests {
     fn rewrite(wire: &[u8], mut edit: impl FnMut(&mut Frame)) -> Vec<u8> {
         let mut reader = wire;
         let mut output = Vec::new();
-        let mut old = HASH_START;
-        let mut digest = HASH_START;
+        let mut decoder = FrameCodec::new(Limits::default());
+        let mut encoder = FrameCodec::new(Limits::default());
         let mut stats = Stats::default();
         let mut count = 0;
         loop {
-            let mut frame = read_frame(&mut reader, Limits::default(), &mut old).unwrap();
+            let mut frame = decoder.read(&mut reader).unwrap();
             if matches!(frame, Frame::End { .. }) {
                 let end = Frame::End {
                     frames: count,
-                    hash: digest,
+                    hash: encoder.digest,
                 };
-                emit(
-                    &mut output,
-                    &end,
-                    Limits::default(),
-                    &mut digest,
-                    &mut stats,
-                )
-                .unwrap();
+                encoder.write(&mut output, &end, &mut stats).unwrap();
                 break;
             }
             edit(&mut frame);
-            emit(
-                &mut output,
-                &frame,
-                Limits::default(),
-                &mut digest,
-                &mut stats,
-            )
-            .unwrap();
+            encoder.write(&mut output, &frame, &mut stats).unwrap();
             count += 1;
         }
         output
