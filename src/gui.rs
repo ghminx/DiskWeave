@@ -1828,29 +1828,20 @@ impl DiskWeaveApp {
         }
         match self.scan.status() {
             ScanStatus::Idle => "대기 중".into(),
-            ScanStatus::Running | ScanStatus::Cancelling => {
-                let progress = crate::engine::Progress {
-                    stage: self.scan.stage().unwrap_or_default(),
-                    counts: self.scan.progress().expect("진행 중 스캔"),
-                };
-                if matches!(self.scan.status(), ScanStatus::Cancelling) {
-                    format!(
-                        "취소 중 · {:.1}초",
-                        self.scan.elapsed().unwrap_or_default().as_secs_f64()
-                    )
-                } else {
-                    let text =
-                        progress.label(self.scan.elapsed().unwrap_or_default().as_secs_f64());
-                    if matches!(
-                        progress.stage,
-                        crate::engine::Stage::Basic | crate::engine::Stage::Fallback
-                    ) {
-                        format!("{text} · 동시 작업 {}개", self.scan.parallelism().workers())
-                    } else {
-                        text
-                    }
-                }
+            ScanStatus::Running => {
+                let counts = self.scan.progress().expect("진행 중 스캔");
+                let seconds = self.scan.elapsed().unwrap_or_default().as_secs_f64();
+                format!(
+                    "파일·폴더 확인 중 · 파일 {} · 폴더 {} · {seconds:.1}초 · 동시 작업 {}개",
+                    counts.files_scanned,
+                    counts.folders_scanned,
+                    self.scan.parallelism().workers()
+                )
             }
+            ScanStatus::Cancelling => format!(
+                "취소 중 · {:.1}초",
+                self.scan.elapsed().unwrap_or_default().as_secs_f64()
+            ),
             ScanStatus::Completed => self
                 .scan
                 .completed()
@@ -2001,10 +1992,7 @@ impl DiskWeaveApp {
                         .unwrap_or("위치");
                     let drives = crate::ui_style::scope_button(ui, label, drive_width);
                     egui::Popup::menu(&drives).show(|ui| {
-                        if let Some(path) =
-                            self.locations_view
-                                .drive_control(ui, !editable, self.target.text())
-                        {
+                        if let Some(path) = self.locations_view.drive_control(ui, !editable) {
                             self.input_error = self.target.choose_folder(path).err();
                         }
                         ui.separator();
@@ -2017,12 +2005,8 @@ impl DiskWeaveApp {
                                     &mut self.scan,
                                     self.target.path(),
                                 ) {
-                                    if self.scan.entries.iter().any(|e| e.path == path) {
-                                        self.target.choose_registered(path);
-                                        self.input_error = None;
-                                    } else {
-                                        self.input_error = self.target.choose_folder(path).err();
-                                    }
+                                    self.target.choose_registered(path);
+                                    self.input_error = None;
                                     self.sync_scan();
                                     self.remember_navigation(previous);
                                 }
@@ -3858,6 +3842,29 @@ mod session_tests {
             app.window_state
         );
         assert!(app.scan.entries.is_empty());
+    }
+
+    #[test]
+    fn scan_status_shows_counts_and_worker_limit_until_cancelled() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let mut app = DiskWeaveApp::new();
+        app.scan
+            .configure_parallelism(crate::scanner::Parallelism::Two)
+            .unwrap();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let message = app.status();
+        assert!(message.starts_with("파일·폴더 확인 중 · 파일 "));
+        assert!(message.contains(" · 폴더 "));
+        assert!(message.ends_with("초 · 동시 작업 2개"));
+        app.scan.cancel();
+        assert!(app.status().starts_with("취소 중 · "));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
     }
 
     #[test]

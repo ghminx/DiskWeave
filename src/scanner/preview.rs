@@ -274,33 +274,20 @@ impl View {
         self.revision = 0;
     }
     pub fn complete(&self, model: &Model, result: &super::ScanResult) -> crate::explorer::Explorer {
-        let mut view = crate::explorer::Explorer::new(result);
         let ids: HashMap<_, _> = result
             .folders
             .iter()
             .enumerate()
             .map(|(id, f)| (&f.path, id))
             .collect();
-        if let Some(id) = model
-            .folders
-            .get(self.folder)
-            .and_then(|f| ids.get(&f.path))
-        {
-            view.open_folder(result, *id);
-        }
-        for id in &self.expanded {
-            if let Some(id) = model.folders.get(*id).and_then(|f| ids.get(&f.path)) {
-                if !view.is_expanded(*id) {
-                    view.toggle_folder(result, *id);
-                }
-            }
-        }
-        if let Some(id) = model
-            .folders
-            .get(self.selected)
-            .and_then(|f| ids.get(&f.path))
-        {
-            view.select(crate::explorer::Item::Folder(*id));
+        let resolve = |id: usize| ids.get(&model.folders.get(id)?.path).copied();
+        let mut view = crate::explorer::Explorer::with_expanded(
+            result,
+            resolve(self.folder).unwrap_or(0),
+            self.expanded.iter().copied().filter_map(resolve).collect(),
+        );
+        if let Some(id) = resolve(self.selected) {
+            view.select(crate::explorer::Item::Folder(id));
         }
         view
     }
@@ -666,7 +653,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("diskweave-preview-nav-{}", std::process::id()));
         std::fs::create_dir_all(root.join("z/deep")).unwrap();
-        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("a/leaf")).unwrap();
+        std::fs::write(root.join("a/leaf/data"), b"123").unwrap();
         let mut model = Model::new(root.clone());
         model
             .apply(Batch {
@@ -698,17 +686,25 @@ mod tests {
         model
             .apply(Batch {
                 reset: false,
-                updates: vec![Update::Folder {
-                    id: 3,
-                    parent: Some(0),
-                    name: vec![97],
-                }],
+                updates: vec![
+                    Update::Folder {
+                        id: 3,
+                        parent: Some(0),
+                        name: vec![97],
+                    },
+                    Update::Folder {
+                        id: 4,
+                        parent: Some(3),
+                        name: "leaf".encode_utf16().collect(),
+                    },
+                ],
             })
             .unwrap();
         view.sync(&model);
         assert_eq!(view.folder, 1);
         assert_eq!(view.selected, 2);
         assert_eq!(model.folders[0].children, vec![1, 3]);
+        view.toggle(3);
         let result = super::super::scan(&root, || false).unwrap();
         let final_view = view.complete(&model, &result);
         assert_eq!(result.folders[final_view.folder()].path, root.join("z"));
@@ -716,7 +712,22 @@ mod tests {
             panic!("폴더 선택 보존")
         };
         assert_eq!(result.folders[id].path, root.join("z/deep"));
-        assert!(final_view.is_expanded(result.folder_index(std::path::Path::new("z")).unwrap()));
+        let visible: Vec<_> = final_view
+            .visible_tree()
+            .iter()
+            .map(|&(id, depth)| (result.folders[id].path.strip_prefix(&root).unwrap(), depth))
+            .collect();
+        use std::path::Path;
+        assert_eq!(
+            visible,
+            [
+                (Path::new(""), 0),
+                (Path::new("a"), 1),
+                (Path::new("a/leaf"), 2),
+                (Path::new("z"), 1),
+                (Path::new("z/deep"), 2),
+            ]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

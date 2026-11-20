@@ -135,12 +135,7 @@ impl LocationsView {
                 .filter_map(|row| self.results()?.hits.get(row).map(|hit| hit.item)),
         )
     }
-    pub fn drive_control(
-        &mut self,
-        ui: &mut egui::Ui,
-        running: bool,
-        _current: &str,
-    ) -> Option<PathBuf> {
+    pub fn drive_control(&mut self, ui: &mut egui::Ui, running: bool) -> Option<PathBuf> {
         if !self.drives.started {
             self.drives.refresh();
         }
@@ -176,6 +171,10 @@ impl LocationsView {
                 }
             });
         });
+        if self.drives.running() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
         path
     }
     pub fn selected_target(&self) -> Option<crate::map_job::Target> {
@@ -255,10 +254,6 @@ impl LocationsView {
         locations: &mut Locations,
         target: Option<&Path>,
     ) -> Option<PathBuf> {
-        if !self.drives.started {
-            self.drives.refresh();
-        }
-        self.drives.poll();
         let mut path = None;
         let previous_global = self.global_mode;
         ui.scope(|ui| {
@@ -357,10 +352,6 @@ impl LocationsView {
             self.selection_changed = true;
             self.key = None;
             self.job.cancel();
-        }
-        if self.drives.running() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
         }
         path
     }

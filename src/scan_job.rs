@@ -50,7 +50,7 @@ struct ActiveScan {
     started: Instant,
     clock: SystemTime,
     cancelled: Arc<AtomicBool>,
-    progress: Arc<Mutex<crate::engine::Progress>>,
+    progress: Arc<Mutex<ScanProgress>>,
     receiver: Receiver<(SystemTime, std::io::Result<crate::engine::Outcome>)>,
 }
 
@@ -95,11 +95,6 @@ impl ScanController {
         self.parallelism = value;
         Ok(())
     }
-    pub fn stage(&self) -> Option<crate::engine::Stage> {
-        self.active
-            .as_ref()
-            .map(|a| a.progress.lock().unwrap().stage)
-    }
     pub fn start(&mut self, path: PathBuf) -> Result<(), &'static str> {
         if self.active.is_some() {
             return Err("스캔이 진행 중입니다");
@@ -108,7 +103,7 @@ impl ScanController {
         let worker_path = path.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let progress = Arc::new(Mutex::new(crate::engine::Progress::default()));
+        let progress = Arc::new(Mutex::new(ScanProgress::default()));
         let worker_progress = Arc::clone(&progress);
         let preview_mail = crate::scanner::preview::Mailbox::default();
         let worker_preview = preview_mail.clone();
@@ -151,13 +146,15 @@ impl ScanController {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
+        // 완료 신호보다 먼저 게시한 마지막 폴더 묶음까지 반영.
+        let message = active.receiver.try_recv();
         if let Some(batch) = active.preview_mail.drain() {
             if let Err(error) = self.preview.as_mut().expect("활성 미리보기").apply(batch) {
                 active.preview_error = Some(error.to_string());
                 active.cancelled.store(true, Ordering::Relaxed);
             }
         }
-        let (finished, result) = match active.receiver.try_recv() {
+        let (finished, result) = match message {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
@@ -167,12 +164,6 @@ impl ScanController {
                 return false;
             }
         };
-        // 완료 채널 수신 직전에 도착한 마지막 폴더 묶음까지 반영.
-        if let Some(batch) = active.preview_mail.drain() {
-            if let Err(error) = self.preview.as_mut().expect("활성 미리보기").apply(batch) {
-                active.preview_error = Some(error.to_string());
-            }
-        }
         let active = self.active.take().expect("수신 중인 스캔 작업");
         if let Some(error) = active.preview_error {
             self.status = ScanStatus::Failed(error);
@@ -218,7 +209,7 @@ impl ScanController {
     pub fn progress(&self) -> Option<ScanProgress> {
         self.active
             .as_ref()
-            .map(|active| active.progress.lock().unwrap().counts)
+            .map(|active| *active.progress.lock().unwrap())
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
@@ -412,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_snapshot_updates_while_scan_runs() {
+    fn delayed_poll_keeps_progress_and_the_final_folder_batch() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -421,9 +412,10 @@ mod tests {
             "diskweave-job-progress-{}-{stamp}",
             std::process::id()
         ));
-        fs::create_dir(&root).unwrap();
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
         fs::write(root.join("first.bin"), [1]).unwrap();
-        fs::write(root.join("second.bin"), [2]).unwrap();
+        fs::write(child.join("second.bin"), [2, 3]).unwrap();
 
         let mut controller = ScanController::default();
         controller.start(root.clone()).unwrap();
@@ -434,12 +426,25 @@ mod tests {
         assert_eq!(
             controller.progress().unwrap(),
             scanner::ScanProgress {
-                folders_scanned: 1,
+                folders_scanned: 2,
                 files_scanned: 2,
             }
         );
 
-        controller.poll();
+        while controller.is_running() && Instant::now() < deadline {
+            controller.poll();
+            std::thread::yield_now();
+        }
+        assert!(matches!(controller.status(), ScanStatus::Completed));
+        let preview = controller.take_finished_preview().unwrap();
+        assert_eq!(preview.folders.len(), 2);
+        assert_eq!(preview.folders[0].bytes, 3);
+        assert_eq!(preview.folders[1].path, child);
+        assert_eq!(preview.folders[1].bytes, 2);
+        assert!(preview
+            .folders
+            .iter()
+            .all(|folder| folder.state() == crate::scanner::preview::State::Complete));
         fs::remove_dir_all(root).unwrap();
     }
 

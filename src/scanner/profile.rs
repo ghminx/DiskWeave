@@ -1,7 +1,5 @@
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 
@@ -43,29 +41,20 @@ const NAMES: [&str; N] = [
     "metadata_task",
     "folder_path_check",
 ];
-static ALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
-thread_local! {
-    static ACTIVE:Cell<usize>=const{Cell::new(usize::MAX)};
-    static ALLOCS:[Cell<u64>;N*2]=const{[const{Cell::new(0)};N*2]};
-}
 #[derive(Default)]
 struct Bucket {
     calls: AtomicU64,
     ns: AtomicU64,
-    allocations: AtomicU64,
-    bytes: AtomicU64,
 }
 pub struct Trace {
     buckets: [Bucket; N],
     cpu: [CpuBucket; 2],
-    allocation_supported: bool,
 }
 impl Default for Trace {
     fn default() -> Self {
         Self {
             buckets: std::array::from_fn(|_| Bucket::default()),
             cpu: std::array::from_fn(|_| CpuBucket::default()),
-            allocation_supported: ALLOC_ENABLED.load(Ordering::Relaxed),
         }
     }
 }
@@ -116,8 +105,8 @@ impl Trace {
                     stage: NAMES[i],
                     calls: load(&b.calls),
                     elapsed_ns: load(&b.ns),
-                    allocations: self.allocation_supported.then(|| load(&b.allocations)),
-                    allocated_bytes: self.allocation_supported.then(|| load(&b.bytes)),
+                    allocations: None,
+                    allocated_bytes: None,
                 })
                 .collect(),
             worker_cpu: cpu(&self.cpu[0]),
@@ -126,31 +115,16 @@ impl Trace {
     }
 }
 pub struct Guard<'a> {
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     trace: &'a Trace,
     stage: usize,
     start: Instant,
-    previous: usize,
-    alloc_start: (u64, u64),
 }
-/// 계측이 켜진 단계만 측정. 시간은 중첩 구간을 포함하고 할당은 현재 단계에만 귀속.
+/// 계측이 켜진 단계의 호출 수와 중첩 구간을 포함한 경과 시간 측정.
 pub fn scope(trace: Option<&Trace>, stage: Stage) -> Option<Guard<'_>> {
-    trace.map(|trace| {
-        let stage = stage as usize;
-        let previous = if trace.allocation_supported {
-            ACTIVE.with(|a| a.replace(stage))
-        } else {
-            usize::MAX
-        };
-        let alloc_start = ALLOCS.with(|a| (a[stage * 2].get(), a[stage * 2 + 1].get()));
-        Guard {
-            _thread: std::marker::PhantomData,
-            trace,
-            stage,
-            start: Instant::now(),
-            previous,
-            alloc_start,
-        }
+    trace.map(|trace| Guard {
+        trace,
+        stage: stage as usize,
+        start: Instant::now(),
     })
 }
 impl Drop for Guard<'_> {
@@ -158,21 +132,6 @@ impl Drop for Guard<'_> {
         let b = &self.trace.buckets[self.stage];
         b.calls.fetch_add(1, Ordering::Relaxed);
         b.ns.fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if self.trace.allocation_supported {
-            ALLOCS.with(|a| {
-                b.allocations.fetch_add(
-                    a[self.stage * 2].get() - self.alloc_start.0,
-                    Ordering::Relaxed,
-                );
-                b.bytes.fetch_add(
-                    a[self.stage * 2 + 1].get() - self.alloc_start.1,
-                    Ordering::Relaxed,
-                );
-                a[self.stage * 2].set(self.alloc_start.0);
-                a[self.stage * 2 + 1].set(self.alloc_start.1);
-            });
-            ACTIVE.with(|a| a.set(self.previous));
-        }
     }
 }
 
@@ -256,59 +215,10 @@ impl Drop for CpuGuard<'_> {
     }
 }
 
-/// 개발용 실행 파일에서만 등록하는 Rust 할당 계측. Windows 내부 할당·해제 후 잔존량은 측정 대상 아님.
-#[allow(dead_code, reason = "제품 기본 allocator를 바꾸지 않는 개발용 계측")]
-pub struct Allocator;
-#[allow(dead_code, reason = "개발용 실행 파일에서만 할당 계측 활성화")]
-pub fn enable_allocations() {
-    ALLOC_ENABLED.store(true, Ordering::Relaxed);
-}
-#[allow(dead_code, reason = "개발용 allocator에서만 호출")]
-fn allocation(size: usize) {
-    if !ALLOC_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-    let _ = ACTIVE.try_with(|active| {
-        let stage = active.get();
-        if stage < N {
-            let _ = ALLOCS.try_with(|a| {
-                a[stage * 2].set(a[stage * 2].get() + 1);
-                a[stage * 2 + 1].set(a[stage * 2 + 1].get() + size as u64);
-            });
-        }
-    });
-}
-// System의 정렬/수명 계약을 그대로 전달하고 성공한 할당 요청만 기록.
-unsafe impl GlobalAlloc for Allocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let value = unsafe { System.alloc(layout) };
-        if !value.is_null() {
-            allocation(layout.size());
-        }
-        value
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let value = unsafe { System.alloc_zeroed(layout) };
-        if !value.is_null() {
-            allocation(layout.size());
-        }
-        value
-    }
-    unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let value = unsafe { System.realloc(p, layout, size) };
-        if !value.is_null() {
-            allocation(size);
-        }
-        value
-    }
-    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(p, layout) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     #[test]
     fn unavailable_cpu_is_not_reported_as_zero_cpu() {
         let trace = Trace::default();
@@ -333,6 +243,10 @@ mod tests {
         let report = trace.snapshot();
         assert_eq!(report.stages[Stage::Overall as usize].calls, 1);
         assert_eq!(report.stages[Stage::PathPrepare as usize].calls, 1);
+        assert!(report
+            .stages
+            .iter()
+            .all(|stage| stage.allocations.is_none() && stage.allocated_bytes.is_none()));
         assert!(
             report.stages[Stage::Overall as usize].elapsed_ns
                 >= report.stages[Stage::PathPrepare as usize].elapsed_ns

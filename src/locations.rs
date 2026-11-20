@@ -236,11 +236,6 @@ impl Locations {
         self.parallelism = value;
         Ok(())
     }
-    pub fn stage(&self) -> Option<crate::engine::Stage> {
-        self.active
-            .and_then(|id| self.get(id))
-            .and_then(|e| e.scan.stage())
-    }
     pub fn add(&mut self, path: &Path) -> io::Result<u64> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {

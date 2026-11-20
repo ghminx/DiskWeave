@@ -72,48 +72,13 @@ impl Report {
 pub enum Stage {
     #[default]
     Basic,
-    Authorizing,
-    Enumerating,
     Metadata,
     Transferring,
-    Fallback,
-}
-impl Stage {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Basic => "파일·폴더 확인 중",
-            Self::Authorizing => "Windows 권한 승인 대기",
-            Self::Enumerating => "NTFS 항목 수집 중",
-            Self::Metadata => "크기·경로 확인 중",
-            Self::Transferring => "결과 전달 중",
-            Self::Fallback => "기본 방식으로 다시 스캔 중",
-        }
-    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Progress {
     pub stage: Stage,
     pub counts: ScanProgress,
-}
-impl Progress {
-    pub fn label(&self, seconds: f64) -> String {
-        match self.stage {
-            Stage::Authorizing | Stage::Transferring => {
-                format!("{} · {seconds:.1}초", self.stage.label())
-            }
-            Stage::Enumerating => format!(
-                "{} · 항목 {} · {seconds:.1}초",
-                self.stage.label(),
-                self.counts.files_scanned
-            ),
-            _ => format!(
-                "{} · 파일 {} · 폴더 {} · {seconds:.1}초",
-                self.stage.label(),
-                self.counts.files_scanned,
-                self.counts.folders_scanned
-            ),
-        }
-    }
 }
 pub struct Outcome {
     pub result: ScanResult,
@@ -123,22 +88,11 @@ pub fn scan_selected<'a>(
     root: &Path,
     parallelism: crate::scanner::Parallelism,
     cancelled: impl Fn() -> bool,
-    mut progress: impl FnMut(Progress),
+    progress: impl FnMut(ScanProgress),
     preview: Option<&'a mut crate::scanner::preview::Observer<'a>>,
 ) -> io::Result<Outcome> {
     crate::output::check(&cancelled)?;
-    let stage = Stage::Basic;
-    progress(Progress {
-        stage,
-        counts: Default::default(),
-    });
-    let result = crate::scanner::scan_unified(
-        root,
-        parallelism,
-        cancelled,
-        |counts| progress(Progress { stage, counts }),
-        preview,
-    )?;
+    let result = crate::scanner::scan_unified(root, parallelism, cancelled, progress, preview)?;
     Ok(Outcome {
         result,
         report: Report {

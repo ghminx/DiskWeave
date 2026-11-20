@@ -1,77 +1,69 @@
 use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
+use windows_sys::Win32::Storage::FileSystem::{
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW,
+};
 
 pub struct Drive {
     pub path: PathBuf,
-    pub kind: u32,
     pub available: Option<u64>,
 }
 
-pub fn read_with(probe: impl FnOnce() -> io::Result<Vec<Drive>>) -> io::Result<Vec<Drive>> {
-    Ok(probe()?
-        .into_iter()
-        .filter(|drive| matches!(drive.kind, 2 | 3))
-        .collect())
-}
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetLogicalDriveStringsW(length: u32, buffer: *mut u16) -> u32;
-    fn GetDriveTypeW(root: *const u16) -> u32;
-    fn GetDiskFreeSpaceExW(
-        root: *const u16,
-        available: *mut u64,
-        total: *mut u64,
-        free: *mut u64,
-    ) -> i32;
-}
-
 pub fn read() -> io::Result<Vec<Drive>> {
-    read_with(|| {
-        // Windows 다중 문자열의 필요 크기를 조회한 뒤 출력 버퍼 확보.
-        let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
-        if needed == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buffer = vec![0u16; needed as usize + 1];
-        let written = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
-        if written == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if written as usize >= buffer.len() {
-            return Err(io::Error::other(
-                "드라이브 목록이 변경됐습니다. 새로고침하세요",
-            ));
-        }
-        let mut result = Vec::new();
-        for root in buffer[..written as usize]
-            .split(|&c| c == 0)
-            .filter(|part| !part.is_empty())
-        {
-            let terminated: Vec<u16> = root.iter().copied().chain(Some(0)).collect();
-            // NUL 종료 UTF-16 루트와 64비트 출력 버퍼를 호출 동안 유지.
-            let kind = unsafe { GetDriveTypeW(terminated.as_ptr()) };
-            if !matches!(kind, 2 | 3) {
-                continue;
-            }
+    // Windows 다중 문자열의 필요 크기를 조회한 뒤 출력 버퍼 확보.
+    let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u16; needed as usize + 1];
+    let written = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize >= buffer.len() {
+        return Err(io::Error::other(
+            "드라이브 목록이 변경됐습니다. 새로고침하세요",
+        ));
+    }
+    Ok(local_drives(
+        &buffer[..written as usize],
+        |root| unsafe { GetDriveTypeW(root.as_ptr()) },
+        |root| {
             let mut available = 0;
             let success = unsafe {
                 GetDiskFreeSpaceExW(
-                    terminated.as_ptr(),
+                    root.as_ptr(),
                     &mut available,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 )
             };
-            result.push(Drive {
+            (success != 0).then_some(available)
+        },
+    ))
+}
+
+fn local_drives(
+    roots: &[u16],
+    drive_type: impl Fn(&[u16]) -> u32,
+    available: impl Fn(&[u16]) -> Option<u64>,
+) -> Vec<Drive> {
+    let mut drives = Vec::new();
+    for root in roots
+        .split(|&unit| unit == 0)
+        .filter(|root| !root.is_empty())
+    {
+        let terminated: Vec<u16> = root.iter().copied().chain(Some(0)).collect();
+        // 고정식·이동식 드라이브만 표시하며 다른 드라이브는 용량 조회도 생략.
+        if matches!(drive_type(&terminated), 2 | 3) {
+            drives.push(Drive {
                 path: std::ffi::OsString::from_wide(root).into(),
-                kind,
-                available: (success != 0).then_some(available),
+                available: available(&terminated),
             });
         }
-        Ok(result)
-    })
+    }
+    drives
 }
 
 #[derive(Default)]
@@ -117,11 +109,21 @@ impl DriveList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
     #[test]
     #[ignore = "실제 Windows 드라이브 목록 읽기 전용 점검"]
     fn real_drive_inventory_read_only() {
         let drives = read().unwrap();
-        assert!(drives.iter().all(|drive| matches!(drive.kind, 2 | 3)));
+        for drive in &drives {
+            let root: Vec<_> = drive
+                .path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            assert!(matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, 2 | 3));
+        }
         eprintln!(
             "DRIVES local={} ready={}",
             drives.len(),
@@ -133,28 +135,28 @@ mod tests {
     }
     #[test]
     fn local_drive_probe_preserves_unknown_capacity_and_excludes_networks() {
-        let drives = read_with(|| {
-            Ok(vec![
-                Drive {
-                    path: "C:\\".into(),
-                    kind: 3,
-                    available: Some(42),
-                },
-                Drive {
-                    path: "E:\\".into(),
-                    kind: 2,
-                    available: None,
-                },
-                Drive {
-                    path: "Z:\\".into(),
-                    kind: 4,
-                    available: Some(99),
-                },
-            ])
-        })
-        .unwrap();
+        let roots: Vec<_> = "C:\\\0E:\\\0Z:\\\0\0".encode_utf16().collect();
+        let drives = local_drives(
+            &roots,
+            |root| {
+                assert_eq!(root.last(), Some(&0));
+                match char::from_u32(root[0].into()) {
+                    Some('C') => 3,
+                    Some('E') => 2,
+                    Some('Z') => 4,
+                    _ => unreachable!(),
+                }
+            },
+            |root| match char::from_u32(root[0].into()) {
+                Some('C') => Some(42),
+                Some('E') => None,
+                _ => panic!("지원하지 않는 드라이브의 여유 공간 조회"),
+            },
+        );
         assert_eq!(drives.len(), 2);
+        assert_eq!(drives[0].path, PathBuf::from(r"C:\"));
+        assert_eq!(drives[0].available, Some(42));
+        assert_eq!(drives[1].path, PathBuf::from(r"E:\"));
         assert_eq!(drives[1].available, None);
-        assert!(read_with(|| Err(std::io::Error::other("probe failed"))).is_err());
     }
 }

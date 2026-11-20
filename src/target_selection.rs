@@ -66,7 +66,7 @@ mod tests {
         let mut target = TargetSelection::default();
         target.choose_registered(path.clone());
         assert_eq!(target.path(), Some(path.as_path()));
-        assert_eq!(target.path(), Some(path.as_path()));
+        assert_eq!(target.text(), path.to_string_lossy());
     }
     #[test]
     fn startup_target_is_c_drive_and_explicit_clear_still_clears_it() {

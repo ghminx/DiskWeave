@@ -91,14 +91,23 @@ impl Explorer {
         next
     }
     pub fn new(result: &ScanResult) -> Self {
+        Self::with_expanded(result, 0, HashSet::new())
+    }
+
+    pub(crate) fn with_expanded(
+        result: &ScanResult,
+        folder: usize,
+        mut expanded: HashSet<usize>,
+    ) -> Self {
+        expanded.insert(0);
         let mut explorer = Self {
-            folder: 0,
+            folder,
             entries: Vec::new(),
-            selected: Item::Folder(0),
-            expanded: HashSet::from([0]),
+            selected: Item::Folder(folder),
+            expanded,
             visible_tree: Vec::new(),
         };
-        explorer.open_folder(result, 0);
+        explorer.open_folder(result, folder);
         explorer
     }
 
