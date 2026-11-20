@@ -8,9 +8,9 @@ Windows 10/11 x64용 디스크 용량 분석·파일 관리 프로그램. 분석
 
 ## 실행
 
-Portable ZIP은 `tools/Build-Portable.ps1`로 생성함. 압축을 푼 뒤 `DiskWeave.exe`를 실행하며 설치가 필요하지 않음. 화면·단축키 설정만 사용자 LocalAppData에 저장하고 분석 목록·검색어·탐색 이력은 저장하지 않음. [사용 안내](docs/portable-readme.md), [v0.1.0 프리뷰](docs/releases/v0.1.0.md), [사용성·배포 검증 및 한계](docs/usability-release.md) 참조.
+Portable ZIP은 `tools/Build-Portable.ps1`로 생성함. 압축을 푼 뒤 `DiskWeave.exe`를 실행하며 설치가 필요하지 않음. 화면·단축키 설정만 사용자 LocalAppData에 저장하고 분석 목록·검색어·탐색 이력은 저장하지 않음. [사용 안내](docs/portable-readme.md), [v0.1.1 프리뷰](docs/releases/v0.1.1.md), [사용성·배포 검증 및 한계](docs/usability-release.md) 참조.
 
-DiskWeave는 [MIT 라이선스](LICENSE)로 제공함. Portable ZIP에 의존성 및 글꼴의 별도 라이선스 고지를 포함함.
+DiskWeave v0.1.1부터 [Apache License 2.0](LICENSE)으로 제공함. 프로젝트 저작권 및 출처는 [NOTICE](NOTICE)에 기록함. Portable ZIP에 의존성 및 글꼴의 별도 라이선스 고지를 포함함.
 
 Rust stable 도구 모음 설치 후 다음 명령 실행.
 
@@ -115,7 +115,7 @@ GUI 용량은 B/KiB/MiB/GiB/TiB로 표시하고 툴팁에 정확한 정수 Byte�
 - `src/workspace.rs`: 작은 창의 패널 폭·지도 높이·목록 공간 제한 담당.
 - `src/ui_style.rs`: 시안 색상·글꼴·표 행/헤더·아이콘·상세 속성의 공통 네이티브 표현 담당.
 
-GUI에 `eframe`(MIT 또는 Apache-2.0)과 `rfd`(MIT)를 사용함. 전체 전이 의존성 라이선스는 공개 전 검토할 예정임.
+GUI에 `eframe`(MIT 또는 Apache-2.0)과 `rfd`(MIT)를 사용함. Portable ZIP의 `THIRD_PARTY_NOTICES.md`와 `licenses/`에 포함된 의존성의 라이선스와 원문을 명시함.
 
 ## 실행 간 분석 목록
 

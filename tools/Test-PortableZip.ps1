@@ -7,14 +7,16 @@ try {
     $names = @($archive.Entries | Where-Object Length -GT 0 | ForEach-Object FullName)
     foreach ($name in $names) {
         if ($name.Contains('..') -or $name.Contains(':') -or $name.StartsWith('/')) { throw "잘못된 ZIP 경로: $name" }
-        if ($name -notin @('DiskWeave.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md') -and !$name.StartsWith('licenses/')) { throw "허용하지 않은 ZIP 내용: $name" }
+        if ($name -notin @('DiskWeave.exe','README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md') -and !$name.StartsWith('licenses/')) { throw "허용하지 않은 ZIP 내용: $name" }
     }
-    foreach ($name in @('DiskWeave.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md','licenses/Pretendard/OFL.txt','licenses/Rust/COPYRIGHT-library.html')) {
+    foreach ($name in @('DiskWeave.exe','README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','licenses/Pretendard/OFL.txt','licenses/Rust/COPYRIGHT-library.html')) {
         if ($name -notin $names) { throw "필수 ZIP 내용 누락: $name" }
     }
-    $reader = [IO.StreamReader]::new($archive.GetEntry('LICENSE').Open())
-    try { $license = $reader.ReadToEnd() } finally { $reader.Dispose() }
-    if ($license -cne [IO.File]::ReadAllText((Join-Path $repo 'LICENSE'))) { throw '프로젝트 라이선스 원문 불일치' }
+    foreach ($name in @('LICENSE','NOTICE')) {
+        $reader = [IO.StreamReader]::new($archive.GetEntry($name).Open())
+        try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        if ($text -cne [IO.File]::ReadAllText((Join-Path $repo $name))) { throw "프로젝트 라이선스 파일 불일치: $name" }
+    }
     $reader = [IO.StreamReader]::new($archive.GetEntry('THIRD_PARTY_NOTICES.md').Open())
     try { $notices = $reader.ReadToEnd() } finally { $reader.Dispose() }
     $references = [regex]::Matches($notices,'License texts: licenses/([^/]+)/')

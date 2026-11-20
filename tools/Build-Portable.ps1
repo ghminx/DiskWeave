@@ -41,10 +41,10 @@ try {
     Copy-Item -LiteralPath 'target/portable-build/x86_64-pc-windows-msvc/release/diskweave.exe' -Destination (Join-Path $stage 'DiskWeave.exe')
     & (Join-Path $PSScriptRoot 'Test-Portable.ps1') -Executable (Join-Path $stage 'DiskWeave.exe')
     Copy-Item -LiteralPath 'docs/portable-readme.md' -Destination (Join-Path $stage 'README.md')
-    Copy-Item -LiteralPath 'LICENSE' -Destination $stage
+    Copy-Item -LiteralPath 'LICENSE','NOTICE' -Destination $stage
     $notices = [Collections.Generic.List[string]]::new()
     $notices.Add("# DiskWeave $version — third-party notices")
-    $notices.Add('DiskWeave is licensed under MIT (see LICENSE). The components below retain their respective license terms.')
+    $notices.Add("DiskWeave is licensed under $($product.license) (see LICENSE and NOTICE). The components below retain their respective license terms.")
     foreach ($package in ($metadata.packages | Sort-Object name,version)) {
         $id = $package.name+'@'+$package.version
         if ($package.name -eq 'diskweave' -or !$used.ContainsKey($id)) { continue }
@@ -80,7 +80,7 @@ try {
     # 지정한 구성 파일만 패키징하고 빌드 경로·사용자 자료 유입 차단
     foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
         $relative = [IO.Path]::GetRelativePath($stage,$file.FullName).Replace('\','/')
-        if ($relative -notin @('DiskWeave.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md') -and !$relative.StartsWith('licenses/')) { throw "허용하지 않은 포함 파일: $relative" }
+        if ($relative -notin @('DiskWeave.exe','README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md') -and !$relative.StartsWith('licenses/')) { throw "허용하지 않은 포함 파일: $relative" }
     }
     $zip = Join-Path $dist "DiskWeave-$version-windows-x64-preview.zip"
     foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) { $file.LastWriteTimeUtc = [DateTime]::new(2000,1,1,0,0,0,[DateTimeKind]::Utc) }

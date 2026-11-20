@@ -1,4 +1,4 @@
-# DiskWeave 0.1.0 프리뷰
+# DiskWeave 0.1.1 프리뷰
 
 Windows 10/11 x64용 설치 없는 디스크 용량 분석 프로그램임.
 
@@ -7,7 +7,7 @@ Windows 10/11 x64용 설치 없는 디스크 용량 분석 프로그램임.
 - 화면·단축키 설정만 사용자 LocalAppData의 `DiskWeave/preferences.json`에 저장됨. ZIP 교체 시 설정이 유지됨.
 - 일반 스캔은 관리자 권한을 요구하지 않음. 실시간 갱신은 별도 권한과 지원 조건이 필요함.
 - 복사·이동·휴지통 등 파일 변경은 확인 후 수행됨. 원본 보존이 필요한 자료는 별도 백업이 필요함.
-- DiskWeave는 MIT 라이선스로 제공함. 프로젝트 라이선스는 `LICENSE`, 제3자 고지는 `THIRD_PARTY_NOTICES.md`와 `licenses/`에서 확인 가능함.
+- 이 버전의 프로젝트 라이선스는 Apache 2.0이며 원문은 `LICENSE`, 저작권과 출처는 `NOTICE`에 포함함. 제3자 고지는 `THIRD_PARTY_NOTICES.md`와 `licenses/`에서 확인 가능함.
 - 프리뷰 실행 파일은 서명되지 않음. 다른 Windows PC 실행과 이 버전의 C드라이브 전체 실시간 갱신은 미검증 상태임.
 
 ## CLI

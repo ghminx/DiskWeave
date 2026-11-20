@@ -6,7 +6,10 @@ $pe = [BitConverter]::ToInt32($bytes, 60)
 if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'x64 실행 파일이 아님' }
 if ([BitConverter]::ToUInt16($bytes, $pe + 24 + 68) -ne 2) { throw 'GUI 기본 실행용 Windows subsystem이 아님' }
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
-if ($version.ProductName -ne 'DiskWeave' -or $version.FileVersion -ne '0.1.0.0') { throw '제품·버전 리소스 누락' }
+$manifest = Get-Content -Raw -LiteralPath (Join-Path (Split-Path $PSScriptRoot) 'Cargo.toml')
+if ($manifest -notmatch '(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"') { throw 'Cargo.toml 제품 버전 누락' }
+$expectedVersion = $Matches[1] + '.0'
+if ($version.ProductName -ne 'DiskWeave' -or $version.FileVersion -ne $expectedVersion) { throw "제품·버전 리소스 불일치: $expectedVersion" }
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
