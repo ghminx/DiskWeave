@@ -2,13 +2,12 @@ use crate::explorer::Item;
 use crate::global_search::Hit;
 use crate::locations::Snapshot;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap};
 use std::io;
 
 pub enum MapScope {
     Folder(usize),
     Locations,
-    Matches(Vec<Hit>),
 }
 pub struct Tile {
     pub target: Option<Hit>,
@@ -211,25 +210,6 @@ pub fn collect(
                 })?;
             }
         }
-        MapScope::Matches(hits) => {
-            let mut seen = HashSet::new();
-            for &hit in hits {
-                if cancelled() {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "지도 구성 취소"));
-                }
-                if let Item::File(id) = hit.item {
-                    if hit.source >= sources.len() || id >= sources[hit.source].scan.files.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "지도 파일 출처 오류",
-                        ));
-                    }
-                    if seen.insert((hit.source, id)) {
-                        add(hit)?;
-                    }
-                }
-            }
-        }
     }
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "지도 구성 취소"));
@@ -408,7 +388,7 @@ mod tests {
         }
     }
     #[test]
-    fn matched_map_counts_only_unique_files_and_handles_missing_or_cancelled_inputs() {
+    fn location_map_preserves_source_and_rejects_invalid_or_cancelled_inputs() {
         let root =
             std::env::temp_dir().join(format!("diskweave-map-matches-{}", std::process::id()));
         std::fs::create_dir_all(root.join("a")).unwrap();
@@ -425,44 +405,16 @@ mod tests {
                 scan: Arc::new(crate::scanner::scan(&root.join(p), || false).unwrap()),
             })
             .collect();
-        let hit = Hit {
-            source: 0,
-            item: Item::File(0),
-        };
-        let map = collect(
-            &sources,
-            &MapScope::Matches(vec![
-                hit,
-                hit,
-                Hit {
-                    source: 1,
-                    item: Item::File(0),
-                },
-                Hit {
-                    source: 0,
-                    item: Item::Folder(0),
-                },
-            ]),
-            || false,
-        )
-        .unwrap();
+        let map = collect(&sources, &MapScope::Locations, || false).unwrap();
         assert_eq!((map.total, map.tiles.len()), (12, 2));
-        assert_eq!(map.tiles[0].target.unwrap().source, 1);
         assert_eq!(
-            collect(&sources, &MapScope::Locations, || false)
-                .unwrap()
-                .total,
-            12
+            map.tiles[0].target,
+            Some(Hit {
+                source: 1,
+                item: Item::Folder(0)
+            })
         );
-        assert!(collect(
-            &sources,
-            &MapScope::Matches(vec![Hit {
-                source: 9,
-                item: Item::File(0)
-            }]),
-            || false
-        )
-        .is_err());
+        assert!(collect(&sources[..1], &MapScope::Folder(9), || false).is_err());
         assert!(collect(&[], &MapScope::Locations, || true).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

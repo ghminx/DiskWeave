@@ -36,11 +36,10 @@ pub fn field_display<T: std::fmt::Display>(value: crate::metadata::Field<T>) -> 
     }
 }
 pub fn allocation_display(total: crate::metadata::Allocation) -> SizeDisplay {
-    let size = SizeDisplay::new(total.bytes);
     let text = if total.missing() == 0 {
-        size.text
+        SizeDisplay::text_for(total.bytes)
     } else if total.known > 0 {
-        format!("{} (일부)", size.text)
+        format!("{} (일부)", SizeDisplay::text_for(total.bytes))
     } else if total.not_collected > 0 && total.unsupported == 0 && total.failed == 0 {
         "확인하지 않음".into()
     } else if total.unsupported > 0 && total.not_collected == 0 && total.failed == 0 {
@@ -83,6 +82,12 @@ pub fn attributes_display(attributes: u32) -> String {
 }
 impl SizeDisplay {
     pub fn new(bytes: u64) -> Self {
+        Self {
+            text: Self::text_for(bytes),
+            exact: format!("{bytes} B"),
+        }
+    }
+    fn text_for(bytes: u64) -> String {
         let units = ["B", "KiB", "MiB", "GiB", "TiB"];
         let mut unit = 0;
         let mut value = bytes as f64;
@@ -94,13 +99,10 @@ impl SizeDisplay {
             value /= 1024.0;
             unit += 1;
         }
-        Self {
-            text: if unit == 0 {
-                format!("{bytes} B")
-            } else {
-                format!("{value:.1} {}", units[unit])
-            },
-            exact: format!("{bytes} B"),
+        if unit == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{value:.1} {}", units[unit])
         }
     }
 }
@@ -148,7 +150,8 @@ impl ColumnWidths {
         modified: bool,
         allocated: bool,
     ) {
-        let info = detail(scan, item);
+        let values = ItemSizes::read(scan, item);
+        let size = values.logical();
         let width = self.get(2);
         let (rect, response) = ui.allocate_exact_size(
             eframe::egui::vec2(width, crate::ui_style::ROW),
@@ -162,16 +165,10 @@ impl ColumnWidths {
             );
             ui.painter()
                 .rect_filled(track, 3.0, eframe::egui::Color32::from_rgb(39, 52, 65));
-            let parent = match item {
-                Item::Folder(id) => scan.folders[id].parent,
-                Item::File(id) => Some(scan.files[id].parent),
-            };
-            let fraction = parent
-                .map(|p| scan.folders[p].logical_bytes)
+            let fraction = values
+                .parent_bytes
                 .filter(|&n| n > 0)
-                .map_or(0.0, |n| {
-                    crate::search::item_bytes(scan, item) as f64 / n as f64
-                });
+                .map_or(0.0, |n| values.bytes as f64 / n as f64);
             ui.painter().rect_filled(
                 eframe::egui::Rect::from_min_size(
                     track.min,
@@ -184,19 +181,20 @@ impl ColumnWidths {
         crate::ui_style::text(
             ui,
             rect.shrink2(eframe::egui::vec2(12.0, 0.0)),
-            &info.size.text,
+            &size.text,
             true,
             crate::ui_style::TEXT,
             12.0,
         );
-        response.on_hover_text(info.size.exact);
+        response.on_hover_text(size.exact);
         if allocated {
-            crate::ui_style::cell(ui, self.get(7), &info.allocated.text, true)
-                .on_hover_text(info.allocated.exact);
+            let allocation = values.allocated(scan, item);
+            crate::ui_style::cell(ui, self.get(7), &allocation.text, true)
+                .on_hover_text(allocation.exact);
         }
         if !self.result_mode {
-            crate::ui_style::cell(ui, self.get(4), &info.parent_percentage, true);
-            for (column, count) in [(5, info.files), (6, info.folders)] {
+            crate::ui_style::cell(ui, self.get(4), &values.parent_percentage(), true);
+            for (column, count) in [(5, values.files), (6, values.folders)] {
                 crate::ui_style::cell(
                     ui,
                     self.get(column),
@@ -208,7 +206,7 @@ impl ColumnWidths {
             }
         }
         if let Some(source) = path {
-            let path = info.path.display().to_string();
+            let path = crate::search::item_path(scan, item).display().to_string();
             if source {
                 let (rect, response) = ui.allocate_exact_size(
                     eframe::egui::vec2(self.get(1), crate::ui_style::ROW),
@@ -235,7 +233,8 @@ impl ColumnWidths {
             }
         }
         if modified {
-            crate::ui_style::cell(ui, self.get(3), &info.modified, false);
+            let date = crate::local_date::display(crate::search::item_modified(scan, item));
+            crate::ui_style::cell(ui, self.get(3), &date, false);
         }
     }
     pub fn fit(&mut self, available: f32, path: bool, modified: bool, allocated: bool) {
@@ -290,6 +289,85 @@ impl ColumnWidths {
     }
 }
 
+struct ItemSizes {
+    bytes: u64,
+    parent_bytes: Option<u64>,
+    files: Option<u64>,
+    folders: Option<u64>,
+    access: crate::scanner::FolderAccess,
+}
+
+impl ItemSizes {
+    fn read(scan: &ScanResult, item: Item) -> Self {
+        use crate::scanner::FolderAccess;
+        match item {
+            Item::Folder(id) => {
+                let folder = &scan.folders[id];
+                Self {
+                    bytes: folder.logical_bytes,
+                    parent_bytes: folder.parent.map(|id| scan.folders[id].logical_bytes),
+                    files: (!folder.access.unreadable()).then_some(folder.file_count),
+                    folders: (!folder.access.unreadable()).then_some(folder.folder_count),
+                    access: folder.access,
+                }
+            }
+            Item::File(id) => {
+                let file = &scan.files[id];
+                Self {
+                    bytes: file.logical_bytes,
+                    parent_bytes: Some(scan.folders[file.parent].logical_bytes),
+                    files: None,
+                    folders: None,
+                    access: FolderAccess::Complete,
+                }
+            }
+        }
+    }
+
+    fn logical(&self) -> SizeDisplay {
+        if self.access.unreadable() {
+            return SizeDisplay {
+                text: "확인 불가".into(),
+                exact: self.access.label().into(),
+            };
+        }
+        let mut size = SizeDisplay::new(self.bytes);
+        if self.access == crate::scanner::FolderAccess::Partial {
+            size.text.push_str(" (일부)");
+            size.exact.push_str(" · 일부 누락 · 확인된 항목의 합계");
+        }
+        size
+    }
+
+    fn allocated(&self, scan: &ScanResult, item: Item) -> SizeDisplay {
+        if self.access.unreadable() {
+            return self.logical();
+        }
+        let total = match item {
+            Item::Folder(id) => scan.folders[id].allocation,
+            Item::File(id) => {
+                let mut total = crate::metadata::Allocation::default();
+                total
+                    .add(scan.files[id].extra.allocation)
+                    .expect("단일 파일 할당 크기");
+                total
+            }
+        };
+        let mut size = allocation_display(total);
+        if self.access == crate::scanner::FolderAccess::Partial {
+            size.text.push_str(" (일부)");
+        }
+        size
+    }
+
+    fn parent_percentage(&self) -> String {
+        match self.parent_bytes {
+            Some(parent) if !self.access.unreadable() => percentage(self.bytes, parent),
+            _ => "—".into(),
+        }
+    }
+}
+
 pub struct Detail {
     pub allocated: SizeDisplay,
     pub created: String,
@@ -305,11 +383,16 @@ pub struct Detail {
     pub parent_percentage: String,
 }
 pub fn detail(scan: &ScanResult, item: Item) -> Detail {
-    let (allocated, created, attributes, identity, links) = match item {
+    let values = ItemSizes::read(scan, item);
+    let (kind, created, attributes, identity, links) = match item {
         Item::Folder(id) => {
             let folder = &scan.folders[id];
             (
-                folder.allocation,
+                if values.access == crate::scanner::FolderAccess::Complete {
+                    "폴더"
+                } else {
+                    values.access.label()
+                },
                 folder.created,
                 folder.attributes,
                 "파일에만 제공".into(),
@@ -318,12 +401,8 @@ pub fn detail(scan: &ScanResult, item: Item) -> Detail {
         }
         Item::File(id) => {
             let file = &scan.files[id];
-            let mut allocated = crate::metadata::Allocation::default();
-            allocated
-                .add(file.extra.allocation)
-                .expect("단일 파일 할당 크기");
             (
-                allocated,
+                "파일",
                 file.created,
                 file.attributes,
                 field_display(file.extra.identity),
@@ -331,59 +410,19 @@ pub fn detail(scan: &ScanResult, item: Item) -> Detail {
             )
         }
     };
-    let (kind, files, folders, parent) = match item {
-        Item::File(id) => ("파일", None, None, Some(scan.files[id].parent)),
-        Item::Folder(id) => (
-            "폴더",
-            Some(scan.folders[id].file_count),
-            Some(scan.folders[id].folder_count),
-            scan.folders[id].parent,
-        ),
-    };
-    let bytes = crate::search::item_bytes(scan, item);
-    let access = match item {
-        Item::Folder(id) => scan.folders[id].access,
-        Item::File(_) => crate::scanner::FolderAccess::Complete,
-    };
-    let mut size = SizeDisplay::new(bytes);
-    let mut shown_allocation = allocation_display(allocated);
-    if access.unreadable() {
-        size = SizeDisplay {
-            text: "확인 불가".into(),
-            exact: access.label().into(),
-        };
-        shown_allocation = SizeDisplay {
-            text: size.text.clone(),
-            exact: size.exact.clone(),
-        };
-    } else if access == crate::scanner::FolderAccess::Partial {
-        size.text.push_str(" (일부)");
-        size.exact.push_str(" · 일부 누락 · 확인된 항목의 합계");
-        shown_allocation.text.push_str(" (일부)");
-    }
     Detail {
-        allocated: shown_allocation,
+        allocated: values.allocated(scan, item),
         created: crate::local_date::display(created),
         attributes: attributes_display(attributes),
         identity,
         links,
         path: crate::search::item_path(scan, item),
-        kind: if access == crate::scanner::FolderAccess::Complete {
-            kind
-        } else {
-            access.label()
-        },
-        size,
+        kind,
+        size: values.logical(),
         modified: crate::local_date::display(crate::search::item_modified(scan, item)),
-        files: if access.unreadable() { None } else { files },
-        folders: if access.unreadable() { None } else { folders },
-        parent_percentage: if access.unreadable() {
-            "—".into()
-        } else {
-            parent
-                .map(|p| percentage(bytes, scan.folders[p].logical_bytes))
-                .unwrap_or_else(|| "—".into())
-        },
+        files: values.files,
+        folders: values.folders,
+        parent_percentage: values.parent_percentage(),
     }
 }
 

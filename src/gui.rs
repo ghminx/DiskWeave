@@ -55,7 +55,6 @@ pub struct DiskWeaveApp {
     locations_view: LocationsView,
     map: MapController,
     map_view: MapView,
-    map_matched: bool,
     map_collapsed: bool,
     map_height: f32,
     detail_target: Option<Target>,
@@ -1775,8 +1774,16 @@ impl DiskWeaveApp {
             self.detail_target = None;
             self.detail_context = Some(context);
         }
-        if let Some((key, sources)) = self.derived_input(self.statistics.matched) {
-            if self.statistics.needs(&key) {
+        let full = self.derived_input(false);
+        let matched;
+        let stats_input = if self.statistics.matched {
+            matched = self.derived_input(true);
+            matched.as_ref()
+        } else {
+            full.as_ref()
+        };
+        if let Some((key, sources)) = stats_input {
+            if self.statistics.needs(key) {
                 let scope = if self.statistics.matched {
                     StatsScope::Matches(self.hits())
                 } else if let Some(folder) = key.folder {
@@ -1784,20 +1791,14 @@ impl DiskWeaveApp {
                 } else {
                     StatsScope::All
                 };
-                self.statistics.submit(key, sources, scope);
+                self.statistics.submit(key.clone(), sources.clone(), scope);
             }
         } else {
             self.statistics.clear();
         }
-        if let Some((key, sources)) = self.derived_input(self.map_matched) {
+        if let Some((key, sources)) = full {
             if self.map.needs(&key) {
-                let scope = if self.map_matched {
-                    MapScope::Matches(self.hits())
-                } else if let Some(folder) = key.folder {
-                    MapScope::Folder(folder)
-                } else {
-                    MapScope::Locations
-                };
+                let scope = key.folder.map_or(MapScope::Locations, MapScope::Folder);
                 self.map.submit(key, sources, scope);
             }
         } else {
@@ -3667,6 +3668,30 @@ impl eframe::App for DiskWeaveApp {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+    #[test]
+    fn search_match_statistics_and_whole_folder_map_keep_distinct_totals() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::write(fixture.0.join("match.bin"), [0; 3]).unwrap();
+        std::fs::write(fixture.0.join("other.bin"), [0; 9]).unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.search.input.text = "match".into();
+        app.statistics.matched = true;
+        while app.statistics.output.is_none() || app.map.output.is_none() {
+            app.refresh_derived();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.statistics.output.as_ref().unwrap().stats.bytes, 3);
+        assert_eq!(app.map.output.as_ref().unwrap().data.total, 12);
+    }
+
     #[test]
     fn unrelated_live_edit_preserves_completed_local_search_statistics_and_map() {
         let fixture = crate::duplicates::tests::Fixture::new();

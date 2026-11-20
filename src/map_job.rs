@@ -193,7 +193,6 @@ impl Drop for MapController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global_search::Hit;
     use std::time::{Duration, Instant};
     #[test]
     fn map_selection_reveals_tree_and_list_while_preserving_query_and_folder() {
@@ -265,33 +264,23 @@ mod tests {
         let key = PanelKey {
             versions: vec![(10, 1), (11, 1)],
             folder: None,
-            query: Some(crate::search::SearchInput::default()),
+            query: None,
         };
-        let hits = vec![
-            Hit {
-                source: 0,
-                item: Item::File(0),
-            },
-            Hit {
-                source: 1,
-                item: Item::File(0),
-            },
-        ];
         let mut map = MapController::default();
-        map.submit(key.clone(), sources.clone(), MapScope::Matches(hits));
+        map.submit(key.clone(), sources.clone(), MapScope::Locations);
         wait(&mut map);
         assert!(!map.needs(&key));
-        let visible = vec![(10, 1, Item::File(0)), (11, 1, Item::File(0))];
+        let visible = vec![(10, 1, Item::Folder(0)), (11, 1, Item::Folder(0))];
         let selection = map.select(0, visible.into_iter()).unwrap();
         assert_eq!(
             (selection.target, selection.row),
-            ((11, 1, Item::File(0)), Some(1))
+            ((11, 1, Item::Folder(0)), Some(1))
         );
         assert_eq!(
-            map.open(0, crate::file_open::OpenAction::RevealFile)
+            map.open(0, crate::file_open::OpenAction::OpenFolder)
                 .unwrap()
                 .path(),
-            root.join("b/same.bin")
+            root.join("b")
         );
         let selection = map.select(0, std::iter::empty()).unwrap();
         assert_eq!(selection.row, None);
@@ -312,6 +301,12 @@ mod tests {
         wait(&mut map);
         assert_eq!(map.route(0), Some((10, 2, Item::File(0))));
         assert_eq!(map.output.as_ref().unwrap().data.total, 7);
+        assert_eq!(
+            map.open(0, crate::file_open::OpenAction::RevealFile)
+                .unwrap()
+                .path(),
+            root.join("a/same.bin")
+        );
         map.clear();
         assert!(map.output.is_none());
         assert!(map.route(0).is_none());
