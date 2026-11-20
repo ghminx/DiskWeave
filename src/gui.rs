@@ -296,7 +296,7 @@ impl DiskWeaveApp {
             .show(ui, |ui| {
                 ui.set_min_width((width - 20.0).max(0.0));
                 ui.horizontal_wrapped(|ui| {
-                    ui.spinner();
+                    crate::ui_style::activity_indicator(ui);
                     ui.strong(if self.preview_view.previous {
                         "이전 분석 결과"
                     } else {
@@ -314,6 +314,7 @@ impl DiskWeaveApp {
                         self.preview_view.previous = !self.preview_view.previous;
                     }
                 });
+                ui.add_space(6.0);
                 ui.small("현재까지 확인한 용량입니다. 스캔이 끝나면 크기순으로 정렬됩니다.");
             });
     }
@@ -423,10 +424,9 @@ impl DiskWeaveApp {
         view.sync(model);
         if model.folders.is_empty() {
             ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("폴더 구조를 확인하고 있습니다");
-            });
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 0))
+                .show(ui, |ui| ui.weak("발견한 폴더를 여기에 표시합니다."));
             return;
         }
         let folder = &model.folders[view.folder];
@@ -846,7 +846,7 @@ impl DiskWeaveApp {
             {
                 let progress = self.tracking.progress();
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    crate::ui_style::activity_indicator(ui);
                     ui.small(format!(
                         "조회 파일 {}개 · 폴더 {}개",
                         progress.files_scanned, progress.folders_scanned
@@ -1981,16 +1981,26 @@ impl DiskWeaveApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let editable = !self.scan.is_running() && !self.file_blocked();
         let available = ui.available_width();
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-            ui.spacing_mut().interact_size.y = 32.0;
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let [drive_width, browse_width, scan_width] = [68.0, 84.0, 114.0];
+            let height = crate::ui_style::FIELD_HEIGHT;
+            ui.spacing_mut().interact_size.y = height;
             ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
             crate::ui_style::slot(
                 ui,
-                egui::vec2(80.0, 32.0),
+                egui::vec2(drive_width, height),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    let label = self.target.text().chars().take(2).collect::<String>();
-                    ui.menu_button(format!("{label}  ▼"), |ui| {
+                    let label = self
+                        .target
+                        .text()
+                        .get(..2)
+                        .filter(|drive| {
+                            drive.as_bytes()[0].is_ascii_alphabetic() && drive.ends_with(':')
+                        })
+                        .unwrap_or("위치");
+                    let drives = crate::ui_style::scope_button(ui, label, drive_width);
+                    egui::Popup::menu(&drives).show(|ui| {
                         if let Some(path) =
                             self.locations_view
                                 .drive_control(ui, !editable, self.target.text())
@@ -2097,17 +2107,18 @@ impl DiskWeaveApp {
                     });
                 },
             );
-            let path_width = (available - 298.0).max(80.0);
+            let path_width = (available
+                - drive_width
+                - browse_width
+                - scan_width
+                - 3.0 * ui.spacing().item_spacing.x)
+                .max(80.0);
             let mut path = self.target.text().to_owned();
             if ui
                 .add_enabled(
                     editable,
-                    egui::TextEdit::singleline(&mut path)
+                    crate::ui_style::text_field(&mut path, path_width)
                         .id(egui::Id::unique("scan_path"))
-                        .desired_width((path_width - 24.0).max(40.0))
-                        .margin(egui::vec2(10.0, 6.0))
-                        .min_size(egui::vec2(40.0, 32.0))
-                        .align(egui::Align2::LEFT_CENTER)
                         .hint_text("분석할 폴더 경로"),
                 )
                 .changed()
@@ -2118,7 +2129,7 @@ impl DiskWeaveApp {
             if ui
                 .add_enabled(
                     editable,
-                    egui::Button::new("폴더 선택").min_size(egui::vec2(84.0, 32.0)),
+                    egui::Button::new("폴더 선택").min_size(egui::vec2(browse_width, height)),
                 )
                 .clicked()
             {
@@ -2143,7 +2154,7 @@ impl DiskWeaveApp {
                         1.0,
                         egui::Color32::from_rgb(75, 166, 237),
                     ))
-                    .min_size(egui::vec2(114.0, 32.0)),
+                    .min_size(egui::vec2(scan_width, height)),
                 )
                 .clicked()
             {
@@ -3088,8 +3099,10 @@ impl DiskWeaveApp {
                 crate::ui_style::property(ui, "같은 파일의 연결 개수", &links);
                 if self.archive_record.is_none() && identity.is_some() {
                     if self.link_details.busy() {
-                        ui.spinner();
-                        ui.label("연결 개수 확인 중…");
+                        ui.horizontal(|ui| {
+                            crate::ui_style::activity_indicator(ui);
+                            ui.label("연결 개수 확인 중…");
+                        });
                         ui.ctx().request_repaint_after(Duration::from_millis(30));
                     } else if ui.button("연결 개수 확인").clicked() {
                         self.input_error = self.link_details.start().err().map(|e| e.to_string());
@@ -3352,19 +3365,25 @@ impl eframe::App for DiskWeaveApp {
             .show(ui, |ui| self.summary(ui));
         egui::Panel::bottom("status")
             .exact_size(panels.status)
-            .frame(egui::Frame::new().fill(surface()).inner_margin(4))
+            .frame(
+                egui::Frame::new()
+                    .fill(surface())
+                    .inner_margin(egui::Margin::symmetric(14, 4)),
+            )
             .show(ui, |ui| {
-                ui.spacing_mut().interact_size.y = 20.0;
-                ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = 18.0;
+                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if self.scan.is_running() {
-                        ui.spinner();
+                        crate::ui_style::activity_indicator(ui);
                     }
                     let status = self.status();
                     let status_width = (ui.available_width() * 0.40).min(500.0);
-                    ui.add_sized(
-                        [status_width, 18.0],
-                        egui::Label::new(egui::RichText::new(&status).small()).truncate(),
-                    )
+                    ui.scope(|ui| {
+                        ui.set_max_width(status_width);
+                        ui.add(egui::Label::new(egui::RichText::new(&status).small()).truncate())
+                    })
+                    .inner
                     .on_hover_text(format!(
                         "{status}\n{}",
                         self.scan
@@ -3621,10 +3640,13 @@ impl eframe::App for DiskWeaveApp {
                         self.file_refresh.errors.clear();
                     }
                     if self.file_refresh.busy() {
-                        ui.spinner();
-                        if ui.button("목록 갱신 취소").clicked() {
-                            self.file_refresh.cancel(&mut self.scan);
-                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            crate::ui_style::activity_indicator(ui);
+                            if ui.button("목록 갱신 취소").clicked() {
+                                self.file_refresh.cancel(&mut self.scan);
+                            }
+                        });
                     }
                 });
         }

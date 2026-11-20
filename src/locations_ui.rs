@@ -386,7 +386,7 @@ impl LocationsView {
             .sum();
         if self.job.running {
             ui.horizontal(|ui| {
-                ui.spinner();
+                crate::ui_style::activity_indicator(ui);
                 ui.label("모든 분석 위치에서 찾는 중…");
                 if ui.button("검색 취소").clicked() {
                     self.job.cancel();

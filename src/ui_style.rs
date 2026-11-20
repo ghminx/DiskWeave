@@ -12,6 +12,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(104, 184, 255);
 pub const SELECTED: Color32 = Color32::from_rgb(27, 48, 65);
 pub const ROW: f32 = 36.0;
 pub const HEADER: f32 = 36.0;
+pub const FIELD_HEIGHT: f32 = 32.0;
 pub const MAP_COLORS: [Color32; 7] = [
     Color32::from_rgb(57, 124, 118),
     Color32::from_rgb(61, 101, 147),
@@ -27,6 +28,23 @@ pub fn slot(ui: &mut Ui, size: egui::Vec2, layout: egui::Layout, contents: impl 
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     contents(&mut child);
+}
+
+pub fn text_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text)
+        .desired_width(width)
+        .min_size(egui::vec2(0.0, FIELD_HEIGHT))
+        .align(egui::Align2::LEFT_CENTER)
+        .margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 3,
+            bottom: 1,
+        })
+}
+
+pub fn activity_indicator(ui: &mut Ui) -> Response {
+    ui.add(egui::Spinner::new().size(14.0).color(ACCENT))
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -540,7 +558,7 @@ pub fn menu_action(ui: &mut Ui, label: &str, enabled: bool) -> Response {
 /// 12px 꺾쇠와 왼쪽 정렬 제목을 사용하는 고정 높이 선택 버튼 생성.
 pub fn scope_button(ui: &mut Ui, label: &str, width: f32) -> Response {
     let response = ui.add_sized(
-        [width, 32.0],
+        [width, FIELD_HEIGHT],
         egui::Button::new(egui::RichText::new(label).color(Color32::TRANSPARENT)),
     );
     let rect = response.rect;
@@ -564,4 +582,44 @@ pub fn scope_button(ui: &mut Ui, label: &str, width: f32) -> Response {
         true,
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_field_and_scope_share_a_centered_control_row() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.horizontal(|ui| {
+                let scope = scope_button(ui, "현재 폴더 안에서", 170.0);
+                let mut value = String::from("한글 경로");
+                let field = text_field(&mut value, 160.0).show(ui);
+                let bounds = field.response.rect;
+                assert!((bounds.width() - 160.0).abs() <= 1.0);
+                assert!((bounds.height() - scope.rect.height()).abs() <= 1.0);
+                assert!((bounds.center().y - scope.rect.center().y).abs() <= 1.0);
+                let text_center = field.galley_pos.y + field.galley.size().y / 2.0;
+                assert!((text_center - bounds.center().y).abs() <= 2.0);
+            });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn activity_indicator_fits_in_a_compact_centered_status_row() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.horizontal(|ui| {
+                let indicator = activity_indicator(ui);
+                let label = ui.small("스캔 중");
+                assert_eq!(indicator.rect.size(), egui::vec2(14.0, 14.0));
+                assert!((indicator.rect.center().y - label.rect.center().y).abs() <= 1.0);
+            });
+        });
+        output.textures_delta.clear();
+    }
 }

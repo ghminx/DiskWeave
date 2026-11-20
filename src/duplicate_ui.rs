@@ -154,7 +154,7 @@ impl DuplicateUi {
                     });
             });
             if job.running() {
-                ui.spinner();
+                crate::ui_style::activity_indicator(ui);
                 if ui.button("검사 취소").clicked() {
                     job.cancel();
                 }

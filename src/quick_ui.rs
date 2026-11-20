@@ -136,6 +136,7 @@ impl QuickUi {
                         }
                     }
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = crate::ui_style::FIELD_HEIGHT;
                         egui::ComboBox::from_id_salt("quick_mode")
                             .selected_text(if quick.mode == crate::search::SearchMode::Name {
                                 "이름"
@@ -154,9 +155,8 @@ impl QuickUi {
                                     "전체 경로",
                                 );
                             });
-                        let input = ui.add_sized(
-                            [ui.available_width(), 34.0],
-                            egui::TextEdit::singleline(&mut quick.text)
+                        let input = ui.add(
+                            crate::ui_style::text_field(&mut quick.text, ui.available_width())
                                 .hint_text("파일 또는 폴더 찾기"),
                         );
                         if quick.focus {
@@ -164,6 +164,7 @@ impl QuickUi {
                             quick.focus = false;
                         }
                     });
+                    ui.add_space(8.0);
                     let sources = locations.snapshots();
                     let skipped = locations.entries.len() - sources.len();
                     ui.small(format!(
@@ -193,15 +194,18 @@ impl QuickUi {
                         ui.add_space(24.0);
                         ui.label("이름이나 경로를 입력하면 파일과 폴더를 찾습니다.");
                     } else if quick.job.running {
+                        ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            crate::ui_style::activity_indicator(ui);
                             ui.label("검색 중…");
                         });
                     } else if let Some(error) = &quick.job.error {
                         ui.colored_label(egui::Color32::LIGHT_RED, error);
                     } else if let Some(results) = &quick.job.results {
                         let count = results.hits.len();
+                        ui.add_space(4.0);
                         ui.small(format!("{count}개 결과 · 크기순"));
+                        ui.add_space(4.0);
                         let row_height =
                             Layout::new(ui.available_width(), ui.available_height()).row;
                         let mut scroll = egui::ScrollArea::vertical()

@@ -299,10 +299,14 @@ impl FileUi {
                         }
                     });
                 if matches!(d.kind, Kind::Copy | Kind::Move) {
+                    ui.add_space(10.0);
                     ui.label("목적지 폴더");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut d.destination).desired_width(f32::INFINITY),
-                    );
+                    ui.add_space(4.0);
+                    ui.add(crate::ui_style::text_field(
+                        &mut d.destination,
+                        f32::INFINITY,
+                    ));
+                    ui.add_space(8.0);
                     if ui.button("목적지 선택…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_title("목적지 폴더 선택")
@@ -318,20 +322,22 @@ impl FileUi {
                     );
                     ui.label("휴지통 지원을 확인할 수 없으면 실행하지 않습니다.");
                 } else {
+                    ui.add_space(10.0);
                     ui.label(if d.kind == Kind::Rename {
                         "새 이름"
                     } else {
                         "폴더 이름"
                     });
-                    ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
+                    ui.add_space(4.0);
+                    ui.add(crate::ui_style::text_field(&mut d.name, f32::INFINITY));
                     if let Some(parent) = &d.context.current {
+                        ui.add_space(6.0);
                         ui.add(egui::Label::new(parent.display().to_string()).wrap());
                     }
                 }
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::from_rgb(255, 145, 140), error);
                 }
-                ui.add_space(12.0);
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(10.0);
@@ -385,7 +391,7 @@ impl FileUi {
                 if job.working() {
                     let p = job.progress();
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        crate::ui_style::activity_indicator(ui);
                         ui.label(format!("{:.1}초", job.elapsed()));
                     });
                     ui.add(egui::Label::new(p.current.display().to_string()).wrap());

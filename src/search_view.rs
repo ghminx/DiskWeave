@@ -423,7 +423,7 @@ impl SearchView {
         ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
         crate::ui_style::slot(
             ui,
-            egui::vec2(width.scope, 32.0),
+            egui::vec2(width.scope, crate::ui_style::FIELD_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let response = crate::ui_style::scope_button(ui, current.label(), width.scope);
@@ -456,13 +456,12 @@ impl SearchView {
                 });
             },
         );
+        let input_width = ui.available_width();
         self.editing |= ui
             .add(
-                egui::TextEdit::singleline(&mut self.input.text)
+                crate::ui_style::text_field(&mut self.input.text, input_width)
                     .id(egui::Id::unique("search_query"))
-                    .hint_text("선택한 범위에서 이름 검색")
-                    .desired_width((ui.available_width() - 8.0).max(48.0))
-                    .margin(egui::vec2(8.0, 6.0)),
+                    .hint_text("선택한 범위에서 이름 검색"),
             )
             .has_focus();
         chosen

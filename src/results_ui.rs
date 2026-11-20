@@ -209,7 +209,7 @@ impl ResultsUi {
     pub fn status(&mut self, ui: &mut egui::Ui) {
         if self.job.running() {
             ui.horizontal_wrapped(|ui| {
-                ui.spinner();
+                crate::ui_style::activity_indicator(ui);
                 ui.label(self.job.stage());
                 if ui.button("작업 취소").clicked() {
                     self.job.cancel();
@@ -383,9 +383,8 @@ impl ResultsUi {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("변경된 경로 찾기")
-                            .desired_width(200.0),
+                        crate::ui_style::text_field(&mut self.query, 200.0)
+                            .hint_text("변경된 경로 찾기"),
                     );
                     for (kind, label) in [
                         (None, "전체"),
