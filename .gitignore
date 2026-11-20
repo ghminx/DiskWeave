@@ -5,3 +5,5 @@
 *.dwsnap
 DiskWeave.csv
 DiskWeave.json
+
+/IMPLEMENTED_FEATURES.md
