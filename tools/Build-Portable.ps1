@@ -4,12 +4,27 @@ $repo = Split-Path $PSScriptRoot
 Push-Location $repo
 try {
     if (!$SkipBuild) {
-        $previous = $env:RUSTFLAGS
+        $previous = $env:CARGO_ENCODED_RUSTFLAGS
         try {
-            $env:RUSTFLAGS = ($previous+' -C target-feature=+crt-static').Trim()
+            $separator = [string][char]31
+            $flags = @()
+            if ($previous) {
+                $flags += $previous.Split([char]31)
+            } elseif ($env:RUSTFLAGS) {
+                $flags += $env:RUSTFLAGS.Trim() -split '\s+'
+            }
+            $flags += '-C', 'target-feature=+crt-static'
+            $cargoHome = if ($env:CARGO_HOME) { [IO.Path]::GetFullPath($env:CARGO_HOME) } else { Join-Path $env:USERPROFILE '.cargo' }
+            foreach ($pair in @(@($env:USERPROFILE, '/build-user'), @($cargoHome, '/cargo'), @($repo, '/diskweave'))) {
+                $root = $pair[0].TrimEnd('\', '/')
+                foreach ($prefix in @($root, $root.Replace('\', '/')) | Select-Object -Unique) {
+                    $flags += "--remap-path-prefix=$prefix=$($pair[1])"
+                }
+            }
+            $env:CARGO_ENCODED_RUSTFLAGS = $flags -join $separator
             cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir target/portable-build
             if ($LASTEXITCODE -ne 0) { throw 'Portable Release 빌드 실패' }
-        } finally { $env:RUSTFLAGS = $previous }
+        } finally { $env:CARGO_ENCODED_RUSTFLAGS = $previous }
     }
     $metadataJson = cargo metadata --locked --filter-platform x86_64-pc-windows-msvc --format-version 1
     if ($LASTEXITCODE -ne 0) { throw '의존성 메타데이터 확인 실패' }
@@ -26,9 +41,10 @@ try {
     Copy-Item -LiteralPath 'target/portable-build/x86_64-pc-windows-msvc/release/diskweave.exe' -Destination (Join-Path $stage 'DiskWeave.exe')
     & (Join-Path $PSScriptRoot 'Test-Portable.ps1') -Executable (Join-Path $stage 'DiskWeave.exe')
     Copy-Item -LiteralPath 'docs/portable-readme.md' -Destination (Join-Path $stage 'README.md')
+    Copy-Item -LiteralPath 'LICENSE' -Destination $stage
     $notices = [Collections.Generic.List[string]]::new()
     $notices.Add("# DiskWeave $version — third-party notices")
-    $notices.Add('Local preview only. Project redistribution license has not been selected. Third-party terms remain applicable.')
+    $notices.Add('DiskWeave is licensed under MIT (see LICENSE). The components below retain their respective license terms.')
     foreach ($package in ($metadata.packages | Sort-Object name,version)) {
         $id = $package.name+'@'+$package.version
         if ($package.name -eq 'diskweave' -or !$used.ContainsKey($id)) { continue }
@@ -64,7 +80,7 @@ try {
     # 지정한 구성 파일만 패키징하고 빌드 경로·사용자 자료 유입 차단
     foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
         $relative = [IO.Path]::GetRelativePath($stage,$file.FullName).Replace('\','/')
-        if ($relative -notin @('DiskWeave.exe','README.md','THIRD_PARTY_NOTICES.md') -and !$relative.StartsWith('licenses/')) { throw "허용하지 않은 포함 파일: $relative" }
+        if ($relative -notin @('DiskWeave.exe','README.md','LICENSE','THIRD_PARTY_NOTICES.md') -and !$relative.StartsWith('licenses/')) { throw "허용하지 않은 포함 파일: $relative" }
     }
     $zip = Join-Path $dist "DiskWeave-$version-windows-x64-preview.zip"
     foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) { $file.LastWriteTimeUtc = [DateTime]::new(2000,1,1,0,0,0,[DateTimeKind]::Utc) }
