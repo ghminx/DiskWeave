@@ -167,16 +167,17 @@ impl Desktop {
         let mut events = vec![];
         if !self.initialized {
             self.initialized = true;
-            let preferences =
-                match crate::quick_settings::path().and_then(|p| crate::quick_settings::load(&p)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        events.push(Event::Notice(format!(
-                            "검색창 설정을 읽지 못해 기본값을 사용합니다: {e}"
-                        )));
-                        Preferences::default()
-                    }
-                };
+            let preferences = match crate::quick_settings::path()
+                .and_then(|p| crate::app_settings::load_quick(&p))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    events.push(Event::Notice(format!(
+                        "검색창 설정을 읽지 못해 기본값을 사용합니다: {e}"
+                    )));
+                    Preferences::default()
+                }
+            };
             match Host::start(ctx.clone()) {
                 Ok(host) => {
                     if let Err(e) = host.apply(preferences) {
@@ -205,7 +206,7 @@ impl Desktop {
                     self.busy = false;
                     if self.save_pending && error.is_none() {
                         if let Err(e) = crate::quick_settings::path()
-                            .and_then(|p| crate::quick_settings::save(&p, preferences))
+                            .and_then(|p| crate::app_settings::save_quick(&p, *preferences))
                         {
                             notices.push(Event::Notice(format!("현재 설정은 적용됐지만 저장하지 못했습니다. 다음 실행에서 다시 설정해 주세요: {e}")));
                         }

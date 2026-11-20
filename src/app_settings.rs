@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     io::{self, Read},
     path::Path,
@@ -161,10 +161,10 @@ impl UiSettings {
         Ok(())
     }
 }
-pub fn load(path: &Path) -> io::Result<Settings> {
+fn read<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
         Err(e) => return Err(e),
     };
     let mut bytes = Vec::new();
@@ -172,10 +172,18 @@ pub fn load(path: &Path) -> io::Result<Settings> {
     if bytes.len() > 8192 {
         return Err(io::Error::other("설정 파일이 너무 큽니다"));
     }
-    let settings: Settings = serde_json::from_slice(&bytes).map_err(crate::output::json_error)?;
+    serde_json::from_slice(&bytes).map_err(crate::output::json_error)
+}
+pub fn load(path: &Path) -> io::Result<Settings> {
+    let settings: Settings = read(path)?;
     settings.quick.validate()?;
     settings.ui.validate()?;
     Ok(settings)
+}
+pub fn load_quick(path: &Path) -> io::Result<crate::quick_settings::Preferences> {
+    let preferences: crate::quick_settings::Preferences = read(path)?;
+    preferences.validate()?;
+    Ok(preferences)
 }
 fn save(path: &Path, settings: &Settings) -> io::Result<()> {
     settings.quick.validate()?;
@@ -214,7 +222,7 @@ mod tests {
             stay: true,
             ..Default::default()
         };
-        crate::quick_settings::save(&path, &quick).unwrap();
+        save_quick(&path, quick).unwrap();
         let mut settings = load(&path).unwrap();
         assert_eq!(settings.quick, quick);
         settings.ui.map_collapsed = true;
@@ -226,7 +234,7 @@ mod tests {
             enabled: false,
             ..quick
         };
-        crate::quick_settings::save(&path, &changed).unwrap();
+        save_quick(&path, changed).unwrap();
         let restored = load(&path).unwrap();
         assert_eq!(restored.quick, changed);
         assert_eq!(restored.ui, settings.ui);
@@ -235,6 +243,11 @@ mod tests {
         for key in ["search", "history", "location", "files", "path"] {
             assert!(!text.contains(&format!("\"{key}\"")));
         }
+        let mut invalid_ui: serde_json::Value = serde_json::from_str(&text).unwrap();
+        invalid_ui["ui"]["workers"] = 3.into();
+        std::fs::write(&path, invalid_ui.to_string()).unwrap();
+        assert!(load(&path).is_err());
+        assert_eq!(load_quick(&path).unwrap(), changed);
         std::fs::write(&path, b"{broken").unwrap();
         assert!(save_ui(&path, UiSettings::default()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
