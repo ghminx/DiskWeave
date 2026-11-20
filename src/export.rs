@@ -1,6 +1,7 @@
 use crate::explorer::Item;
 use crate::global_search::Hit;
 use crate::locations::Snapshot;
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -90,12 +91,12 @@ fn text(writer: &mut dyn Write, value: &str) -> io::Result<()> {
         value.trim_start().chars().next(),
         Some('=' | '+' | '-' | '@')
     ) || value.starts_with(['\t', '\r', '\n']);
-    write!(
-        writer,
-        "\"{}{}\"",
-        if guarded { "'" } else { "" },
-        value.replace('"', "\"\"")
-    )
+    let value = if value.contains('"') {
+        Cow::Owned(value.replace('"', "\"\""))
+    } else {
+        Cow::Borrowed(value)
+    };
+    write!(writer, "\"{}{}\"", if guarded { "'" } else { "" }, value)
 }
 pub fn write(
     sources: &[Snapshot],

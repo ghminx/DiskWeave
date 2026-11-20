@@ -2,7 +2,8 @@ use crate::explorer::Item;
 use crate::metadata::{Allocation, Extra};
 use crate::scanner::ScanResult;
 use crate::snapshot::SavedScan;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -130,7 +131,8 @@ pub fn compare(
             "같은 분석 경로의 전체 결과끼리 비교하세요",
         ));
     }
-    if let (Some(a), Some(b)) = (volume(a), volume(b)) {
+    let (old_volume, new_volume) = (volume(a), volume(b));
+    if let (Some(a), Some(b)) = (old_volume, new_volume) {
         if a != b {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -138,18 +140,25 @@ pub fn compare(
             ));
         }
     }
-    let old = entries(a, &cancelled)?;
-    let new = entries(b, &cancelled)?;
+    let mut old = entries(a, &cancelled)?.into_iter().peekable();
+    let mut new = entries(b, &cancelled)?.into_iter().peekable();
     let incomplete = a.error_count > 0
         || b.error_count > 0
         || a.skipped_reparse_points > 0
         || b.skipped_reparse_points > 0;
-    let keys: BTreeSet<_> = old.keys().chain(new.keys()).collect();
     let mut changes = Vec::new();
-    for path in keys {
+    loop {
+        let order = match (old.peek(), new.peek()) {
+            (Some((a, _)), Some((b, _))) => a.cmp(b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
         crate::output::check(&cancelled)?;
-        let left = old.get(path).map(|&item| info(a, item));
-        let right = new.get(path).map(|&item| info(b, item));
+        let old_row = (order != Ordering::Greater).then(|| old.next().unwrap());
+        let new_row = (order != Ordering::Less).then(|| new.next().unwrap());
+        let left = old_row.as_ref().map(|&(_, item)| info(a, item));
+        let right = new_row.as_ref().map(|&(_, item)| info(b, item));
         if left == right {
             continue;
         }
@@ -181,7 +190,7 @@ pub fn compare(
             Some(i128::from(after.unwrap_or(0)) - i128::from(before.unwrap_or(0)))
         };
         changes.push(Change {
-            path: path.clone(),
+            path: old_row.or(new_row).unwrap().0,
             folder,
             kind,
             before,
@@ -196,7 +205,7 @@ pub fn compare(
         after_bytes: b.folders[0].logical_bytes,
         delta: i128::from(b.folders[0].logical_bytes) - i128::from(a.folders[0].logical_bytes),
         incomplete,
-        volume_unverified: volume(a).is_none() || volume(b).is_none(),
+        volume_unverified: old_volume.is_none() || new_volume.is_none(),
         changes,
         before_time: before.finished,
         after_time: after.finished,
@@ -241,6 +250,10 @@ mod tests {
             (report.before_bytes, report.after_bytes, report.delta),
             (10, 13, 3)
         );
+        assert!(report
+            .changes
+            .windows(2)
+            .all(|pair| pair[0].path < pair[1].path));
         let removed = report
             .changes
             .iter()
