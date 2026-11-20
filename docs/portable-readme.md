@@ -1,4 +1,4 @@
-# DiskWeave 0.1.1 프리뷰
+# DiskWeave 0.1.0 프리뷰
 
 Windows 10/11 x64용 설치 없는 디스크 용량 분석 프로그램임.
 
