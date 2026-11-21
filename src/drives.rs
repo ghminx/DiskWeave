@@ -11,6 +11,17 @@ pub struct Drive {
 }
 
 pub fn read() -> io::Result<Vec<Drive>> {
+    read_matching(|kind| matches!(kind, 2 | 3))
+}
+
+pub fn fixed_roots() -> io::Result<Vec<PathBuf>> {
+    Ok(read_matching(|kind| kind == 3)?
+        .into_iter()
+        .map(|drive| drive.path)
+        .collect())
+}
+
+fn read_matching(include: impl Fn(u32) -> bool) -> io::Result<Vec<Drive>> {
     // Windows 다중 문자열의 필요 크기를 조회한 뒤 출력 버퍼 확보.
     let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
     if needed == 0 {
@@ -28,7 +39,14 @@ pub fn read() -> io::Result<Vec<Drive>> {
     }
     Ok(local_drives(
         &buffer[..written as usize],
-        |root| unsafe { GetDriveTypeW(root.as_ptr()) },
+        |root| {
+            let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+            if include(kind) {
+                kind
+            } else {
+                0
+            }
+        },
         |root| {
             let mut available = 0;
             let success = unsafe {

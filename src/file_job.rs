@@ -63,6 +63,13 @@ impl Controller {
         self.started.map_or(0.0, |t| t.elapsed().as_secs_f32())
     }
     pub fn prepare(&mut self, request: Request) -> io::Result<()> {
+        self.prepare_expected(request, None)
+    }
+    pub fn prepare_expected(
+        &mut self,
+        request: Request,
+        expected: Option<(crate::metadata::Identity, bool)>,
+    ) -> io::Result<()> {
         if self.busy() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -75,11 +82,13 @@ impl Controller {
         let worker_progress = Arc::clone(&progress);
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = file_ops::prepare(
-                request,
-                &|| worker_cancel.load(Ordering::Relaxed),
-                &mut |p| *worker_progress.lock().unwrap() = p,
-            );
+            let cancel = || worker_cancel.load(Ordering::Relaxed);
+            let mut progress = |p| *worker_progress.lock().unwrap() = p;
+            let result = if expected.is_some() {
+                file_ops::prepare_expected(request, expected, &cancel, &mut progress)
+            } else {
+                file_ops::prepare(request, &cancel, &mut progress)
+            };
             let _ = sender.send(Response::Prepared(result));
         });
         self.cancel = cancel;

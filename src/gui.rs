@@ -729,6 +729,15 @@ impl DiskWeaveApp {
     }
     fn file_tick(&mut self) {
         if self.file_job.poll() {
+            if let Some(report) = &self.file_job.report {
+                if matches!(report.action, Some(crate::file_ops::Action::Recycle)) {
+                    for item in report.items.iter().filter(|item| item.succeeded()) {
+                        if let Some(path) = &item.source {
+                            self.quick.remove_recycled(path);
+                        }
+                    }
+                }
+            }
             let affected = self
                 .file_job
                 .report
@@ -1324,27 +1333,40 @@ impl DiskWeaveApp {
                         self.show_main(ctx);
                         self.quick.hide();
                     }
-                    crate::quick_ui::Action::Open(target, action) => {
-                        let (id, generation, item) = target;
-                        let entry = self
-                            .scan
-                            .get(id)
-                            .filter(|e| !e.stale && e.generation == generation)
-                            .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다"))?;
-                        let scan = &entry.scan.completed().unwrap().result;
-                        let request = OpenRequest::for_item(scan, item, action);
+                    crate::quick_ui::Action::Open(request) => {
                         self.file_open.start(request)?;
                         self.quick_ui.opening = true;
                     }
-                    crate::quick_ui::Action::Copy((id, generation, item)) => {
-                        let entry = self
-                            .scan
-                            .get(id)
-                            .filter(|e| !e.stale && e.generation == generation)
-                            .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다"))?;
-                        let path =
-                            crate::search::item_path(&entry.scan.completed().unwrap().result, item);
+                    crate::quick_ui::Action::Copy(path) => {
                         crate::path_copy::copy_to_clipboard(ctx, &[path])?;
+                    }
+                    crate::quick_ui::Action::Recycle(hit) => {
+                        if !self.file_actions_available() {
+                            return Err(std::io::Error::other("진행 중인 작업을 먼저 마쳐 주세요"));
+                        }
+                        let identity = hit.identity.ok_or_else(|| {
+                            std::io::Error::other(
+                                "검색 결과의 파일 또는 폴더 ID를 확인할 수 없습니다",
+                            )
+                        })?;
+                        let context = crate::file_ui::Context {
+                            paths: vec![hit.path],
+                            current: None,
+                            protected: self
+                                .scan
+                                .entries
+                                .iter()
+                                .map(|entry| entry.path.clone())
+                                .collect(),
+                            writable: true,
+                        };
+                        self.file_ui.begin_search_recycle(
+                            context,
+                            identity,
+                            hit.kind == crate::file_open::TargetKind::Folder,
+                        )?;
+                        self.show_main(ctx);
+                        self.quick.hide();
                     }
                 }
                 Ok(())
@@ -2698,6 +2720,7 @@ impl DiskWeaveApp {
                                 ui,
                                 self.locations_view.global_mode,
                                 self.scan.snapshots().len() > 1,
+                                self.archive_record.is_none(),
                             );
                         },
                     );
@@ -2722,6 +2745,7 @@ impl DiskWeaveApp {
                                         ui,
                                         self.locations_view.global_mode,
                                         self.scan.snapshots().len() > 1,
+                                        self.archive_record.is_none(),
                                     );
                                 },
                             );
@@ -2729,9 +2753,17 @@ impl DiskWeaveApp {
                     );
                 }
             });
-        if let Some(scope) = chosen_scope {
-            self.locations_view.choose_scope(&mut self.search, scope);
-            self.detail_target = None;
+        match chosen_scope {
+            Some(crate::search_view::ScopeChoice::Scan(scope)) => {
+                self.locations_view.choose_scope(&mut self.search, scope);
+                self.detail_target = None;
+            }
+            Some(crate::search_view::ScopeChoice::QuickSearch) => {
+                self.quick.set_scope(crate::quick_search::Scope::Folder);
+                self.quick.open();
+                ui.ctx().request_repaint();
+            }
+            None => {}
         }
         if let Some(forward) = history_direction {
             self.history_move(forward);

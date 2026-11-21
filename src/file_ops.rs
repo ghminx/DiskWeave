@@ -45,6 +45,13 @@ pub struct Target {
     modified: u64,
 }
 impl Target {
+    pub fn identity(&self) -> crate::metadata::Identity {
+        crate::metadata::Identity {
+            volume: self.id.0,
+            file: self.id.1,
+        }
+    }
+
     pub fn capture(path: &Path) -> io::Result<Self> {
         let path = std::path::absolute(path)?;
         for part in path.ancestors() {
@@ -318,7 +325,23 @@ pub fn prepare(
     cancel: &impl Fn() -> bool,
     progress: &mut impl FnMut(Progress),
 ) -> io::Result<Plan> {
+    prepare_expected(request, None, cancel, progress)
+}
+
+pub fn prepare_expected(
+    request: Request,
+    expected: Option<(crate::metadata::Identity, bool)>,
+    cancel: &impl Fn() -> bool,
+    progress: &mut impl FnMut(Progress),
+) -> io::Result<Plan> {
     crate::output::check(cancel)?;
+    if expected.is_some()
+        && (request.paths.len() != 1 || !matches!(request.action, Action::Recycle))
+    {
+        return Err(invalid(
+            "검색에서 선택한 항목 하나를 휴지통으로 옮길 수 있습니다",
+        ));
+    }
     if matches!(request.action, Action::Recycle) {
         if request.paths.is_empty() {
             return Err(invalid("휴지통으로 옮길 항목을 선택하세요"));
@@ -335,8 +358,19 @@ pub fn prepare(
                 issue: None,
                 tree: vec![],
             };
+            let source = Target::capture(&path);
+            if let Some((id, directory)) = expected {
+                let target = source
+                    .as_ref()
+                    .map_err(|e| invalid(&format!("검색 결과를 다시 확인하세요. {e}")))?;
+                if target.identity() != id || target.directory != directory {
+                    return Err(invalid(
+                        "검색한 항목이 다른 파일 또는 폴더로 바뀌었습니다. 다시 검색해 주세요",
+                    ));
+                }
+            }
             let result: io::Result<()> = (|| {
-                let source = Target::capture(&path)?;
+                let source = source?;
                 protect(&source, &request.protected)?;
                 item.tree = collect(&source, cancel)?;
                 item.source = Some(source);
@@ -922,6 +956,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn recycle_from_search_refuses_a_replacement_at_the_same_path() {
+        let f = Fixture::new();
+        let path = f.0.join("report.txt");
+        fs::write(&path, b"original").unwrap();
+        let found = Target::capture(&path).unwrap();
+        fs::rename(&path, f.0.join("original.txt")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let request = Request {
+            action: Action::Recycle,
+            paths: vec![path.clone()],
+            protected: vec![f.0.clone()],
+        };
+        let plan = prepare_expected(
+            request,
+            Some((found.identity(), false)),
+            &|| false,
+            &mut |_| {},
+        );
+        assert!(plan.is_err());
+        assert_eq!(fs::read(path).unwrap(), b"replacement");
     }
     #[test]
     fn replacing_a_file_with_alternate_streams_preserves_source_and_replacement_content() {

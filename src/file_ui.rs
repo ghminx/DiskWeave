@@ -36,6 +36,7 @@ pub struct Dialog {
     pub destination: String,
     transfer_choice: bool,
     context: Context,
+    expected: Option<(crate::metadata::Identity, bool)>,
 }
 #[derive(Default)]
 pub struct FileUi {
@@ -129,11 +130,22 @@ impl FileUi {
             destination,
             transfer_choice: false,
             context,
+            expected: None,
         });
         self.visible = false;
         self.error = None;
         self.replace_confirmed = false;
         self.delete_confirmed = false;
+        Ok(())
+    }
+    pub fn begin_search_recycle(
+        &mut self,
+        context: Context,
+        identity: crate::metadata::Identity,
+        directory: bool,
+    ) -> io::Result<()> {
+        self.begin(Kind::Recycle, context)?;
+        self.dialog.as_mut().unwrap().expected = Some((identity, directory));
         Ok(())
     }
     pub fn request(&self) -> io::Result<Request> {
@@ -346,7 +358,11 @@ impl FileUi {
                 self.dialog = None;
             }
             if submit {
-                match self.request().and_then(|request| job.prepare(request)) {
+                let expected = self.dialog.as_ref().and_then(|dialog| dialog.expected);
+                match self.request().and_then(|request| match expected {
+                    Some(expected) => job.prepare_expected(request, Some(expected)),
+                    None => job.prepare(request),
+                }) {
                     Ok(()) => {
                         self.dialog = None;
                         self.visible = true;

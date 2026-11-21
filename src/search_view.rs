@@ -20,6 +20,11 @@ pub enum SearchScope {
     Location,
     Registered,
 }
+
+pub enum ScopeChoice {
+    Scan(SearchScope),
+    QuickSearch,
+}
 impl SearchScope {
     pub fn label(self) -> &'static str {
         match self {
@@ -420,7 +425,8 @@ impl SearchView {
         ui: &mut egui::Ui,
         global: bool,
         multiple: bool,
-    ) -> Option<SearchScope> {
+        quick_search_available: bool,
+    ) -> Option<ScopeChoice> {
         self.editing = false;
         let current = self.scope(global);
         let mut chosen = None;
@@ -449,7 +455,14 @@ impl SearchView {
                             .selectable_label(current == scope, scope.label())
                             .clicked()
                         {
-                            chosen = Some(scope);
+                            chosen = Some(ScopeChoice::Scan(scope));
+                            ui.close();
+                        }
+                    }
+                    if quick_search_available {
+                        ui.separator();
+                        if ui.button("다른 위치에서 찾기…").clicked() {
+                            chosen = Some(ScopeChoice::QuickSearch);
                             ui.close();
                         }
                     }
