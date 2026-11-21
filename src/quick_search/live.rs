@@ -26,7 +26,7 @@ pub struct Hit {
     pub identity: Option<Identity>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Input {
     pub folder: Option<PathBuf>,
     pub text: String,

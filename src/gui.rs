@@ -4,7 +4,7 @@ mod folders;
 use crate::analysis::StatsScope;
 use crate::analysis_panel::{AnalysisPanel, PanelKey};
 use crate::explorer::{Explorer, Item};
-use crate::file_open::{OpenAction, OpenController, OpenRequest, OpenStatus};
+use crate::file_open::{OpenAction, OpenController, OpenRequest, OpenStatus, TargetKind};
 use crate::global_search::Hit;
 use crate::locations::{Locations, Snapshot};
 use crate::locations_ui::{LocationAction, LocationsView};
@@ -257,15 +257,15 @@ fn allocation_summary(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
     });
 }
 
-fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
+fn open_menu(ui: &mut egui::Ui, kind: TargetKind) -> Option<OpenAction> {
     let mut action = None;
-    match item {
-        Item::Folder(_) => {
+    match kind {
+        TargetKind::Folder => {
             if crate::ui_style::menu_action(ui, "탐색기에서 열기", true).clicked() {
                 action = Some(OpenAction::OpenFolder);
             }
         }
-        Item::File(_) => {
+        TargetKind::File => {
             if crate::ui_style::menu_action(ui, "기본 앱으로 열기", true).clicked() {
                 action = Some(OpenAction::OpenFile);
             }
@@ -2594,7 +2594,7 @@ impl DiskWeaveApp {
                                 1,
                                 true,
                             );
-                            if let Some(action) = open_menu(ui, Item::Folder(folder)) {
+                            if let Some(action) = open_menu(ui, TargetKind::Folder) {
                                 open = Some(OpenRequest::for_item(
                                     &source.scan,
                                     Item::Folder(folder),
@@ -3101,7 +3101,7 @@ impl DiskWeaveApp {
                                         ui.close();
                                     }
                                 }
-                                if let Some(action) = open_menu(ui, item) {
+                                if let Some(action) = open_menu(ui, item.into()) {
                                     open = Some(OpenRequest::for_item(&source.scan, item, action));
                                 }
                             });
@@ -3987,7 +3987,7 @@ mod session_tests {
         app.prepare_folder_drop(vec![left.join("report.txt")], target)
             .unwrap();
         app.file_job
-            .prepare(app.file_ui.request().unwrap())
+            .prepare(app.file_ui.request().unwrap(), None)
             .unwrap();
         app.file_ui.dialog = None;
         while app.file_job.working() {

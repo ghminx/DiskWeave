@@ -5,12 +5,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 fn plan(action: Action, paths: Vec<PathBuf>, roots: &[PathBuf]) -> io::Result<file_ops::Plan> {
-    file_ops::prepare(
+    file_ops::prepare_expected(
         Request {
             action,
             paths,
             protected: roots.to_vec(),
         },
+        None,
         &|| false,
         &mut |_| {},
     )

@@ -11,17 +11,34 @@ pub struct Drive {
 }
 
 pub fn read() -> io::Result<Vec<Drive>> {
-    read_matching(|kind| matches!(kind, 2 | 3))
+    read_matching(
+        |kind| matches!(kind, 2 | 3),
+        |path, root| {
+            let mut available = 0;
+            let success = unsafe {
+                GetDiskFreeSpaceExW(
+                    root.as_ptr(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            Drive {
+                path,
+                available: (success != 0).then_some(available),
+            }
+        },
+    )
 }
 
 pub fn fixed_roots() -> io::Result<Vec<PathBuf>> {
-    Ok(read_matching(|kind| kind == 3)?
-        .into_iter()
-        .map(|drive| drive.path)
-        .collect())
+    read_matching(|kind| kind == 3, |path, _| path)
 }
 
-fn read_matching(include: impl Fn(u32) -> bool) -> io::Result<Vec<Drive>> {
+fn read_matching<T>(
+    include: impl Fn(u32) -> bool,
+    read: impl Fn(PathBuf, &[u16]) -> T,
+) -> io::Result<Vec<T>> {
     // Windows 다중 문자열의 필요 크기를 조회한 뒤 출력 버퍼 확보.
     let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
     if needed == 0 {
@@ -39,46 +56,29 @@ fn read_matching(include: impl Fn(u32) -> bool) -> io::Result<Vec<Drive>> {
     }
     Ok(local_drives(
         &buffer[..written as usize],
-        |root| {
-            let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
-            if include(kind) {
-                kind
-            } else {
-                0
-            }
-        },
-        |root| {
-            let mut available = 0;
-            let success = unsafe {
-                GetDiskFreeSpaceExW(
-                    root.as_ptr(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            (success != 0).then_some(available)
-        },
+        |root| unsafe { GetDriveTypeW(root.as_ptr()) },
+        include,
+        read,
     ))
 }
 
-fn local_drives(
+fn local_drives<T>(
     roots: &[u16],
     drive_type: impl Fn(&[u16]) -> u32,
-    available: impl Fn(&[u16]) -> Option<u64>,
-) -> Vec<Drive> {
+    include: impl Fn(u32) -> bool,
+    read: impl Fn(PathBuf, &[u16]) -> T,
+) -> Vec<T> {
     let mut drives = Vec::new();
     for root in roots
         .split(|&unit| unit == 0)
         .filter(|root| !root.is_empty())
     {
         let terminated: Vec<u16> = root.iter().copied().chain(Some(0)).collect();
-        // 고정식·이동식 드라이브만 표시하며 다른 드라이브는 용량 조회도 생략.
-        if matches!(drive_type(&terminated), 2 | 3) {
-            drives.push(Drive {
-                path: std::ffi::OsString::from_wide(root).into(),
-                available: available(&terminated),
-            });
+        if include(drive_type(&terminated)) {
+            drives.push(read(
+                std::ffi::OsString::from_wide(root).into(),
+                &terminated,
+            ));
         }
     }
     drives
@@ -165,10 +165,14 @@ mod tests {
                     _ => unreachable!(),
                 }
             },
-            |root| match char::from_u32(root[0].into()) {
-                Some('C') => Some(42),
-                Some('E') => None,
-                _ => panic!("지원하지 않는 드라이브의 여유 공간 조회"),
+            |kind| matches!(kind, 2 | 3),
+            |path, root| Drive {
+                path,
+                available: match char::from_u32(root[0].into()) {
+                    Some('C') => Some(42),
+                    Some('E') => None,
+                    _ => panic!("지원하지 않는 드라이브의 여유 공간 조회"),
+                },
             },
         );
         assert_eq!(drives.len(), 2);

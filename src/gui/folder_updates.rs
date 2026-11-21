@@ -11,7 +11,6 @@ use std::{
     path::Path,
 };
 
-#[derive(Clone)]
 struct Row {
     name: OsString,
     current: Entry,
@@ -185,7 +184,7 @@ impl LiveRows {
     }
 }
 
-fn watch_status(ui: &mut egui::Ui, watch: &FolderWatch) {
+pub(super) fn watch_status(ui: &mut egui::Ui, watch: &FolderWatch) {
     let (label, color) = if watch.error().is_some() {
         ("목록 갱신 불가", egui::Color32::LIGHT_RED)
     } else if watch.entries().is_some() {
@@ -223,24 +222,23 @@ impl DiskWeaveApp {
             visible.push(path);
         }
         if both {
-            if let Some(view) = self.folder_tabs.other().filter(|view| {
-                view.tab == 0 && !view.query.is_active() && !view.whole_scan && !view.global
-            }) {
-                if let Some((source, folder)) = self.parked_live_source(view) {
-                    visible.push(source.scan.folders[folder].path.clone());
-                }
+            if let Some((source, folder)) = self
+                .folder_tabs
+                .other()
+                .and_then(|view| self.parked_live_source(view))
+            {
+                visible.push(source.scan.folders[folder].path.clone());
             }
         }
         self.visible_watches.sync(&visible, ctx);
     }
 
     fn parked_live_source(&self, view: &crate::navigation::ViewState) -> Option<(Snapshot, usize)> {
+        if view.tab != 0 || view.query.is_active() || view.whole_scan || view.global {
+            return None;
+        }
         let source = self.scan.completed_snapshot(view.location)?;
-        let root = &source.scan.folders[0].path;
-        let folder = view
-            .folder
-            .ancestors()
-            .find_map(|path| source.scan.folder_index(path.strip_prefix(root).ok()?).ok())?;
+        let (folder, _) = view.resolve_folder_on(&source).ok()?;
         (!source.scan.folders[folder].access.unreadable()).then_some((source, folder))
     }
 
@@ -346,8 +344,8 @@ impl DiskWeaveApp {
         {
             return false;
         }
-        if let Some(row) = self.live_rows.single().cloned() {
-            self.open_live_row(&folder, &row, false);
+        if let Some(row) = self.live_rows.single() {
+            self.open_live_item(folder.join(&row.name), row.current.folder, row.known, None);
         }
         true
     }
@@ -542,7 +540,7 @@ impl DiskWeaveApp {
                             self.live_rows.selection.click(index, false, false);
                         }
                         if response.double_clicked() {
-                            open = Some((row.clone(), false));
+                            open = Some((index, None));
                         }
                         if writable && response.drag_started() {
                             let paths = if selected {
@@ -568,28 +566,13 @@ impl DiskWeaveApp {
                                         open_tab = Some((id, right));
                                     }
                                 }
-                                if let Some(action) = super::open_menu(
-                                    ui,
-                                    if row.current.folder {
-                                        Item::Folder(0)
-                                    } else {
-                                        Item::File(0)
-                                    },
-                                ) {
-                                    open = Some((row.clone(), true));
-                                    if action == OpenAction::RevealFile {
-                                        let request = OpenRequest::new(
-                                            folder_path.join(&row.name),
-                                            TargetKind::File,
-                                            action,
-                                        );
-                                        self.input_error = self
-                                            .file_open
-                                            .start(request)
-                                            .err()
-                                            .map(|e| e.to_string());
-                                        open = None;
-                                    }
+                                let kind = if row.current.folder {
+                                    TargetKind::Folder
+                                } else {
+                                    TargetKind::File
+                                };
+                                if let Some(action) = super::open_menu(ui, kind) {
+                                    open = Some((index, Some(action)));
                                 }
                             }
                             self.file_ui.menu(
@@ -623,8 +606,14 @@ impl DiskWeaveApp {
                 });
             }
         });
-        if let Some((row, shell_only)) = open {
-            self.open_live_row(&folder_path, &row, shell_only);
+        if let Some((index, action)) = open {
+            let row = &self.live_rows.rows[index];
+            self.open_live_item(
+                folder_path.join(&row.name),
+                row.current.folder,
+                row.known,
+                action,
+            );
         }
         if let Some((folder, right)) = open_tab {
             self.input_error = self
@@ -635,35 +624,43 @@ impl DiskWeaveApp {
         true
     }
 
-    fn open_live_row(&mut self, folder: &Path, row: &Row, shell_only: bool) {
-        if self
-            .visible_watches
-            .get(folder)
+    fn open_live_item(
+        &mut self,
+        path: PathBuf,
+        folder: bool,
+        known: Option<Item>,
+        action: Option<OpenAction>,
+    ) {
+        if path
+            .parent()
+            .and_then(|parent| self.visible_watches.get(parent))
             .is_none_or(|watch| watch.error().is_some())
         {
             return;
         }
-        if !shell_only {
-            if let Some(Item::Folder(id)) = row.known {
+        if action.is_none() {
+            if let Some(Item::Folder(id)) = known {
                 self.navigate(id, true);
                 return;
             }
         }
-        let (kind, action) = if row.current.folder {
+        let (kind, default_action) = if folder {
             (TargetKind::Folder, OpenAction::OpenFolder)
         } else {
             (TargetKind::File, OpenAction::OpenFile)
         };
-        self.start_open(OpenRequest::new(folder.join(&row.name), kind, action));
+        self.start_open(OpenRequest::new(
+            path,
+            kind,
+            action.unwrap_or(default_action),
+        ));
     }
 
     pub(super) fn draw_parked_live_rows(
         &mut self,
         ui: &mut egui::Ui,
     ) -> Option<Option<(PathBuf, bool)>> {
-        let view = self.folder_tabs.other().filter(|view| {
-            view.tab == 0 && !view.query.is_active() && !view.whole_scan && !view.global
-        })?;
+        let view = self.folder_tabs.other()?;
         let (source, folder) = self.parked_live_source(view)?;
         let path = &source.scan.folders[folder].path;
         let watch = self.visible_watches.get(path)?;
@@ -734,7 +731,6 @@ impl DiskWeaveApp {
                 .get(parent)
                 .and_then(FolderWatch::entries)
                 .and_then(|rows| rows.get(name))
-                .cloned()
             else {
                 return;
             };
@@ -744,16 +740,7 @@ impl DiskWeaveApp {
                 (current.folder && source.scan.folders[id].created == current.created)
                     .then_some(Item::Folder(id))
             });
-            self.open_live_row(
-                parent,
-                &Row {
-                    name: name.to_owned(),
-                    current,
-                    known,
-                    bytes: None,
-                },
-                false,
-            );
+            self.open_live_item(path, current.folder, known, None);
         } else {
             self.live_rows.restore(vec![path]);
         }
@@ -950,6 +937,63 @@ mod tests {
         assert!(app.visible_watches.get(&right).is_none());
         assert!(!labels.iter().any(|label| label == "목록 자동 갱신"));
         assert!(Arc::ptr_eq(&source.scan, &app.source().unwrap().scan));
+    }
+
+    #[test]
+    fn opening_watched_analyzed_folders_stays_in_the_analysis() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let left = fixture.0.join("left");
+        let right = fixture.0.join("right");
+        let child = right.join("right-child");
+        fs::create_dir(&left).unwrap();
+        fs::create_dir_all(&child).unwrap();
+
+        let mut app = analyze(&fixture.0);
+        let source = app.source().unwrap();
+        let index = |name| {
+            source
+                .scan
+                .folder_index(std::path::Path::new(name))
+                .unwrap()
+        };
+        app.open_folder_tab(&source, index("right"), true).unwrap();
+        app.focus_folder_side(Side::Left);
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["left", "right-child"], &[]);
+
+        app.focus_folder_side(Side::Right);
+        app.pick_parked_live_row(child.clone(), true);
+        assert_eq!(app.capture_navigation().unwrap().folder, child);
+
+        app.focus_folder_side(Side::Left);
+        observe(&mut app, &ctx, &["left", "right"], &[]);
+        app.live_select_hit((source.id, source.generation, Item::Folder(index("left"))));
+        assert!(app.live_keyboard_open());
+        assert_eq!(app.capture_navigation().unwrap().folder, left);
+    }
+
+    #[test]
+    fn parked_watch_reports_initial_failure_while_preserving_the_scanned_rows() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let right = fixture.0.join("right");
+        fs::create_dir(&right).unwrap();
+        fs::write(right.join("cached-right.txt"), b"cached").unwrap();
+
+        let mut app = analyze(&fixture.0);
+        let source = app.source().unwrap();
+        let folder = source
+            .scan
+            .folder_index(std::path::Path::new("right"))
+            .unwrap();
+        app.open_folder_tab(&source, folder, true).unwrap();
+        app.focus_folder_side(Side::Left);
+        fs::rename(&right, fixture.0.join("outside-view")).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["cached-right.txt", "목록 갱신 불가"], &[]);
+        assert!(app.other_folder_path().is_none());
     }
 
     #[test]

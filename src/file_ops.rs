@@ -320,6 +320,7 @@ fn protect(source: &Target, roots: &[PathBuf]) -> io::Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 pub fn prepare(
     request: Request,
     cancel: &impl Fn() -> bool,

@@ -72,6 +72,15 @@ pub enum TargetKind {
     File,
 }
 
+impl From<crate::explorer::Item> for TargetKind {
+    fn from(item: crate::explorer::Item) -> Self {
+        match item {
+            crate::explorer::Item::Folder(_) => Self::Folder,
+            crate::explorer::Item::File(_) => Self::File,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAction {
     OpenFolder,
@@ -98,11 +107,7 @@ impl OpenRequest {
         item: crate::explorer::Item,
         action: OpenAction,
     ) -> Self {
-        let kind = match item {
-            crate::explorer::Item::Folder(_) => TargetKind::Folder,
-            crate::explorer::Item::File(_) => TargetKind::File,
-        };
-        Self::new(crate::search::item_path(result, item), kind, action)
+        Self::new(crate::search::item_path(result, item), item.into(), action)
     }
 }
 

@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -90,19 +90,17 @@ impl QuickSearch {
         self.set_folder(path.clone());
         Ok(())
     }
-    fn live_input(&self) -> live::Input {
-        live::Input {
-            folder: (self.scope == Scope::Folder).then(|| self.folder.clone()),
-            text: self.text.trim().to_owned(),
-            mode: self.mode,
-        }
+    fn live_input_matches(&self, input: &live::Input) -> bool {
+        input.folder.as_deref() == (self.scope == Scope::Folder).then_some(self.folder())
+            && input.text == self.text.trim()
+            && input.mode == self.mode
     }
     pub fn invalidate_live(&mut self) {
         if self
             .live
             .input
             .as_ref()
-            .is_some_and(|input| *input != self.live_input())
+            .is_some_and(|input| !self.live_input_matches(input))
         {
             self.live.clear();
             self.selection = None;
@@ -115,17 +113,19 @@ impl QuickSearch {
         &mut self,
         fixed_roots: impl FnOnce() -> io::Result<Vec<PathBuf>> + Send + 'static,
     ) -> io::Result<()> {
-        let input = self.live_input();
-        if self.scope == Scope::Scanned || input.text.is_empty() {
+        let text = self.text.trim();
+        if self.scope == Scope::Scanned || text.is_empty() {
             return Err(io::Error::other("검색 범위와 검색어를 확인하세요"));
         }
-        if input
-            .folder
-            .as_ref()
-            .is_some_and(|path| !path.is_absolute())
-        {
+        let folder = (self.scope == Scope::Folder).then_some(self.folder());
+        if folder.is_some_and(|path| !path.is_absolute()) {
             return Err(io::Error::other("검색할 폴더의 전체 경로를 입력하세요"));
         }
+        let input = live::Input {
+            folder: folder.map(Path::to_path_buf),
+            text: text.to_owned(),
+            mode: self.mode,
+        };
         self.live.start(input, fixed_roots)?;
         self.selection = None;
         Ok(())
@@ -171,7 +171,7 @@ impl QuickSearch {
             .live
             .input
             .as_ref()
-            .is_none_or(|input| *input != self.live_input())
+            .is_none_or(|input| !self.live_input_matches(input))
         {
             return Err(io::Error::other("현재 범위에서 다시 검색해 주세요"));
         }
@@ -333,6 +333,11 @@ mod tests {
         let mut expected = vec![root.join("보고서"), root.join("분기 보고서.xlsx")];
         expected.sort();
         assert_eq!(paths, expected);
+        quick.step(1);
+        let selected = quick.selected_hit(&locations).unwrap().path;
+        quick.text = "  보고서  ".into();
+        quick.tick(&locations, Instant::now());
+        assert_eq!(quick.selected_hit(&locations).unwrap().path, selected);
         for hit in quick.live_hits() {
             let actual = crate::file_ops::Target::capture(&hit.path).unwrap();
             assert_eq!(hit.identity, Some(actual.identity()));
@@ -347,6 +352,9 @@ mod tests {
             .any(|hit| hit.kind == TargetKind::Folder));
         quick.remove_recycled(&root.join("보고서"));
         assert_eq!(quick.live_hits().len(), 1);
+        quick.mode = SearchMode::Path;
+        quick.tick(&locations, Instant::now());
+        assert_eq!(quick.count(), 0);
         assert!(locations.entries.is_empty());
         fs::remove_dir_all(root).unwrap();
     }

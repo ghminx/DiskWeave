@@ -167,11 +167,12 @@ impl DiskWeaveApp {
 
     pub(super) fn other_folder_path(&self) -> Option<PathBuf> {
         let view = self.folder_tabs.other().filter(|view| !view.global)?;
-        let resolved = view
-            .resolve_on(&self.scan.completed_snapshot(view.location)?)
-            .ok()?;
-        let path =
-            &resolved.source.scan.folders[if view.whole_scan { 0 } else { resolved.folder }].path;
+        if self.scan.get(view.location)?.stale {
+            return None;
+        }
+        let source = self.scan.completed_snapshot(view.location)?;
+        let (folder, _) = view.resolve_folder_on(&source).ok()?;
+        let path = &source.scan.folders[if view.whole_scan { 0 } else { folder }].path;
         if self
             .visible_watches
             .get(path)
@@ -346,15 +347,9 @@ impl DiskWeaveApp {
 
     fn parked_folder(&mut self, ui: &mut egui::Ui, rect: egui::Rect, side: Side) {
         let mut picked = None;
-        let mut can_drop = false;
         let mut live_pick = None;
         if let Some(picked) = self.draw_parked_live_rows(ui) {
             live_pick = picked;
-            can_drop = self.folder_tabs.other().is_some_and(|view| {
-                self.scan
-                    .get(view.location)
-                    .is_some_and(|entry| !entry.stale)
-            });
         } else if let Some(view) = self.folder_tabs.other() {
             self.other_rows.refresh(view, &self.scan);
             if let Some(path) = self.other_rows.folder(view.whole_scan) {
@@ -371,11 +366,13 @@ impl DiskWeaveApp {
                         )
                         .on_hover_text(path.display().to_string());
                     });
-                can_drop = !view.global
-                    && self
-                        .scan
-                        .get(view.location)
-                        .is_some_and(|location| !location.stale);
+                if let Some(watch) = self
+                    .visible_watches
+                    .get(path)
+                    .filter(|watch| watch.error().is_some())
+                {
+                    super::folder_updates::watch_status(ui, watch);
+                }
                 if view.query.is_active() {
                     ui.add(egui::Label::new(format!("검색 · {}", view.query.text)).truncate());
                 }
@@ -450,11 +447,12 @@ impl DiskWeaveApp {
         }
 
         let hovered = ui.rect_contains_pointer(rect);
-        if hovered
-            && can_drop
+        let drop_target = (hovered
             && self.file_actions_available()
-            && egui::DragAndDrop::has_payload_of_type::<crate::file_ui::DragPayload>(ui.ctx())
-        {
+            && egui::DragAndDrop::has_payload_of_type::<crate::file_ui::DragPayload>(ui.ctx()))
+        .then(|| self.other_folder_path())
+        .flatten();
+        if let Some(path) = drop_target {
             ui.painter().rect_stroke(
                 rect,
                 3.0,
@@ -465,9 +463,7 @@ impl DiskWeaveApp {
                 if let Some(payload) =
                     egui::DragAndDrop::take_payload::<crate::file_ui::DragPayload>(ui.ctx())
                 {
-                    if let Some(path) = self.other_folder_path() {
-                        self.file_ui.drop_requested = Some((payload.paths.clone(), path));
-                    }
+                    self.file_ui.drop_requested = Some((payload.paths.clone(), path));
                 }
             }
         } else if hovered

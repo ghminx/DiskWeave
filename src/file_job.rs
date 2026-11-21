@@ -62,10 +62,7 @@ impl Controller {
     pub fn elapsed(&self) -> f32 {
         self.started.map_or(0.0, |t| t.elapsed().as_secs_f32())
     }
-    pub fn prepare(&mut self, request: Request) -> io::Result<()> {
-        self.prepare_expected(request, None)
-    }
-    pub fn prepare_expected(
+    pub fn prepare(
         &mut self,
         request: Request,
         expected: Option<(crate::metadata::Identity, bool)>,
@@ -84,11 +81,7 @@ impl Controller {
         std::thread::spawn(move || {
             let cancel = || worker_cancel.load(Ordering::Relaxed);
             let mut progress = |p| *worker_progress.lock().unwrap() = p;
-            let result = if expected.is_some() {
-                file_ops::prepare_expected(request, expected, &cancel, &mut progress)
-            } else {
-                file_ops::prepare(request, &cancel, &mut progress)
-            };
+            let result = file_ops::prepare_expected(request, expected, &cancel, &mut progress);
             let _ = sender.send(Response::Prepared(result));
         });
         self.cancel = cancel;
@@ -204,8 +197,8 @@ mod tests {
             protected: vec![root.clone()],
         };
         let mut job = Controller::default();
-        job.prepare(request.clone()).unwrap();
-        assert!(job.prepare(request.clone()).is_err());
+        job.prepare(request.clone(), None).unwrap();
+        assert!(job.prepare(request.clone(), None).is_err());
         let start = Instant::now();
         while job.working() && start.elapsed() < Duration::from_secs(3) {
             job.poll();
@@ -216,7 +209,7 @@ mod tests {
         job.cancel();
         assert_eq!(job.phase, Phase::Cancelled);
         assert!(!root.join("created").exists());
-        job.prepare(request).unwrap();
+        job.prepare(request, None).unwrap();
         while job.working() && start.elapsed() < Duration::from_secs(3) {
             job.poll();
             std::thread::yield_now();

@@ -27,20 +27,20 @@ impl ViewState {
         self.resolve_on(source)
     }
 
+    pub fn resolve_folder_on(&self, source: &Snapshot) -> io::Result<(usize, bool)> {
+        let scan = &source.scan;
+        self.folder
+            .ancestors()
+            .find_map(|path| {
+                let relative = path.strip_prefix(&scan.folders[0].path).ok()?;
+                let folder = scan.folder_index(relative).ok()?;
+                Some((folder, path != self.folder))
+            })
+            .ok_or_else(|| io::Error::other("이력의 폴더로 이동할 수 없습니다"))
+    }
+
     pub fn resolve_on(&self, source: &Snapshot) -> io::Result<Resolved> {
-        let mut path = self.folder.as_path();
-        let folder = loop {
-            if let Some(id) = path
-                .strip_prefix(&source.scan.folders[0].path)
-                .ok()
-                .and_then(|relative| source.scan.folder_index(relative).ok())
-            {
-                break id;
-            }
-            path = path
-                .parent()
-                .ok_or_else(|| io::Error::other("이력의 폴더로 이동할 수 없습니다"))?;
-        };
+        let (folder, fallback) = self.resolve_folder_on(source)?;
         let mut selected = Vec::new();
         for target in &self.selected {
             let Some(relative) = target.strip_prefix(&source.scan.folders[0].path).ok() else {
@@ -66,7 +66,7 @@ impl ViewState {
             source: source.clone(),
             folder,
             selected,
-            fallback: path != self.folder,
+            fallback,
         })
     }
     fn same_place(&self, other: &Self) -> bool {

@@ -359,10 +359,10 @@ impl FileUi {
             }
             if submit {
                 let expected = self.dialog.as_ref().and_then(|dialog| dialog.expected);
-                match self.request().and_then(|request| match expected {
-                    Some(expected) => job.prepare_expected(request, Some(expected)),
-                    None => job.prepare(request),
-                }) {
+                match self
+                    .request()
+                    .and_then(|request| job.prepare(request, expected))
+                {
                     Ok(()) => {
                         self.dialog = None;
                         self.visible = true;
