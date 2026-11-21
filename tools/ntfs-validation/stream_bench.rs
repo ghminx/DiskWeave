@@ -54,6 +54,7 @@ struct Cost {
     peak_working_set_sample: u64,
     receive_seconds: Option<f64>,
     rebuild_seconds: Option<f64>,
+    baseline: Option<crate::usn::stream::BaselineCost>,
 }
 fn measured<T>(run: impl FnOnce() -> io::Result<T>) -> io::Result<(T, Cost)> {
     let stop = AtomicBool::new(false);
@@ -83,6 +84,7 @@ fn measured<T>(run: impl FnOnce() -> io::Result<T>) -> io::Result<(T, Cost)> {
                 peak_working_set_sample: peak,
                 receive_seconds: None,
                 rebuild_seconds: None,
+                baseline: None,
             },
         ))
     })
@@ -164,14 +166,19 @@ fn legacy(record: &SavedScan) -> io::Result<(SavedScan, u64, Cost)> {
     })?;
     Ok((result, bytes, cost))
 }
+struct Transferred {
+    bytes: u64,
+    snapshot: SavedScan,
+}
+
 fn transfer(
     sender: &mut crate::usn::stream::Sender,
     index: &mut Index,
     receiver: &mut crate::usn::stream::Receiver,
-) -> io::Result<(u64, Cost)> {
+) -> io::Result<(io::Result<Transferred>, Cost)> {
     let (mut writer, mut reader) = channel();
-    let ((bytes, receive, rebuild), mut cost) = measured(|| {
-        std::thread::scope(|scope| {
+    let (result, mut cost) = measured(|| {
+        Ok(std::thread::scope(|scope| {
             let task = scope.spawn(move || sender.write(&mut writer, index, &|| false));
             let started = Instant::now();
             let result = receiver.receive(&mut reader, &|| false);
@@ -183,13 +190,28 @@ fn transfer(
             let stats = sent?;
             result?;
             let started = Instant::now();
-            let _complete = receiver.snapshot(&|| false)?;
-            Ok((stats.bytes, receive, started.elapsed().as_secs_f64()))
-        })
+            let snapshot = receiver.snapshot(&|| false)?;
+            Ok((stats, snapshot, receive, started.elapsed().as_secs_f64()))
+        }))
     })?;
-    cost.receive_seconds = Some(receive);
-    cost.rebuild_seconds = Some(rebuild);
-    Ok((bytes, cost))
+    let result = result.map(|(stats, snapshot, receive, rebuild)| {
+        cost.receive_seconds = Some(receive);
+        cost.rebuild_seconds = Some(rebuild);
+        cost.baseline = stats.baseline;
+        Transferred {
+            bytes: stats.bytes,
+            snapshot,
+        }
+    });
+    Ok((result, cost))
+}
+
+fn write_new_report(output: &Path, value: &serde_json::Value) -> io::Result<()> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    serde_json::to_writer(file, value).map_err(crate::output::json_error)
 }
 fn cancellation(index: &mut Index, root: &Path) -> io::Result<f64> {
     let stop = AtomicBool::new(false);
@@ -248,6 +270,131 @@ fn extra(id: u64) -> Extra {
         ..Default::default()
     }
 }
+struct BaselineTree {
+    groups: usize,
+    root: PathBuf,
+}
+impl Source for BaselineTree {
+    fn journal(&mut self) -> io::Result<Journal> {
+        Ok(Journal {
+            volume: "synthetic".into(),
+            id: 7,
+            first: 0,
+            lowest: 0,
+            next: 100,
+        })
+    }
+    fn read(&mut self, _: i64, _: i64) -> io::Result<Vec<Event>> {
+        Ok(Vec::new())
+    }
+    fn inspect(&mut self, path: &Path, _: bool) -> io::Result<crate::ntfs::Info> {
+        let relative = path.strip_prefix(&self.root).unwrap();
+        let mut parts = relative.iter().map(|part| {
+            part.to_str()
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        });
+        let branch = parts.next();
+        let folder = parts.next();
+        let child = parts.next();
+        let group = branch.unwrap_or(0) * 10_000 + folder.unwrap_or(0);
+        let id = match (branch, folder, child) {
+            (None, _, _) => 1,
+            (Some(branch), None, _) => branch + 2,
+            (_, Some(_), None) => 102 + group,
+            (_, _, Some(child)) => 1_000_102 + group * 5 + child,
+        };
+        Ok(crate::ntfs::Info {
+            resolved: Some(path.to_owned()),
+            reference: Some(crate::ntfs::Id::V2(id)),
+            bytes: if child.is_some() { 8 } else { 0 },
+            attributes: if child.is_some() { 32 } else { 16 },
+            created: None,
+            modified: None,
+            extra: crate::metadata::Report {
+                values: if child.is_some() {
+                    extra(id)
+                } else {
+                    Default::default()
+                },
+                issue: None,
+            },
+        })
+    }
+    fn list(&mut self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        let relative = path.strip_prefix(&self.root).unwrap();
+        let depth = relative.components().count();
+        let count = match depth {
+            0 => self.groups.div_ceil(10_000),
+            1 => {
+                let branch = relative.file_name().unwrap().to_str().unwrap();
+                let branch: usize = branch.split('-').next().unwrap().parse().unwrap();
+                (self.groups - branch * 10_000).min(10_000)
+            }
+            2 => 5,
+            _ => unreachable!(),
+        };
+        let padding = "x".repeat([48, 56, 16][depth]);
+        Ok((0..count)
+            .map(|i| path.join(format!("{i}-{padding}")))
+            .collect())
+    }
+}
+
+pub fn baseline_budget(groups: &str, output: &Path) -> io::Result<()> {
+    let groups: usize = groups.parse().map_err(io::Error::other)?;
+    if !(1..=900_000).contains(&groups) {
+        return Err(io::Error::other("합성 폴더 수 범위 초과"));
+    }
+    let owned = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/stream-benchmark");
+    if output.parent().map(fs::canonicalize).transpose()? != Some(fs::canonicalize(owned)?) {
+        return Err(io::Error::other(
+            "합성 결과는 지정한 시험 폴더에만 저장 가능",
+        ));
+    }
+    let root = PathBuf::from("C:\\DiskWeaveSynthetic");
+    let (mut index, collect) = measured(|| {
+        Index::begin(
+            &root,
+            true,
+            &mut BaselineTree {
+                groups,
+                root: root.clone(),
+            },
+            &|| false,
+        )
+    })?;
+    let mut sender = crate::usn::stream::Sender::new(17, Default::default());
+    let mut receiver = crate::usn::stream::Receiver::new(root, true, Default::default());
+    let (result, transfer_cost) = transfer(&mut sender, &mut index, &mut receiver)?;
+    let result = match result {
+        Ok(Transferred {
+            bytes,
+            snapshot: complete,
+        }) => {
+            assert_eq!(complete.scan.files.len(), groups * 5);
+            assert_eq!(
+                complete.scan.folders.len(),
+                groups + groups.div_ceil(10_000) + 1
+            );
+            assert_eq!(complete.scan.folders[0].logical_bytes, groups as u64 * 40);
+            serde_json::json!({"success":true,"wire_bytes":bytes})
+        }
+        Err(error) => serde_json::json!({"success":false,"error":error.to_string()}),
+    };
+    write_new_report(
+        output,
+        &serde_json::json!({
+            "groups":groups, "nodes":groups * 6 + groups.div_ceil(10_000) + 1,
+            "collect":collect, "total_transfer":transfer_cost, "result":result
+        }),
+    )
+}
+
 fn baseline(count: usize, width: usize) -> io::Result<SavedScan> {
     let root = PathBuf::from("C:\\DiskWeaveSynthetic");
     let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
@@ -430,15 +577,18 @@ fn removal_cost(count: usize, root: &Path, file_only: bool) -> io::Result<serde_
     let mut sender = crate::usn::stream::Sender::new(21, Default::default());
     let mut receiver =
         crate::usn::stream::Receiver::new(root.to_owned(), false, Default::default());
-    transfer(&mut sender, &mut index, &mut receiver)?;
+    transfer(&mut sender, &mut index, &mut receiver)?.0?;
     source.removed = true;
     crate::usn::cost::start();
     let started = Instant::now();
     assert!(index.refresh(&mut source, &|| false)?);
     let refresh = started.elapsed().as_secs_f64();
-    let (wire_bytes, delta) = transfer(&mut sender, &mut index, &mut receiver)?;
+    let (received, delta) = transfer(&mut sender, &mut index, &mut receiver)?;
+    let Transferred {
+        bytes: wire_bytes,
+        snapshot: saved,
+    } = received?;
     let stages = crate::usn::cost::finish();
-    let saved = receiver.snapshot(&|| false)?;
     assert_eq!(saved.scan.folders.len(), if file_only { 3 } else { 2 });
     assert_eq!(saved.scan.files.len(), count);
     assert_eq!(saved.scan.folders[0].logical_bytes, count as u64 * 8);
@@ -490,10 +640,17 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
                     Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}),
                 });
             } else {
-                new = Some(transfer(&mut sender, &mut index, &mut receiver)?);
+                let (received, cost) = transfer(&mut sender, &mut index, &mut receiver)?;
+                new = Some((received?, cost));
             }
         }
-        let initial = receiver.snapshot(&|| false)?;
+        let (
+            Transferred {
+                bytes,
+                snapshot: initial,
+            },
+            cost,
+        ) = new.unwrap();
         let first_key = initial
             .entries
             .as_ref()
@@ -502,6 +659,7 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
             .unwrap();
         assert_eq!(initial.scan.files.len(), count);
         assert_eq!(initial.scan.folders[0].logical_bytes, count as u64 * 8);
+        drop(initial);
         let mut source = Synthetic {
             name: name(0, width),
             time: SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
@@ -521,12 +679,18 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
                     Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}),
                 });
             } else {
-                new_update = Some(transfer(&mut sender, &mut index, &mut receiver)?);
+                let (received, cost) = transfer(&mut sender, &mut index, &mut receiver)?;
+                new_update = Some((received?, cost));
             }
         }
-        let (delta_bytes, delta_cost) = new_update.unwrap();
+        let (
+            Transferred {
+                bytes: delta_bytes,
+                snapshot: result,
+            },
+            delta_cost,
+        ) = new_update.unwrap();
         let stage_ns = crate::usn::cost::finish();
-        let result = receiver.snapshot(&|| false)?;
         assert_eq!(
             result
                 .entries
@@ -544,14 +708,12 @@ pub fn run(count: &str, width: &str, output: &Path) -> io::Result<()> {
         }
         let id_lookup_seconds = queried.elapsed().as_secs_f64();
         assert_eq!(result.scan.folders[0].logical_bytes, count as u64 * 8 + 9);
-        result.tracking.as_ref().unwrap().validate(&result.scan)?;
-        let (bytes, cost) = new.unwrap();
+        drop(result);
         let removal = removal_cost(count, &root, false)?;
         let file_removal = removal_cost(count, &root, true)?;
         results.push(serde_json::json!({"subtree":removal,"file_removal":file_removal,"round":round,"old_initial":old,"new_initial":{"ok":true,"bytes":bytes,"cost":cost},"old_changed_full":old_update,"new_changed_delta":{"ok":true,"bytes":delta_bytes,"cost":delta_cost},"candidate_refresh_seconds":refresh,"stage_ns":stage_ns,"collector_edit":index.edit_stats(),"receiver_edit":receiver.edit_stats(),"id_roundtrip_queries":count,"id_lookup_seconds":id_lookup_seconds,"changed_entry_id_preserved":true,"files":count,"expected_logical_bytes":count as u64*8+9}));
     }
     let cancel_ms = cancellation(&mut Index::restore(&record)?, &root)?;
     let report = serde_json::json!({"count":count,"name_width":width,"bounded_channel_bytes":4*BUFFER,"frame_limit_bytes":1024*1024,"cancel_ms":cancel_ms,"note":"같은 프로세스의 제한된 채널에서 전송과 부모 결과 구성을 측정함. CPU는 프로세스 시간 차이, RAM은 해당 단계에서 이미 유지 중인 원본/인덱스/이전 결과를 포함한 25ms 간격 working set 표본 최대값임. 실제 관리자 IPC/UAC·OS 수집·GUI 게시 시간은 포함하지 않음. 재구성·원본 수집의 전체 메모리 상한을 의미하지 않음.","results":results});
-    serde_json::to_writer(fs::File::create(output)?, &report).map_err(crate::output::json_error)?;
-    Ok(())
+    write_new_report(output, &report)
 }

@@ -118,13 +118,35 @@ pub fn inspect_file(path: &Path, detailed: bool, expected_volume: &str) -> io::R
     })
 }
 pub(crate) fn check_volume(file: &File, expected: &str) -> io::Result<PathBuf> {
+    let buffer = resolved_units(file, VOLUME_NAME_GUID)?;
+    let close = buffer
+        .iter()
+        .position(|n| *n == 125)
+        .filter(|n| *n + 1 < buffer.len() && buffer[*n + 1] == 92)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "볼륨 GUID 경로 확인 실패"))?;
+    if !String::from_utf16_lossy(&buffer[..close + 2]).eq_ignore_ascii_case(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "선택한 볼륨 밖으로 경로가 변경됐습니다",
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+pub(crate) fn resolved_path(file: &File, format: u32) -> io::Result<PathBuf> {
+    Ok(PathBuf::from(OsString::from_wide(&resolved_units(
+        file, format,
+    )?)))
+}
+
+fn resolved_units(file: &File, format: u32) -> io::Result<Vec<u16>> {
     let mut buffer = vec![0u16; 256];
     let query = |buffer: &mut Vec<u16>| unsafe {
         GetFinalPathNameByHandleW(
             file.as_raw_handle(),
             buffer.as_mut_ptr(),
             buffer.len() as u32,
-            VOLUME_NAME_GUID,
+            format,
         )
     };
     let mut size = query(&mut buffer) as usize;
@@ -141,18 +163,8 @@ pub(crate) fn check_volume(file: &File, expected: &str) -> io::Result<PathBuf> {
             "볼륨 경로 길이 초과",
         ));
     }
-    let close = buffer[..size]
-        .iter()
-        .position(|n| *n == 125)
-        .filter(|n| *n + 1 < size && buffer[*n + 1] == 92)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "볼륨 GUID 경로 확인 실패"))?;
-    if !String::from_utf16_lossy(&buffer[..close + 2]).eq_ignore_ascii_case(expected) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "선택한 볼륨 밖으로 경로가 변경됐습니다",
-        ));
-    }
-    Ok(PathBuf::from(OsString::from_wide(&buffer[..size])))
+    buffer.truncate(size);
+    Ok(buffer)
 }
 
 #[cfg(test)]

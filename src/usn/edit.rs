@@ -420,7 +420,7 @@ fn patch_scan(
             .or_else(|| find_existing(path))
     };
     let mut edits = Vec::with_capacity(changes.len());
-    let mut changed_paths = HashSet::new();
+    let mut changed_file_keys = HashSet::new();
     let mut access_changes = Vec::new();
     let mut excluded_changes = BTreeMap::new();
     let mut removed_folders = Vec::new();
@@ -477,7 +477,9 @@ fn patch_scan(
             };
             let item = find(relative);
             if structural && new.is_some() && changes.len() <= 256 {
-                changed_paths.insert(relative.to_owned());
+                if let Some(key) = index.nodes.key_number(relative) {
+                    changed_file_keys.insert(key);
+                }
             }
             edits.push((relative, item, parent, old, new));
         }
@@ -640,7 +642,9 @@ fn patch_scan(
             crate::output::check(cancelled)?;
             let row = result.files.len();
             ids.push(node.id);
-            result.files.push(file_entry(path, parent, node));
+            result
+                .files
+                .push(file_entry(path.file_name().unwrap(), parent, node));
             Arc::make_mut(&mut result.file_children[parent]).push(row);
             new_files.push(Item::File(row));
         }
@@ -649,7 +653,7 @@ fn patch_scan(
                 if old.id == new.id {
                     crate::output::check(cancelled)?;
                     let row = remap.get(row).expect("수정한 파일의 위치");
-                    result.files[row] = file_entry(path, parent, new);
+                    result.files[row] = file_entry(path.file_name().unwrap(), parent, new);
                     new_files.push(Item::File(row));
                 }
             }
@@ -657,8 +661,9 @@ fn patch_scan(
         file_rows = Some(remap);
         Some((next, ids, folder_ids))
     } else if structural {
-        let mut files = RowProjection::new(&previous.files, |(path, parent, node)| {
-            file_entry(path, parent, node)
+        let changed_keys = index.nodes.changed_current_keys(cancelled)?;
+        let mut files = RowProjection::new(&previous.files, |(name, parent, node)| {
+            file_entry(name, parent, node)
         });
         let mut ids = Vec::with_capacity(previous.files.len());
         let mut keys = Vec::with_capacity(previous.files.len());
@@ -668,7 +673,7 @@ fn patch_scan(
             if node.dir() || node.excluded() {
                 continue;
             }
-            let Some(Item::Folder(parent)) = path.parent().and_then(find) else {
+            let Some(Item::Folder(parent)) = find(path.parent()) else {
                 return Ok(None);
             };
             let row = keys.len();
@@ -676,15 +681,15 @@ fn patch_scan(
                 file_parents.insert(parent);
                 mark_ancestors(&result, &mut affected, parent);
             }
-            if changed_paths.contains(path) {
+            if changed_file_keys.contains(&key) {
                 new_files.push(Item::File(row));
             }
             lists[parent].push(row);
             files.push(
-                (path, parent, node),
+                (path.name(), parent, node),
                 projection.has_file_key(row, key)
                     && previous.files[row].parent == parent
-                    && index.nodes.original(path) == Some(node),
+                    && !changed_keys.contains(&key),
             );
             ids.push(node.id);
             keys.push(key);
@@ -1060,11 +1065,13 @@ fn patch_tree(
     let mut folder_ids = Vec::new();
     let mut folder_keys = Vec::new();
     let mut affected = HashSet::new();
-    let mut dirs: Vec<_> = index
-        .nodes
-        .identified()
-        .filter(|(_, _, n)| n.dir() && !n.excluded())
-        .collect();
+    let mut dirs = Vec::new();
+    for (path, key, node) in index.nodes.identified() {
+        crate::output::check(cancelled)?;
+        if node.dir() && !node.excluded() {
+            dirs.push((path.path(), key, node));
+        }
+    }
     dirs.sort_by_key(|(p, _, _)| p.components().count());
     let mut folder_rows = RowProjection::new(
         &previous.folders,
@@ -1088,8 +1095,9 @@ fn patch_tree(
             }
         },
     );
-    for (path, key, n) in dirs {
+    for (path, key, n) in &dirs {
         crate::output::check(cancelled)?;
+        let path = path.as_path();
         let parent = path.parent().map(|p| paths[p]);
         let old_row = projection
             .path_key(path)
@@ -1104,7 +1112,7 @@ fn patch_tree(
         let before = old_row.map(|row| &previous.folders[row]);
         let row = folder_keys.len();
         paths.insert(path, row);
-        folder_keys.push(key);
+        folder_keys.push(*key);
         folder_ids.push(n.id);
         let same = old_row == Some(row)
             && before.is_some_and(|f| {
@@ -1113,7 +1121,7 @@ fn patch_tree(
                     && f.created == n.created
                     && f.modified == n.modified
             });
-        folder_rows.push((path, parent, n, before), same);
+        folder_rows.push((path, parent, *n, before), same);
     }
     scan.folders = folder_rows.finish();
     for (&path, &row) in &paths {
@@ -1171,25 +1179,24 @@ fn patch_tree(
     }
     let mut file_ids = Vec::with_capacity(previous.files.len());
     let mut file_keys = Vec::with_capacity(previous.files.len());
-    let mut files = RowProjection::new(&previous.files, |(path, parent, node)| {
-        file_entry(path, parent, node)
+    let changed_keys = index.nodes.changed_current_keys(cancelled)?;
+    let mut files = RowProjection::new(&previous.files, |(name, parent, node)| {
+        file_entry(name, parent, node)
     });
     for (path, key, n) in index.nodes.identified() {
         crate::output::check(cancelled)?;
         if n.dir() || n.excluded() {
             continue;
         }
-        let parent = paths[path.parent().unwrap()];
+        let parent = paths[path.parent()];
         let row = file_keys.len();
         let same_key = projection.has_file_key(row, key);
         if !same_key {
             mark_ancestors(&scan, &mut affected, parent);
         }
         files.push(
-            (path, parent, n),
-            same_key
-                && previous.files[row].parent == parent
-                && index.nodes.original(path) == Some(n),
+            (path.name(), parent, n),
+            same_key && previous.files[row].parent == parent && !changed_keys.contains(&key),
         );
         file_keys.push(key);
         file_ids.push(n.id);
@@ -1354,9 +1361,9 @@ impl<'a, T: Clone, R, F: FnMut(R) -> T> RowProjection<'a, T, R, F> {
     }
 }
 
-fn file_entry(path: &Path, parent: usize, n: &super::Node) -> crate::scanner::FileEntry {
+fn file_entry(name: &std::ffi::OsStr, parent: usize, n: &super::Node) -> crate::scanner::FileEntry {
     crate::scanner::FileEntry {
-        name: path.file_name().unwrap().to_owned(),
+        name: name.to_owned(),
         parent,
         logical_bytes: n.bytes,
         extra: n.extra,

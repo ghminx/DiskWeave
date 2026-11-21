@@ -12,6 +12,8 @@ pub mod cost;
 pub mod edit;
 #[path = "usn/entries.rs"]
 pub mod entries;
+#[path = "usn/paths.rs"]
+mod paths;
 #[path = "usn/stream.rs"]
 pub mod stream;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -256,16 +258,15 @@ fn conflicting_directories(
     cancelled: &impl Fn() -> bool,
 ) -> io::Result<Vec<(u64, PathBuf, PathBuf)>> {
     let mut conflicts = Vec::new();
-    for (id, aliases) in nodes.conflicting_directory_ids() {
+    for id in nodes.conflicting_directory_ids() {
         crate::output::check(cancelled)?;
         let mut previous = None;
-        for path in aliases {
+        for (path, node) in nodes.nodes_with_id(id) {
             crate::output::check(cancelled)?;
-            let path = path.as_ref();
-            let node = &nodes[path];
             if node.dir() && !node.excluded() {
-                if let Some(before) = previous.replace(path) {
-                    conflicts.push((id, before.to_owned(), path.to_owned()));
+                let path = path.path();
+                if let Some(before) = previous.replace(path.clone()) {
+                    conflicts.push((id, before, path));
                 }
             }
         }
@@ -874,26 +875,24 @@ impl Index {
                 pending.insert(e.id);
             }
             let structural = e.reason & 0x00373300 != 0;
-            let paths = self.nodes.paths_with_id(e.id);
-            for p in paths {
+            let nodes = self.nodes.nodes_with_id(e.id);
+            let has_aliases = nodes.len() != 0;
+            for (p, n) in nodes {
                 crate::output::check(cancelled)?;
-                let p = p.as_ref();
-                let n = &self.nodes[p];
-                if p.as_os_str().is_empty() {
+                if p.name().is_empty() {
                     continue;
                 }
                 if structural || n.dir() || n.excluded() {
-                    directories.insert(p.parent().unwrap_or(Path::new("")).to_owned());
+                    directories.insert(p.parent().to_owned());
                 } else {
-                    files.insert(p.to_owned());
+                    files.insert(p.path());
                 }
             }
-            if structural || paths.is_empty() {
-                for p in self.nodes.paths_with_id(e.parent) {
+            if structural || !has_aliases {
+                for (p, n) in self.nodes.nodes_with_id(e.parent) {
                     crate::output::check(cancelled)?;
-                    let n = &self.nodes[p.as_ref()];
                     if n.dir() && !n.excluded() {
-                        directories.insert(p.to_path_buf());
+                        directories.insert(p.path());
                     }
                 }
             }
@@ -907,10 +906,10 @@ impl Index {
         }
         for id in &pending {
             crate::output::check(cancelled)?;
-            for p in self.nodes.paths_with_id(*id) {
+            for (p, node) in self.nodes.nodes_with_id(*id) {
                 crate::output::check(cancelled)?;
-                if !self.nodes[p.as_ref()].dir() {
-                    files.insert(p.to_path_buf());
+                if !node.dir() {
+                    files.insert(p.path());
                 }
             }
         }
@@ -934,9 +933,8 @@ impl Index {
         let mut open_files = Vec::new();
         for id in pending {
             crate::output::check(cancelled)?;
-            for path in edit.nodes.paths_with_id(id) {
+            for (_, node) in edit.nodes.nodes_with_id(id) {
                 crate::output::check(cancelled)?;
-                let node = &edit.nodes[path.as_ref()];
                 if !node.dir() && !node.excluded() {
                     open_files.push(id);
                     break;
@@ -1191,10 +1189,14 @@ impl Index {
                     }
                 }
                 let removed: Vec<_> = next
-                    .subtree_keys(&directory)
-                    .chain(unavailable.subtree_keys(&directory).map(PathBuf::as_path))
-                    .filter(|p| p.parent() == Some(directory.as_path()) && !seen.contains(*p))
-                    .map(Path::to_owned)
+                    .direct_children(&directory)
+                    .chain(
+                        unavailable
+                            .subtree_keys(&directory)
+                            .filter(|p| p.parent() == Some(directory.as_path()))
+                            .cloned(),
+                    )
+                    .filter(|p| !seen.contains(p))
                     .collect();
                 for p in removed {
                     next.remove_subtree(&p, false, cancelled)?;
@@ -1301,24 +1303,28 @@ impl Index {
                 .identified()
                 .filter(|(_, _, n)| n.dir() && !n.excluded())
                 .collect();
-            directories.sort_by_key(|(p, _, _)| p.components().count());
+            directories.sort_by_key(|(p, _, _)| {
+                p.parent().components().count() + usize::from(!p.name().is_empty())
+            });
             for (p, key, n) in directories {
                 crate::output::check(cancelled)?;
-                let parent = if p.as_os_str().is_empty() {
+                let parent = if p.name().is_empty() {
                     None
                 } else {
                     Some(
                         *folders
-                            .get(p.parent().unwrap())
+                            .get(p.parent())
                             .ok_or_else(|| invalid("부모 없는 추적 폴더"))?,
                     )
                 };
-                folders.insert(p, scan.folders.len());
+                let path = p.path();
+                let absolute = self.root.join(&path);
+                folders.insert(path, scan.folders.len());
                 refs.push(n.id);
                 folder_keys.push(key);
                 scan.folders.push(Folder {
                     access: Default::default(),
-                    path: self.root.join(p),
+                    path: absolute,
                     parent,
                     logical_bytes: 0,
                     file_count: 0,
@@ -1334,7 +1340,7 @@ impl Index {
                 if n.excluded() {
                     scan.skipped_reparse_points += 1;
                     excluded.push(Excluded {
-                        path: p.as_os_str().encode_wide().collect(),
+                        path: p.wide(),
                         id: n.id,
                         attributes: n.attributes,
                     });
@@ -1344,7 +1350,7 @@ impl Index {
                     continue;
                 }
                 let parent = *folders
-                    .get(p.parent().unwrap())
+                    .get(p.parent())
                     .ok_or_else(|| invalid("부모 없는 추적 파일"))?;
                 let folder = &mut scan.folders[parent];
                 folder.logical_bytes = folder
@@ -1357,13 +1363,13 @@ impl Index {
                     scan.metadata_error_count += 1;
                     if scan.metadata_issues.len() < 20 {
                         scan.metadata_issues.push(crate::scanner::ScanIssue {
-                            path: self.root.join(p),
+                            path: self.root.join(p.path()),
                             error: io::Error::other(issue.clone()),
                         });
                     }
                 }
                 scan.files.push(FileEntry {
-                    name: p.file_name().unwrap().to_owned(),
+                    name: p.name().to_owned(),
                     parent,
                     logical_bytes: n.bytes,
                     created: n.created,

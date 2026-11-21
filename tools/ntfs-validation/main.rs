@@ -108,6 +108,9 @@ fn run() -> io::Result<()> {
             Path::new(&args[3]),
         );
     }
+    if args.len() == 3 && args[0] == "--baseline-budget" {
+        return stream_bench::baseline_budget(&args[1].to_string_lossy(), Path::new(&args[2]));
+    }
     if args.len() != 1 {
         return Err(io::Error::other("독립 시험 볼륨의 요청 파일이 필요합니다"));
     }

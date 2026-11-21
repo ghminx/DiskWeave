@@ -76,6 +76,7 @@ enum Frame {
 pub struct Stats {
     pub bytes: u64,
     pub changes: u64,
+    pub baseline: Option<BaselineCost>,
 }
 const HASH_START: u64 = 0xcbf29ce484222325;
 fn hash(mut value: u64, bytes: &[u8]) -> u64 {
@@ -158,28 +159,59 @@ fn path(value: &[u16]) -> io::Result<PathBuf> {
     }
     Ok(path)
 }
+const RECORD_COST: u64 = 384 + std::mem::size_of::<Node>() as u64;
+
+fn path_cost(path: &Path) -> u64 {
+    path.file_name().unwrap_or_default().len() as u64 * 4
+}
+fn issue_cost(node: &Node) -> u64 {
+    node.issue.as_ref().map_or(0, |s| s.len() as u64 * 2)
+}
 pub(super) fn node_cost(path: &Path, node: &Node) -> u64 {
-    384 + std::mem::size_of::<Node>() as u64
-        + (path.as_os_str().len() as u64) * 4
-        + node.issue.as_ref().map_or(0, |s| s.len() as u64 * 2)
+    RECORD_COST + path_cost(path) + issue_cost(node)
+}
+pub(super) fn node_undo_cost(path: &Path, node: &Node) -> u64 {
+    RECORD_COST + path.as_os_str().len() as u64 * 4 + issue_cost(node)
 }
 pub(super) fn unavailable_cost(path: &Path, item: &Unavailable) -> u64 {
     384 + std::mem::size_of::<Unavailable>() as u64
         + path.as_os_str().len() as u64 * 4
         + item.path.len() as u64 * 2
 }
-fn estimate(index: &Index, cancelled: &impl Fn() -> bool) -> io::Result<u64> {
-    let mut cost = 0u64;
-    for value in index.nodes.iter().map(|(p, n)| node_cost(p, n)).chain(
-        index
-            .unavailable
-            .iter()
-            .map(|(p, e)| unavailable_cost(p, e)),
-    ) {
+#[derive(Debug, Default, serde::Serialize)]
+pub struct BaselineCost {
+    pub nodes: usize,
+    pub excluded: usize,
+    pub records: u64,
+    pub paths: u64,
+    pub shared_parents: u64,
+    pub issues: u64,
+    pub excluded_bytes: u64,
+}
+impl BaselineCost {
+    fn total(&self) -> u64 {
+        self.entry_bytes() + self.shared_parents
+    }
+    fn entry_bytes(&self) -> u64 {
+        self.records + self.paths + self.issues + self.excluded_bytes
+    }
+}
+fn estimate(index: &Index, cancelled: &impl Fn() -> bool) -> io::Result<BaselineCost> {
+    let mut cost = BaselineCost {
+        nodes: index.nodes.len(),
+        excluded: index.unavailable.len(),
+        shared_parents: index.nodes.parent_bytes(),
+        ..Default::default()
+    };
+    for (path, _, node) in index.nodes.identified() {
         crate::output::check(cancelled)?;
-        cost = cost
-            .checked_add(value)
-            .ok_or_else(|| invalid("갱신 목록이 메모리 예산을 초과했습니다"))?;
+        cost.records += RECORD_COST;
+        cost.paths += path.name().len() as u64 * 4;
+        cost.issues += issue_cost(node);
+    }
+    for (path, issue) in &index.unavailable {
+        crate::output::check(cancelled)?;
+        cost.excluded_bytes += unavailable_cost(path, issue);
     }
     Ok(cost)
 }
@@ -210,23 +242,51 @@ impl Sender {
         crate::output::check(cancelled)?;
         let baseline = self.revision == 0;
         let quiet = !baseline && index.changes.is_empty();
+        let mut stats = Stats::default();
         let units = {
             let _sample = super::cost::measure(super::cost::Stage::SendBudget);
-            if self.session == 0
-                || index.nodes.len() + index.unavailable.len() > self.limits.entries
-            {
-                return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
+            if self.session == 0 {
+                return Err(invalid("갱신 세션 불일치"));
+            }
+            let count = index.nodes.len() + index.unavailable.len();
+            if count > self.limits.entries {
+                return Err(invalid(&format!(
+                    "갱신 목록 항목 한도 초과 ({count} / {})",
+                    self.limits.entries
+                )));
             }
             let units = if baseline {
-                estimate(index, cancelled)?
+                let cost = estimate(index, cancelled)?;
+                let total = cost.entry_bytes();
+                stats.baseline = Some(cost);
+                total
             } else if quiet {
                 self.units
             } else {
                 u64::try_from(i128::from(self.units) + index.budget_change)
                     .map_err(|_| invalid("갱신 목록의 메모리 예산 합계 오류"))?
             };
-            if units > self.limits.state_bytes / 2 {
-                return Err(invalid("갱신 목록이 항목·메모리 예산을 초과했습니다"));
+            let maximum = self.limits.state_bytes / 2;
+            let resident = stats
+                .baseline
+                .as_ref()
+                .map_or_else(|| units + index.nodes.parent_bytes(), BaselineCost::total);
+            if resident > maximum {
+                let detail = stats.baseline.as_ref().map_or_else(String::new, |cost| {
+                    format!(
+                        ", 노드 {}개, 항목 {} B, 이름 {} B, 상위 경로 {} B, 오류 {} B, 제외 {}개 / {} B",
+                        cost.nodes,
+                        cost.records,
+                        cost.paths,
+                        cost.shared_parents,
+                        cost.issues,
+                        cost.excluded,
+                        cost.excluded_bytes
+                    )
+                });
+                return Err(invalid(&format!(
+                    "갱신 목록 추정 메모리 예산 초과 ({resident} / {maximum} B{detail})"
+                )));
             }
             units
         };
@@ -246,7 +306,6 @@ impl Sender {
             finished: SystemTime::now(),
         };
         let mut codec = FrameCodec::new(self.limits);
-        let mut stats = Stats::default();
         let mut frames = 1;
         codec.write(
             writer,
@@ -267,9 +326,9 @@ impl Sender {
             Ok(())
         };
         if baseline {
-            for (p, n) in &index.nodes {
+            for (p, _, n) in index.nodes.identified() {
                 send(Change::Node {
-                    path: wide(p),
+                    path: p.wide(),
                     expected: None,
                     value: Some(n.clone()),
                 })?;
@@ -495,7 +554,13 @@ impl Receiver {
             self.finished = header.finished;
             return Ok(false);
         }
-        if self.units > self.limits.state_bytes / 2 {
+        if self.units
+            + self
+                .index
+                .as_ref()
+                .map_or(0, |index| index.nodes.parent_bytes())
+            > self.limits.state_bytes / 2
+        {
             return Err(invalid("갱신 후보가 메모리 예산을 초과했습니다"));
         }
         let baseline = self.index.is_none();
@@ -615,10 +680,11 @@ impl Receiver {
                 }
             }
             frames += 1;
+            let resident = units + candidate.nodes.parent_bytes();
             if candidate.nodes.len() + candidate.unavailable.len() > self.limits.entries
                 || pending.len() > self.limits.entries
-                || units > self.limits.state_bytes / 2
-                || units
+                || resident > self.limits.state_bytes / 2
+                || resident
                     .checked_add(candidate.undo_bytes())
                     .is_none_or(|n| n > self.limits.state_bytes)
                 || frames > self.limits.entries as u64 * 4 + 8
@@ -841,7 +907,7 @@ fn validate_delta(
         }
         if before.and_then(Node::directory_id).is_some() {
             if !available_directory(index, path)
-                && (index.nodes.subtree_keys(path).any(|child| child != path)
+                && (index.nodes.has_descendants(path)
                     || index
                         .unavailable
                         .subtree_keys(path)
@@ -915,11 +981,9 @@ fn validate(
     let mut files = HashMap::<u64, i64>::new();
     let mut bytes = 0u64;
     let mut allocation = 0u64;
-    for (p, n) in &index.nodes {
+    for (p, _, n) in index.nodes.identified() {
         crate::output::check(cancelled)?;
-        if p.parent()
-            .is_some_and(|parent| !available_directory(index, parent))
-        {
+        if !p.name().is_empty() && !available_directory(index, p.parent()) {
             return Err(invalid("갱신 항목 부모 누락"));
         }
         if n.excluded() {
@@ -929,8 +993,8 @@ fn validate(
             if let Some(previous) = dirs.insert(n.id, p) {
                 return Err(invalid(&format!(
                     "동일한 폴더 ID의 경로 불일치: {} / {} (ID {:X})",
-                    previous.display(),
-                    p.display(),
+                    previous.path().display(),
+                    p.path().display(),
                     n.id
                 )));
             }
@@ -1941,12 +2005,13 @@ pub(crate) mod tests {
         index.refresh(&mut source, &|| false).unwrap();
         wire.clear();
         sender.write(&mut wire, &mut index, &|| false).unwrap();
-        receiver.limits.state_bytes = receiver.units * 2;
+        receiver.limits.state_bytes =
+            (receiver.units + receiver.index.as_ref().unwrap().nodes.parent_bytes()) * 2;
         let revision = receiver.revision;
         let error = receiver
             .receive(&mut wire.as_slice(), &|| false)
             .unwrap_err();
-        assert!(error.to_string().contains("예산"), "{error}");
+        assert_eq!(error.to_string(), "변경 원본 보관 예산 초과");
         let kept = receiver.snapshot(&|| false).unwrap();
         assert!(Arc::ptr_eq(&kept.scan, &before.scan));
         assert!(Arc::ptr_eq(
@@ -2126,6 +2191,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn long_shared_folder_names_fit_without_raising_the_initial_list_budget() {
+        let fixture = Fixture::new();
+        let relative = PathBuf::from("p".repeat(120)).join("q".repeat(120));
+        let folder = fixture.0.join(&relative);
+        std::fs::create_dir_all(&folder).unwrap();
+        for i in 0..16 {
+            std::fs::write(folder.join(format!("file-{i:02}.txt")), b"abc").unwrap();
+        }
+        let mut index = Index::restore(&record(&fixture.0)).unwrap();
+        let limits = Limits {
+            state_bytes: 32_000,
+            ..Default::default()
+        };
+        let mut wire = Vec::new();
+        let mut sender = Sender::new(17, limits);
+        sender.write(&mut wire, &mut index, &|| false).unwrap();
+        let mut receiver = Receiver::new(fixture.0.clone(), true, limits);
+        assert!(receiver.receive(&mut wire.as_slice(), &|| false).unwrap());
+        let ready = receiver.snapshot(&|| false).unwrap();
+        assert_eq!(ready.scan.files.len(), 16);
+        let parent = ready.scan.folder_index(&relative).unwrap();
+        assert_eq!(ready.scan.folders[parent].logical_bytes, 48);
+        for i in 0..16 {
+            let entries = ready.entries.as_ref().unwrap();
+            let key = entries
+                .path_key(&relative.join(format!("file-{i:02}.txt")))
+                .unwrap();
+            assert!(matches!(
+                entries.item(key),
+                Some(crate::explorer::Item::File(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn baseline_reports_which_budget_was_exceeded_before_sending_any_rows() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("file"), b"x").unwrap();
+        let mut index = Index::restore(&record(&fixture.0)).unwrap();
+        for (limits, reason) in [
+            (
+                Limits {
+                    entries: 1,
+                    ..Default::default()
+                },
+                "항목 한도 초과 (2 / 1)",
+            ),
+            (
+                Limits {
+                    state_bytes: 2,
+                    ..Default::default()
+                },
+                "추정 메모리 예산 초과",
+            ),
+        ] {
+            let mut wire = Vec::new();
+            let error = Sender::new(17, limits)
+                .write(&mut wire, &mut index, &|| false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(wire.is_empty());
+        }
+    }
+
+    #[test]
     fn sender_budget_tracks_path_growth_without_consuming_a_failed_revision() {
         let fixture = Fixture::new();
         let path = fixture.0.join("file");
@@ -2145,7 +2276,7 @@ pub(crate) mod tests {
             },
         };
         let mut index = Index::restore(&saved).unwrap();
-        let baseline_cost = estimate(&index, &|| false).unwrap();
+        let baseline_cost = estimate(&index, &|| false).unwrap().total();
         let mut sender = Sender::new(
             17,
             Limits {

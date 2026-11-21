@@ -617,9 +617,11 @@ impl DiskWeaveApp {
         paths
     }
     fn file_actions_available(&self) -> bool {
+        self.shared_file_actions_available() && self.live_folder_writable() && self.tab != 4
+    }
+
+    fn shared_file_actions_available(&self) -> bool {
         self.archive_record.is_none()
-            && self.live_folder_writable()
-            && self.tab != 4
             && !self.duplicates.running()
             && !self.scan.is_running()
             && !self.file_job.busy()
@@ -628,16 +630,40 @@ impl DiskWeaveApp {
             && !self.results.busy()
     }
 
+    fn registered_path_writable(&self, path: &std::path::Path) -> bool {
+        self.scan.entries.iter().all(|entry| {
+            crate::file_ops::contains_path(&entry.path, path).is_ok_and(|contained| {
+                !contained || !entry.stale && entry.scan.completed().is_some()
+            })
+        })
+    }
+
+    fn quick_recycle_context(&self, path: PathBuf) -> std::io::Result<crate::file_ui::Context> {
+        if !self.shared_file_actions_available() {
+            return Err(std::io::Error::other("진행 중인 작업을 먼저 마쳐 주세요"));
+        }
+        if !self.registered_path_writable(&path) {
+            return Err(std::io::Error::other(
+                "등록 위치의 목록을 갱신한 뒤 다시 시도해 주세요",
+            ));
+        }
+        Ok(crate::file_ui::Context {
+            paths: vec![path],
+            current: None,
+            protected: self
+                .scan
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+            writable: true,
+        })
+    }
+
     fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
         let mut writable = self.file_actions_available();
         let paths = if let Some(paths) = explicit {
-            for path in &paths {
-                for entry in &self.scan.entries {
-                    if crate::file_ops::contains_path(&entry.path, path).unwrap_or(true) {
-                        writable &= !entry.stale && entry.scan.completed().is_some();
-                    }
-                }
-            }
+            writable &= paths.iter().all(|path| self.registered_path_writable(path));
             paths
         } else {
             let mut selected = if self.locations_view.global_mode {
@@ -1341,25 +1367,12 @@ impl DiskWeaveApp {
                         crate::path_copy::copy_to_clipboard(ctx, &[path])?;
                     }
                     crate::quick_ui::Action::Recycle(hit) => {
-                        if !self.file_actions_available() {
-                            return Err(std::io::Error::other("진행 중인 작업을 먼저 마쳐 주세요"));
-                        }
+                        let context = self.quick_recycle_context(hit.path)?;
                         let identity = hit.identity.ok_or_else(|| {
                             std::io::Error::other(
                                 "검색 결과의 파일 또는 폴더 ID를 확인할 수 없습니다",
                             )
                         })?;
-                        let context = crate::file_ui::Context {
-                            paths: vec![hit.path],
-                            current: None,
-                            protected: self
-                                .scan
-                                .entries
-                                .iter()
-                                .map(|entry| entry.path.clone())
-                                .collect(),
-                            writable: true,
-                        };
                         self.file_ui.begin_search_recycle(
                             context,
                             identity,
@@ -4066,6 +4079,36 @@ mod session_tests {
         assert!(app.source().is_none());
         app.close_folder_tab(0);
         assert_eq!(app.capture_navigation().unwrap().folder, second);
+    }
+
+    #[test]
+    fn quick_recycle_policy_uses_the_hit_location_and_keeps_registered_roots_protected() {
+        let registered = crate::duplicates::tests::Fixture::new();
+        let external = crate::duplicates::tests::Fixture::new();
+        let in_file = registered.0.join("registered.txt");
+        let out_file = external.0.join("external.txt");
+        std::fs::write(&in_file, []).unwrap();
+        std::fs::write(&out_file, []).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let id = app.scan.add(&registered.0).unwrap();
+        app.tab = 4;
+
+        assert!(app.quick_recycle_context(in_file.clone()).is_err());
+        let context = app.quick_recycle_context(out_file).unwrap();
+        assert_eq!(context.protected, std::slice::from_ref(&registered.0));
+        assert!(context.writable);
+
+        app.scan.start_selected(&[id]).unwrap();
+        assert!(app.quick_recycle_context(in_file.clone()).is_err());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(app.quick_recycle_context(in_file.clone()).is_ok());
+        app.scan.entries[0].stale = true;
+        assert!(app.quick_recycle_context(in_file).is_err());
     }
 
     #[test]

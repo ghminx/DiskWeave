@@ -1,7 +1,7 @@
 use crate::{
     file_open::TargetKind,
     metadata::Identity,
-    scanner::directory::{self, Strategy},
+    scanner::directory,
     search::{EntryKind, SearchMode},
 };
 use std::{
@@ -31,6 +31,7 @@ pub struct Input {
     pub folder: Option<PathBuf>,
     pub text: String,
     pub mode: SearchMode,
+    pub kind: EntryKind,
 }
 
 #[derive(Default)]
@@ -73,8 +74,6 @@ pub struct LiveSearch {
     pub coverage: Coverage,
     pub error: Option<String>,
     worker: Option<Worker>,
-    files: Vec<usize>,
-    folders: Vec<usize>,
 }
 
 impl LiveSearch {
@@ -82,33 +81,10 @@ impl LiveSearch {
         self.worker.is_some()
     }
 
-    pub fn count(&self, kind: EntryKind) -> usize {
-        match kind {
-            EntryKind::All => self.hits.len(),
-            EntryKind::Files => self.files.len(),
-            EntryKind::Folders => self.folders.len(),
-        }
-    }
-
-    pub fn row(&self, kind: EntryKind, row: usize) -> Option<&Hit> {
-        let index = match kind {
-            EntryKind::All => row,
-            EntryKind::Files => *self.files.get(row)?,
-            EntryKind::Folders => *self.folders.get(row)?,
-        };
-        self.hits.get(index)
-    }
-
     pub fn remove_recycled(&mut self, path: &Path) -> bool {
         let before = self.hits.len();
         self.hits.retain(|hit| !hit.path.starts_with(path));
-        if before == self.hits.len() {
-            return false;
-        }
-        self.files.clear();
-        self.folders.clear();
-        index_hits(&self.hits, 0, &mut self.files, &mut self.folders);
-        true
+        before != self.hits.len()
     }
 
     pub fn start(
@@ -149,8 +125,6 @@ impl LiveSearch {
         self.stop();
         self.input = None;
         self.hits.clear();
-        self.files.clear();
-        self.folders.clear();
         self.coverage = Coverage::default();
         self.error = None;
     }
@@ -161,7 +135,6 @@ impl LiveSearch {
             match worker.messages.try_recv() {
                 Ok(Message::Hits(mut hits)) => {
                     if !self.stopped {
-                        index_hits(&hits, self.hits.len(), &mut self.files, &mut self.folders);
                         self.hits.append(&mut hits);
                     }
                 }
@@ -188,15 +161,6 @@ impl LiveSearch {
     }
 }
 
-fn index_hits(hits: &[Hit], offset: usize, files: &mut Vec<usize>, folders: &mut Vec<usize>) {
-    for (row, hit) in hits.iter().enumerate() {
-        match hit.kind {
-            TargetKind::File => files.push(offset + row),
-            TargetKind::Folder => folders.push(offset + row),
-        }
-    }
-}
-
 pub fn check_root(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::other("검색할 폴더의 전체 경로를 입력하세요"));
@@ -218,9 +182,8 @@ fn search(
 ) -> io::Result<Coverage> {
     let cancelled = || cancel.load(Ordering::Relaxed);
     let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
-    let roots = if let Some(root) = input.folder {
+    let roots = if let Some(root) = &input.folder {
         let root = std::path::absolute(root)?;
-        check_root(&root)?;
         vec![root]
     } else {
         fixed_roots()?
@@ -228,15 +191,31 @@ fn search(
     if roots.is_empty() {
         return Err(io::Error::other("검색할 로컬 고정 드라이브가 없습니다"));
     }
-    let mut pending = roots;
     let needle = input.text.to_lowercase();
     let mut coverage = Coverage::default();
+    let mut scoped = Vec::with_capacity(roots.len());
+    for root in roots {
+        match directory::scoped_root(&root, &cancelled) {
+            Ok(expected) => scoped.push((root, expected)),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted || input.folder.is_some() => {
+                return Err(error)
+            }
+            Err(error) => coverage.skip(&root, error),
+        }
+    }
+    let mut pending: Vec<_> = scoped
+        .iter()
+        .enumerate()
+        .map(|(index, (root, _))| (root.clone(), index))
+        .collect();
     let mut batch = Vec::with_capacity(64);
     let mut sent = 0;
     let mut emitted_at = Instant::now();
-    while let Some(folder) = pending.pop() {
+    while let Some((folder, scope)) = pending.pop() {
         crate::output::check(&cancelled)?;
-        let result = directory::collect(&folder, Strategy::Bulk, &cancelled, &mut |entries| {
+        let (root, resolved) = &scoped[scope];
+        let expected = resolved.join(folder.strip_prefix(root).map_err(io::Error::other)?);
+        let result = directory::collect_scoped(&folder, &expected, &cancelled, &mut |entries| {
             for entry in entries {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -251,7 +230,13 @@ fn search(
                 }
                 let folder = entry.attributes & 0x10 != 0;
                 if folder {
-                    pending.push(entry.path.clone());
+                    pending.push((entry.path.clone(), scope));
+                }
+                if matches!(
+                    (input.kind, folder),
+                    (EntryKind::Files, true) | (EntryKind::Folders, false)
+                ) {
+                    continue;
                 }
                 let value = match input.mode {
                     SearchMode::Name => entry.name.to_string_lossy(),
@@ -306,4 +291,81 @@ fn search(
             .map_err(|_| interrupted())?;
     }
     Ok(coverage)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::scanner::directory::{collect_scoped, scoped_root};
+    use std::fs;
+
+    #[test]
+    fn scoped_enumeration_rejects_a_handle_to_a_different_directory() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let selected = fixture.0.join("selected");
+        let other = fixture.0.join("other");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("outside.txt"), []).unwrap();
+        let expected = scoped_root(&selected, &|| false).unwrap();
+        let mut found = Vec::new();
+        let error = collect_scoped(&other, &expected, &|| false, &mut |rows| {
+            found.extend(rows);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("검색 범위"));
+        assert!(found.is_empty());
+        collect_scoped(
+            &other,
+            &scoped_root(&other, &|| false).unwrap(),
+            &|| false,
+            &mut |rows| {
+                found.extend(rows);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].as_ref().unwrap().name, "outside.txt");
+    }
+
+    #[test]
+    fn scoped_enumeration_does_not_follow_a_replaced_ancestor() {
+        use std::os::windows::process::CommandExt;
+
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let selected = fixture.0.join("selected");
+        let ancestor = selected.join("ancestor");
+        let pending = ancestor.join("pending");
+        let outside = fixture.0.join("outside");
+        fs::create_dir_all(&pending).unwrap();
+        fs::create_dir_all(outside.join("pending")).unwrap();
+        fs::write(outside.join("pending/outside.txt"), []).unwrap();
+        let expected = scoped_root(&selected, &|| false)
+            .unwrap()
+            .join("ancestor")
+            .join("pending");
+
+        fs::remove_dir(&pending).unwrap();
+        fs::remove_dir(&ancestor).unwrap();
+        let link = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&ancestor)
+            .arg(&outside)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(link.status.success(), "{:?}", link.stderr);
+
+        let mut emitted = false;
+        let result = collect_scoped(&pending, &expected, &|| false, &mut |_| {
+            emitted = true;
+            Ok(())
+        });
+        let root_result = scoped_root(&pending, &|| false);
+        fs::remove_dir(&ancestor).unwrap();
+        assert!(result.unwrap_err().to_string().contains("검색 범위"));
+        assert!(root_result.is_err());
+        assert!(!emitted);
+    }
 }

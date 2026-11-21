@@ -75,6 +75,7 @@ impl QuickSearch {
         if self.kind != kind {
             self.kind = kind;
             self.selection = None;
+            self.invalidate_live();
         }
     }
     pub fn set_folder(&mut self, path: PathBuf) {
@@ -94,6 +95,7 @@ impl QuickSearch {
         input.folder.as_deref() == (self.scope == Scope::Folder).then_some(self.folder())
             && input.text == self.text.trim()
             && input.mode == self.mode
+            && input.kind == self.kind
     }
     pub fn invalidate_live(&mut self) {
         if self
@@ -125,6 +127,7 @@ impl QuickSearch {
             folder: folder.map(Path::to_path_buf),
             text: text.to_owned(),
             mode: self.mode,
+            kind: self.kind,
         };
         self.live.start(input, fixed_roots)?;
         self.selection = None;
@@ -143,12 +146,12 @@ impl QuickSearch {
         if self.scope == Scope::Scanned {
             self.job.results.as_ref().map_or(0, |r| r.hits.len())
         } else {
-            self.live.count(self.kind)
+            self.live.hits.len()
         }
     }
     pub fn row(&self, row: usize) -> Option<Hit> {
         if self.scope != Scope::Scanned {
-            return self.live.row(self.kind, row).cloned();
+            return self.live.hits.get(row).cloned();
         }
         let results = self.job.results.as_ref()?;
         let hit = results.hits.get(row)?;
@@ -394,7 +397,8 @@ mod tests {
         assert!(quick.live.stopped);
         assert!(quick.live.error.is_none());
 
-        quick.start_live_using(move || Ok(roots)).unwrap();
+        let file_roots = roots.clone();
+        quick.start_live_using(move || Ok(file_roots)).unwrap();
         while quick.pending() {
             quick.tick(&locations, Instant::now());
             assert!(Instant::now() < until);
@@ -410,6 +414,13 @@ mod tests {
         );
         quick.set_kind(EntryKind::Folders);
         assert!(!quick.pending());
+        assert_eq!(quick.count(), 0);
+        quick.start_live_using(move || Ok(roots)).unwrap();
+        while quick.pending() {
+            quick.tick(&locations, Instant::now());
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
         assert_eq!(quick.count(), 2);
         assert_eq!(quick.row(0).unwrap().kind, TargetKind::Folder);
         quick.step(1);
@@ -419,6 +430,38 @@ mod tests {
         quick.tick(&locations, Instant::now());
         assert!(quick.live_hits().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn folders_only_does_not_spend_its_limit_on_files_in_an_earlier_root() {
+        let owned = crate::duplicates::tests::Fixture::new();
+        let earlier = owned.0.join("earlier");
+        let later = owned.0.join("later");
+        fs::create_dir(&earlier).unwrap();
+        fs::create_dir_all(later.join("match-folder")).unwrap();
+        for row in 0..10_001 {
+            fs::write(earlier.join(format!("match-{row:05}.txt")), []).unwrap();
+        }
+        let locations = Locations::default();
+        let mut quick = QuickSearch::default();
+        quick.set_scope(Scope::Computer);
+        quick.set_kind(EntryKind::Folders);
+        quick.open();
+        quick.text = "match".into();
+        quick
+            .start_live_using(move || Ok(vec![later, earlier]))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while quick.pending() {
+            quick.tick(&locations, Instant::now());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!quick.live.coverage.limited);
+        assert_eq!(quick.count(), 1);
+        assert_eq!(
+            quick.row(0).unwrap().path.file_name().unwrap(),
+            "match-folder"
+        );
     }
     #[test]
     fn quick_search_uses_live_locations_and_rejects_changed_results() {

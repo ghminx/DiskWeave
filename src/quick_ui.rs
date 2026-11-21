@@ -477,7 +477,8 @@ impl QuickUi {
                         });
                     } else if (scanned && quick.job.results.is_some())
                         || (quick.live.input.is_some() && !quick.live.running() && !quick.live.stopped
-                            && quick.live.error.is_none() && quick.live.coverage.skipped == 0)
+                            && quick.live.error.is_none() && !quick.live.coverage.limited
+                            && quick.live.coverage.skipped == 0)
                     {
                         ui.label("일치하는 파일이나 폴더가 없습니다.");
                     }

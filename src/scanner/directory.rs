@@ -159,6 +159,82 @@ impl Drop for Find {
         }
     }
 }
+
+fn plain_directory(path: &Path, access: u32, share: u32) -> io::Result<fs::File> {
+    let file = fs::File::options()
+        .access_mode(access)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other("일반 폴더만 열거할 수 있습니다"));
+    }
+    Ok(file)
+}
+
+fn pin_plain_ancestors(path: &Path, cancel: &impl Fn() -> bool) -> io::Result<Vec<fs::File>> {
+    let ancestors: Vec<_> = path.ancestors().collect();
+    ancestors
+        .into_iter()
+        .rev()
+        .map(|part| {
+            crate::output::check(cancel)?;
+            plain_directory(part, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, FILE_SHARE_READ)
+        })
+        .collect()
+}
+
+pub fn scoped_root(path: &Path, cancel: &impl Fn() -> bool) -> io::Result<PathBuf> {
+    let handles = pin_plain_ancestors(path, cancel)?;
+    let root = handles
+        .last()
+        .ok_or_else(|| io::Error::other("검색 폴더 누락"))?;
+    crate::ntfs_native::resolved_path(root, VOLUME_NAME_DOS)
+}
+
+pub fn collect_scoped(
+    path: &Path,
+    expected: &Path,
+    cancel: &impl Fn() -> bool,
+    emit: &mut impl FnMut(Vec<Item>) -> io::Result<()>,
+) -> io::Result<()> {
+    let verify = |handle: &fs::File| {
+        if crate::ntfs_native::resolved_path(handle, VOLUME_NAME_DOS)? != expected {
+            Err(io::Error::other("검색 범위의 폴더 경로가 변경되었습니다"))
+        } else {
+            Ok(())
+        }
+    };
+    crate::output::check(cancel)?;
+    let handle = plain_directory(
+        path,
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    verify(&handle)?;
+    match Native::from_file(handle) {
+        Ok(mut source) => match collect_from_with_options(
+            path,
+            &mut source,
+            cancel,
+            emit,
+            Experiment::for_strategy(Strategy::Bulk),
+        ) {
+            Err(e) if e.kind() == io::ErrorKind::Unsupported && !source.returned_page => {}
+            other => return other,
+        },
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+        Err(e) => return Err(e),
+    }
+    // 경로 기반 대체 열거에서 상위 폴더 이름 변경·재분석 지점 삽입 방지.
+    let guards = pin_plain_ancestors(path, cancel)?;
+    let folder = guards
+        .last()
+        .ok_or_else(|| io::Error::other("검색 폴더 누락"))?;
+    verify(folder)?;
+    collect(path, Strategy::LargeFetch, cancel, emit)
+}
 /// 폴더 항목을 제한된 묶음으로 전달. 파일 내용은 읽지 않으며 Reparse 대상 추적 생략.
 pub fn collect(
     path: &Path,
@@ -331,6 +407,9 @@ impl Native {
             return Err(io::Error::other("열거할 폴더의 종류가 변경되었습니다"));
         }
         observe(m);
+        Self::from_file(file)
+    }
+    fn from_file(file: fs::File) -> io::Result<Self> {
         let mut id = FILE_ID_INFO::default();
         // 동일 디렉터리 핸들에서 64-bit 볼륨 ID 확인. 출력 구조체의 크기/수명 유지.
         if unsafe {
@@ -546,6 +625,7 @@ fn read_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn configured_pages_bound_buffer_sizes_and_reject_short_dirty_responses() {
         struct Pages {
