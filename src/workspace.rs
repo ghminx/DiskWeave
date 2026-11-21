@@ -1,3 +1,6 @@
+pub mod folders;
+pub mod pane_rows;
+
 pub struct Panels {
     pub header: f32,
     pub target: f32,

@@ -312,6 +312,24 @@ impl Locations {
             self.changed = true;
         }
     }
+    pub fn clear_selection(&mut self) {
+        self.changed |= self.selected.take().is_some();
+    }
+    pub fn show_completed_view(&mut self, id: u64) {
+        // 같은 세대에서 복원할 화면이 있으므로 선택 변경에 따른 탐색 초기화 생략.
+        self.selected = Some(id);
+        self.changed = false;
+    }
+    pub fn completed_snapshot(&self, id: u64) -> Option<Snapshot> {
+        let entry = self.get(id)?;
+        let completed = entry.scan.completed()?;
+        Some(Snapshot {
+            entries: completed.entries.clone(),
+            id,
+            generation: entry.generation,
+            scan: Arc::clone(&completed.result),
+        })
+    }
     pub fn start(&mut self, path: PathBuf) -> io::Result<()> {
         if self.is_running() {
             return Err(io::Error::new(

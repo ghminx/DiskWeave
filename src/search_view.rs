@@ -83,6 +83,11 @@ impl Default for SearchView {
 }
 
 impl SearchView {
+    pub fn restoring_paths(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.live_selection
+            .as_ref()
+            .map(|(_, _, _, _, paths)| paths.iter().cloned().collect())
+    }
     pub fn preferred_map_collapsed(&self, current: bool) -> bool {
         self.presentation.map_or(current, |(map, _, _)| map)
     }

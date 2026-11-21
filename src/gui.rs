@@ -1,10 +1,12 @@
+mod folders;
+
 use crate::analysis::StatsScope;
 use crate::analysis_panel::{AnalysisPanel, PanelKey};
 use crate::explorer::{Explorer, Item};
 use crate::file_open::{OpenAction, OpenController, OpenRequest, OpenStatus};
 use crate::global_search::Hit;
 use crate::locations::{Locations, Snapshot};
-use crate::locations_ui::LocationsView;
+use crate::locations_ui::{LocationAction, LocationsView};
 use crate::map_job::{MapController, Target};
 use crate::presentation::{detail, SizeDisplay};
 use crate::scan_job::ScanStatus;
@@ -14,6 +16,7 @@ use crate::search_view::{SearchScope, SearchView};
 use crate::target_selection::TargetSelection;
 use crate::treemap::MapScope;
 use crate::treemap_view::{MapEvent, MapView};
+use crate::workspace::folders::{FolderTabs, PaneMemory, Side};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +32,10 @@ pub struct DiskWeaveApp {
     window_state: Option<crate::app_settings::WindowState>,
     window_restore: Option<(crate::app_settings::WindowState, u8)>,
     history: crate::navigation::History,
+    folder_tabs: FolderTabs,
+    unavailable_pane: Option<crate::navigation::ViewState>,
+    other_rows: crate::workspace::pane_rows::PaneRows,
+    split_fraction: Option<f32>,
     duplicates: crate::duplicate_job::Controller,
     duplicate_view: crate::duplicate_ui::DuplicateUi,
     quick: crate::quick_search::QuickSearch,
@@ -266,6 +273,19 @@ fn open_menu(ui: &mut egui::Ui, item: Item) -> Option<OpenAction> {
         ui.close();
     }
     action
+}
+
+fn folder_open_menu(ui: &mut egui::Ui, available: bool) -> Option<bool> {
+    if !available {
+        return None;
+    }
+    for (right, label) in [(false, "새 탭에서 열기"), (true, "오른쪽에 열기")] {
+        if crate::ui_style::menu_action(ui, label, true).clicked() {
+            ui.close();
+            return Some(right);
+        }
+    }
+    None
 }
 impl DiskWeaveApp {
     /// 현재 실행의 분석 위치. 이전 자동 저장소 접근 없이 제공.
@@ -588,15 +608,19 @@ impl DiskWeaveApp {
         }
         paths
     }
-    fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
-        let mut writable = self.archive_record.is_none()
+    fn file_actions_available(&self) -> bool {
+        self.archive_record.is_none()
             && self.tab != 4
             && !self.duplicates.running()
             && !self.scan.is_running()
             && !self.file_job.busy()
             && !self.file_refresh.busy()
             && self.file_ui.dialog.is_none()
-            && !self.results.busy();
+            && !self.results.busy()
+    }
+
+    fn file_context(&self, explicit: Option<Vec<PathBuf>>) -> crate::file_ui::Context {
+        let mut writable = self.file_actions_available();
         let paths = if let Some(paths) = explicit {
             for path in &paths {
                 for entry in &self.scan.entries {
@@ -674,6 +698,20 @@ impl DiskWeaveApp {
             .begin(kind, context)
             .err()
             .map(|e| e.to_string());
+    }
+
+    fn prepare_folder_drop(
+        &mut self,
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+    ) -> std::io::Result<()> {
+        let mut context = self.file_context(Some(paths));
+        for entry in &self.scan.entries {
+            if crate::file_ops::contains_path(&entry.path, &destination)? {
+                context.writable &= !entry.stale && entry.scan.completed().is_some();
+            }
+        }
+        self.file_ui.folder_drop(destination, context)
     }
     fn file_tick(&mut self) {
         if self.file_job.poll() {
@@ -1360,13 +1398,7 @@ impl DiskWeaveApp {
     }
     fn source(&self) -> Option<Snapshot> {
         let locations = self.active_locations();
-        let entry = locations.get(locations.selected_id()?)?;
-        Some(Snapshot {
-            entries: entry.scan.completed()?.entries.clone(),
-            id: entry.id,
-            generation: entry.generation,
-            scan: Arc::clone(&entry.scan.completed()?.result),
-        })
+        locations.completed_snapshot(locations.selected_id()?)
     }
     fn export_context(&self) -> crate::results_ui::ExportContext {
         let sources = self.scan.snapshots();
@@ -1405,7 +1437,23 @@ impl DiskWeaveApp {
         self.input_error = self.file_open.start(request).err().map(|e| e.to_string());
     }
     fn sync_scan(&mut self) {
+        let previous = if self.folder_tabs.len() > 1 || self.folder_tabs.is_split() {
+            self.source()
+        } else {
+            None
+        };
         if self.scan.poll() {
+            if self.scan.selected_id().is_some() {
+                self.unavailable_pane = None;
+            }
+            if let (Some(old), Some(new)) = (previous, self.source()) {
+                if old.id == new.id && !Arc::ptr_eq(&old.scan, &new.scan) {
+                    self.scan.take_finished_preview();
+                    self.replace_live_result(Some(&old.scan), &new.scan, None);
+                    self.locations_view.preserve_live_selection(&self.scan);
+                    return;
+                }
+            }
             if self.locations_view.global_mode {
                 self.search.invalidate();
             } else {
@@ -1514,7 +1562,9 @@ impl DiskWeaveApp {
         if self.archive_record.is_some() {
             return None;
         }
-        let source = self.source()?;
+        let Some(source) = self.source() else {
+            return self.unavailable_pane.clone();
+        };
         let folder = self.explorer.as_ref()?.folder();
         Some(crate::navigation::ViewState {
             location: source.id,
@@ -1522,11 +1572,17 @@ impl DiskWeaveApp {
             query: self.search.input.clone(),
             whole_scan: self.search.whole_scan,
             global: self.locations_view.global_mode,
-            selected: self.copy_selection_paths(),
+            selected: if self.locations_view.global_mode {
+                self.locations_view.restoring_paths()
+            } else {
+                self.search.restoring_paths()
+            }
+            .unwrap_or_else(|| self.copy_selection_paths()),
             scroll: [self.search.horizontal_offset, self.search.vertical_offset],
             tab: self.tab,
         })
     }
+
     fn remember_navigation(&mut self, from: Option<crate::navigation::ViewState>) {
         if let (Some(from), Some(to)) = (from, self.capture_navigation()) {
             self.history.visit(from, &to);
@@ -1550,10 +1606,25 @@ impl DiskWeaveApp {
                 return;
             }
         };
-        self.scan.choose(resolved.source.id);
-        self.sync_scan();
-        let mut explorer =
-            Explorer::with_expanded(&resolved.source.scan, resolved.folder, Default::default());
+        self.restore_folder_view(next, resolved);
+    }
+
+    fn restore_folder_view(
+        &mut self,
+        next: crate::navigation::ViewState,
+        resolved: crate::navigation::Resolved,
+    ) {
+        let reuse_tree = self.scan.selected_id() == Some(resolved.source.id);
+        self.scan.show_completed_view(resolved.source.id);
+        let mut explorer = match self.explorer.take().filter(|_| reuse_tree) {
+            Some(mut explorer) => {
+                explorer.open_folder(&resolved.source.scan, resolved.folder);
+                explorer
+            }
+            None => {
+                Explorer::with_expanded(&resolved.source.scan, resolved.folder, Default::default())
+            }
+        };
         if let Some(item) = resolved.selected.first() {
             explorer.select(*item);
         }
@@ -1565,20 +1636,22 @@ impl DiskWeaveApp {
             resolved.selected,
             next.scroll,
         );
-        self.locations_view.global_mode = next.global;
+        self.locations_view.set_global_mode(next.global);
         if next.global {
             let mut paths = std::collections::HashSet::new();
             for path in &next.selected {
-                if let Some(s) = sources
-                    .iter()
-                    .find(|s| path.starts_with(&s.scan.folders[0].path))
-                {
-                    paths.insert((s.id, path.clone()));
+                if let Some(entry) = self.scan.entries.iter().find(|entry| {
+                    !entry.stale
+                        && entry.scan.completed().is_some()
+                        && path.starts_with(&entry.path)
+                }) {
+                    paths.insert((entry.id, path.clone()));
                 }
             }
             self.locations_view.restore_selection(next.query, paths);
         }
         self.explorer = Some(explorer);
+        self.search.sync_presentation(&mut self.map_collapsed);
         self.tab = next.tab;
         self.detail_target = None;
         if resolved.fallback {
@@ -1876,7 +1949,7 @@ impl DiskWeaveApp {
             ScanStatus::Failed(e) => format!("스캔 실패: {e}"),
         }
     }
-    fn header(&mut self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui, docked_details: bool) {
         if self.logo.is_none() {
             let data = eframe::icon_data::from_png_bytes(include_bytes!(
                 "../assets/brand/diskweave-logo.png"
@@ -1965,8 +2038,7 @@ impl DiskWeaveApp {
                 if self.archive_record.is_some() {
                     ui.small("조회 전용");
                 }
-                if ui.ctx().content_rect().width() < 1050.0 && ui.button("선택 항목").clicked()
-                {
+                if !docked_details && ui.button("선택 항목").clicked() {
                     self.details_open = !self.details_open;
                 }
                 let rect = ui.available_rect_before_wrap();
@@ -2011,12 +2083,21 @@ impl DiskWeaveApp {
                         ui.menu_button("분석 위치 관리", |ui| {
                             ui.set_max_width(420.0);
                             ui.add_enabled_ui(editable, |ui| {
-                                if let Some(id) = self.locations_view.controls(
+                                let action = self.locations_view.controls(
                                     ui,
                                     &mut self.scan,
                                     self.target.path(),
-                                ) {
-                                    self.select_registered_location(id);
+                                );
+                                match action {
+                                    Some(LocationAction::Select(id)) => {
+                                        self.select_registered_location(id)
+                                    }
+                                    Some(LocationAction::Remove(id)) => {
+                                        if let Err(error) = self.remove_registered_location(id) {
+                                            self.input_error = Some(error.to_string());
+                                        }
+                                    }
+                                    None => {}
                                 }
                             });
                         });
@@ -2290,6 +2371,7 @@ impl DiskWeaveApp {
             return;
         };
         let mut destination = None;
+        let mut open_folder = None;
         let mut toggle = None;
         let mut open = None;
         let height = (ui.available_height() - 26.0).max(30.0);
@@ -2428,6 +2510,13 @@ impl DiskWeaveApp {
                         ))
                         .context_menu(|ui| {
                             crate::ui_style::menu_spacing(ui);
+                            if let Some(right) = folder_open_menu(
+                                ui,
+                                self.archive_record.is_none()
+                                    && !source.scan.folders[folder].access.unreadable(),
+                            ) {
+                                open_folder = Some((folder, right));
+                            }
                             if crate::ui_style::menu_action(ui, "이 폴더에서 검색", true).clicked()
                             {
                                 destination = Some(folder);
@@ -2464,7 +2553,14 @@ impl DiskWeaveApp {
         if let Some(open) = open {
             self.start_open(open);
         }
+        if let Some((folder, right)) = open_folder {
+            self.input_error = self
+                .open_folder_tab(&source, folder, right)
+                .err()
+                .map(|error| error.to_string());
+        }
     }
+
     fn center(&mut self, ui: &mut egui::Ui) {
         self.preview_banner(ui);
         if self.show_preview() {
@@ -2507,15 +2603,20 @@ impl DiskWeaveApp {
                             if crate::ui_style::navigation_button(ui, folder != 0, 0).clicked() {
                                 destination = source.scan.folders[folder].parent;
                             }
-                            let path = source.scan.folders[folder].path.display().to_string();
+                            let folder_path = &source.scan.folders[folder].path;
+                            let path = folder_path.display().to_string();
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(ui.available_width(), 30.0),
                                 egui::Sense::click(),
                             );
+                            let label = self
+                                .folder_tabs
+                                .is_split()
+                                .then(|| folders::pane_path_label(ui, folder_path, rect.width()));
                             crate::ui_style::text(
                                 ui,
                                 rect,
-                                &path,
+                                label.as_deref().unwrap_or(&path),
                                 false,
                                 crate::ui_style::TEXT,
                                 13.0,
@@ -2766,6 +2867,7 @@ impl DiskWeaveApp {
         let mut enter = None;
         let mut analyze = false;
         let mut pick = None;
+        let mut open_folder = None;
         if let Some(results) = self.search.job.results() {
             if results.items.is_empty() {
                 ui.weak(if self.search.input.is_active() {
@@ -2910,6 +3012,13 @@ impl DiskWeaveApp {
                                     ui.close();
                                 }
                                 if let Item::Folder(id) = item {
+                                    if let Some(right) = folder_open_menu(
+                                        ui,
+                                        self.archive_record.is_none()
+                                            && !source.scan.folders[id].access.unreadable(),
+                                    ) {
+                                        open_folder = Some((id, right));
+                                    }
                                     if crate::ui_style::menu_action(ui, "이 폴더에서 검색", true)
                                         .clicked()
                                     {
@@ -2983,6 +3092,12 @@ impl DiskWeaveApp {
         }
         if let Some(open) = open {
             self.start_open(open);
+        }
+        if let Some((folder, right)) = open_folder {
+            self.input_error = self
+                .open_folder_tab(&source, folder, right)
+                .err()
+                .map(|error| error.to_string());
         }
     }
     fn details(&mut self, ui: &mut egui::Ui) {
@@ -3304,6 +3419,13 @@ impl eframe::App for DiskWeaveApp {
             self.map_height,
             self.map_collapsed || self.show_preview(),
         );
+        if self.folder_tabs.is_split()
+            && panels.right > 0.0
+            && crate::workspace::folders::split_widths(panels.center, 0.5).is_none()
+        {
+            panels.center += panels.right;
+            panels.right = 0.0;
+        }
         if self.tab == 4 {
             panels.body += panels.map;
             panels.map = 0.0;
@@ -3319,7 +3441,7 @@ impl eframe::App for DiskWeaveApp {
                     .fill(egui::Color32::from_rgb(16, 23, 32))
                     .inner_margin(egui::Margin::symmetric(12, 4)),
             )
-            .show(ui, |ui| self.header(ui));
+            .show(ui, |ui| self.header(ui, panels.right > 0.0));
         egui::Panel::top("target")
             .exact_size(panels.target)
             .frame(
@@ -3517,7 +3639,7 @@ impl eframe::App for DiskWeaveApp {
             .resizable(false)
             .frame(egui::Frame::new().fill(surface()))
             .show(ui, |ui| self.tree(ui));
-        if size.x < 1050.0 && self.details_open {
+        if panels.right == 0.0 && self.details_open {
             let mut open = self.details_open;
             egui::Window::new("선택 항목")
                 .open(&mut open)
@@ -3551,7 +3673,7 @@ impl eframe::App for DiskWeaveApp {
             .show(ui, |ui| {
                 ui.set_max_width(panels.center.max(0.0));
                 ui.set_max_height(panels.body.max(0.0));
-                self.center(ui);
+                self.folder_workspace(ui);
             });
         if self.results.export_open && self.results.export_context.is_none() {
             let context = self.export_context();
@@ -3584,15 +3706,8 @@ impl eframe::App for DiskWeaveApp {
             .take()
             .or_else(|| self.locations_view.drop_requested.take())
         {
-            let mut context = self.file_context(Some(paths));
-            for entry in &self.scan.entries {
-                if crate::file_ops::contains_path(&entry.path, &destination).unwrap_or(true) {
-                    context.writable &= !entry.stale && entry.scan.completed().is_some();
-                }
-            }
             self.input_error = self
-                .file_ui
-                .folder_drop(destination, context)
+                .prepare_folder_drop(paths, destination)
                 .err()
                 .map(|e| e.to_string());
         }
@@ -3663,6 +3778,215 @@ impl eframe::App for DiskWeaveApp {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn folder_tabs_open_only_on_request_and_restore_the_original_view() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("first/deep")).unwrap();
+        std::fs::create_dir(fixture.0.join("second")).unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let limit = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        let first = source
+            .scan
+            .folder_index(std::path::Path::new("first/deep"))
+            .unwrap();
+        let second = source
+            .scan
+            .folder_index(std::path::Path::new("second"))
+            .unwrap();
+        app.navigate(first, true);
+        assert_eq!(app.folder_tabs.len(), 1);
+        assert!(!app.folder_tabs.is_split());
+        app.search.input.text = "saved query".into();
+        app.search.vertical_offset = 36.0;
+        app.open_folder_tab(&source, second, false).unwrap();
+        assert_eq!(app.folder_tabs.len(), 2);
+        assert_eq!(
+            app.capture_navigation().unwrap().folder,
+            fixture.0.join("second")
+        );
+        assert!(Arc::ptr_eq(&source.scan, &app.source().unwrap().scan));
+        app.switch_folder_tab(0);
+        let original = app.capture_navigation().unwrap();
+        assert_eq!(original.folder, fixture.0.join("first/deep"));
+        assert_eq!(original.query.text, "saved query");
+        assert_eq!(original.scroll[1], 36.0);
+        app.history_move(false);
+        assert_eq!(app.capture_navigation().unwrap().folder, fixture.0);
+        app.close_folder_tab(1);
+        assert_eq!(app.folder_tabs.len(), 1);
+    }
+
+    #[test]
+    fn split_keeps_left_view_and_updates_both_sides_after_copy_and_rescan() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let left = fixture.0.join("left");
+        let right = fixture.0.join("right");
+        let input = left.join("report.txt");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir_all(right.join("deep")).unwrap();
+        std::fs::write(&input, b"report").unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        let folder = |name: &str| {
+            source
+                .scan
+                .folder_index(std::path::Path::new(name))
+                .unwrap()
+        };
+        app.navigate(folder("left"), true);
+        app.open_folder_tab(&source, folder("right"), true).unwrap();
+        assert_eq!(app.folder_tabs.len(), 1);
+        assert_eq!(app.folder_tabs.side(), Side::Right);
+        assert_eq!(app.folder_tabs.other().unwrap().folder, left);
+        app.focus_folder_side(Side::Left);
+        let target = app.other_folder_path().unwrap();
+        assert_eq!(target, right);
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        for (pressed, pos) in [
+            (true, egui::pos2(180.0, 160.0)),
+            (false, egui::pos2(850.0, 340.0)),
+        ] {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            };
+            let mut frame = ctx.run_ui(raw, |ui| {
+                if pressed {
+                    egui::DragAndDrop::set_payload(
+                        ui.ctx(),
+                        crate::file_ui::DragPayload {
+                            paths: vec![input.clone()],
+                        },
+                    );
+                }
+                app.folder_workspace(ui);
+            });
+            frame.textures_delta.clear();
+        }
+        let (dropped, destination) = app
+            .file_ui
+            .drop_requested
+            .take()
+            .expect("반대편 폴더에서 드롭 수신");
+        app.prepare_folder_drop(dropped, destination).unwrap();
+        let request = app.file_ui.request().unwrap();
+        assert_eq!(request.paths, [input]);
+        assert!(
+            matches!(request.action, crate::file_ops::Action::Copy { destination } if destination == right)
+        );
+        assert!(!right.join("report.txt").exists());
+        app.file_ui.dialog = None;
+        app.prepare_folder_drop(vec![left.join("report.txt")], target)
+            .unwrap();
+        app.file_job
+            .prepare(app.file_ui.request().unwrap())
+            .unwrap();
+        app.file_ui.dialog = None;
+        while app.file_job.working() {
+            app.file_tick();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        app.file_job.confirm().unwrap();
+        while app.file_job.working() || app.file_refresh.busy() {
+            app.file_tick();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read(right.join("report.txt")).unwrap(), b"report");
+        assert_eq!(app.capture_navigation().unwrap().folder, left);
+        app.focus_folder_side(Side::Right);
+        assert_eq!(app.capture_navigation().unwrap().folder, right);
+        let latest = app.source().unwrap();
+        assert!(!Arc::ptr_eq(&source.scan, &latest.scan));
+        assert!(latest
+            .scan
+            .file_named(
+                latest
+                    .scan
+                    .folder_index(std::path::Path::new("right"))
+                    .unwrap(),
+                std::ffi::OsStr::new("report.txt")
+            )
+            .is_some());
+        let deep = latest
+            .scan
+            .folder_index(std::path::Path::new("right/deep"))
+            .unwrap();
+        app.navigate(deep, true);
+        std::fs::remove_dir(right.join("deep")).unwrap();
+        app.scan.start_selected(&[source.id]).unwrap();
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.capture_navigation().unwrap().folder, right);
+        app.close_folder_split();
+        assert_eq!(app.capture_navigation().unwrap().folder, left);
+        assert!(!app.folder_tabs.is_split());
+    }
+
+    #[test]
+    fn removing_a_tab_location_does_not_show_another_location_under_its_name() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let first = fixture.0.join("first");
+        let second = fixture.0.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let a = app.scan.add(&first).unwrap();
+        let b = app.scan.add(&second).unwrap();
+        app.scan.start_selected(&[a, b]).unwrap();
+        let limit = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < limit);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        app.open_folder_tab(&source, 0, false).unwrap();
+        app.select_registered_location(b);
+        app.switch_folder_tab(0);
+        app.remove_registered_location(a).unwrap();
+        assert!(app.source().is_none());
+        assert_eq!(app.capture_navigation().unwrap().folder, first);
+        assert!(app.input_error.as_deref().unwrap().contains("제거"));
+        app.switch_folder_tab(1);
+        assert_eq!(app.capture_navigation().unwrap().folder, second);
+        app.switch_folder_tab(0);
+        assert!(app.source().is_none());
+        app.close_folder_tab(0);
+        assert_eq!(app.capture_navigation().unwrap().folder, second);
+    }
 
     #[test]
     fn explicit_file_actions_use_their_own_paths_and_keep_stale_locations_read_only() {

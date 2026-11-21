@@ -475,7 +475,15 @@ pub fn menu_action(ui: &mut Ui, label: &str, enabled: bool) -> Response {
     );
     let c = egui::pos2(response.rect.left() + 18.0, response.rect.center().y);
     let stroke = egui::Stroke::new(1.5, color);
-    if label.contains("휴지통") {
+    if matches!(label, "새 탭에서 열기" | "오른쪽에 열기") {
+        let frame = egui::Rect::from_center_size(c, egui::vec2(15.0, 11.0));
+        p.rect_stroke(frame, 1.5, stroke, egui::StrokeKind::Inside);
+        if label == "오른쪽에 열기" {
+            p.vline(c.x, frame.y_range().shrink(1.0), stroke);
+        } else {
+            p.hline(frame.x_range().shrink(1.0), frame.top() + 3.5, stroke);
+        }
+    } else if label.contains("휴지통") {
         p.rect_stroke(
             egui::Rect::from_center_size(c + egui::vec2(0.0, 1.0), egui::vec2(10.0, 12.0)),
             1.0,

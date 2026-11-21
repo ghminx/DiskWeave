@@ -14,6 +14,11 @@ type LiveSelection = (
     std::collections::HashMap<(u64, PathBuf), Option<crate::usn::entries::Key>>,
 );
 
+pub enum LocationAction {
+    Select(u64),
+    Remove(u64),
+}
+
 #[derive(Default)]
 pub struct LocationsView {
     pub file_requested: Option<crate::file_ui::Kind>,
@@ -29,6 +34,11 @@ pub struct LocationsView {
 }
 
 impl LocationsView {
+    pub fn restoring_paths(&self) -> Option<Vec<PathBuf>> {
+        self.live_selection
+            .as_ref()
+            .map(|(_, paths)| paths.keys().map(|(_, path)| path.clone()).collect())
+    }
     pub fn restore_selection(
         &mut self,
         input: SearchInput,
@@ -267,7 +277,7 @@ impl LocationsView {
         ui: &mut egui::Ui,
         locations: &mut Locations,
         target: Option<&Path>,
-    ) -> Option<u64> {
+    ) -> Option<LocationAction> {
         let mut choose = None;
         ui.scope(|ui| {
             ui.strong("등록한 분석 위치");
@@ -301,7 +311,6 @@ impl LocationsView {
                     self.error = locations.start_selected(&ids).err().map(|e| e.to_string());
                 }
             });
-            let mut remove = None;
             let running = locations.is_running();
             let selected = locations.selected_id();
             for entry in &mut locations.entries {
@@ -317,7 +326,7 @@ impl LocationsView {
                         )
                         .clicked()
                     {
-                        choose = Some(entry.id);
+                        choose = Some(LocationAction::Select(entry.id));
                     }
                     let state = if entry.scan.is_running() {
                         "스캔 중"
@@ -339,12 +348,9 @@ impl LocationsView {
                         .add_enabled(!running, egui::Button::new("목록에서 빼기"))
                         .clicked()
                     {
-                        remove = Some(entry.id);
+                        choose = Some(LocationAction::Remove(entry.id));
                     }
                 });
-            }
-            if let Some(id) = remove {
-                self.error = locations.remove(id).err().map(|e| e.to_string());
             }
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);

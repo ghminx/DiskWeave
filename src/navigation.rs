@@ -24,6 +24,10 @@ impl ViewState {
             .iter()
             .find(|s| s.id == self.location)
             .ok_or_else(|| io::Error::other("이력의 분석 위치가 제거됐거나 갱신이 필요합니다"))?;
+        self.resolve_on(source)
+    }
+
+    pub fn resolve_on(&self, source: &Snapshot) -> io::Result<Resolved> {
         let mut path = self.folder.as_path();
         let folder = loop {
             if let Some(id) = path
