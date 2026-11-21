@@ -1,3 +1,4 @@
+mod folder_updates;
 mod folders;
 
 use crate::analysis::StatsScope;
@@ -32,6 +33,10 @@ pub struct DiskWeaveApp {
     window_state: Option<crate::app_settings::WindowState>,
     window_restore: Option<(crate::app_settings::WindowState, u8)>,
     history: crate::navigation::History,
+    folder_refresh_disabled: bool,
+    visible_watches: crate::visible_watch::VisibleWatches,
+    live_rows: folder_updates::LiveRows,
+    parked_live_rows: folder_updates::LiveRows,
     folder_tabs: FolderTabs,
     unavailable_pane: Option<crate::navigation::ViewState>,
     other_rows: crate::workspace::pane_rows::PaneRows,
@@ -571,6 +576,9 @@ impl DiskWeaveApp {
             || self.duplicates.running()
     }
     fn copy_selection_paths(&self) -> Vec<PathBuf> {
+        if let Some(paths) = self.live_selection_paths() {
+            return paths;
+        }
         if self.locations_view.global_mode {
             return self
                 .locations_view
@@ -610,6 +618,7 @@ impl DiskWeaveApp {
     }
     fn file_actions_available(&self) -> bool {
         self.archive_record.is_none()
+            && self.live_folder_writable()
             && self.tab != 4
             && !self.duplicates.running()
             && !self.scan.is_running()
@@ -689,6 +698,11 @@ impl DiskWeaveApp {
     }
     fn begin_file_action(&mut self, kind: crate::file_ui::Kind, paths: Option<Vec<PathBuf>>) {
         let explicit = paths.is_some();
+        let paths = paths.or_else(|| {
+            (kind != crate::file_ui::Kind::Folder)
+                .then(|| self.live_selection_paths())
+                .flatten()
+        });
         let mut context = self.file_context(paths);
         if kind == crate::file_ui::Kind::Folder && explicit {
             context.current = context.paths.first().cloned();
@@ -1007,6 +1021,7 @@ impl DiskWeaveApp {
         Self::default()
     }
     fn apply_ui_settings(&mut self, settings: crate::app_settings::UiSettings) {
+        self.folder_refresh_disabled = !settings.folder_auto_refresh;
         self.search.widths.restore(settings.columns);
         self.search.input.sort = settings.sort;
         self.search.input.descending = settings.descending;
@@ -1050,6 +1065,7 @@ impl DiskWeaveApp {
                 Parallelism::Four => 4,
                 _ => 8,
             },
+            folder_auto_refresh: !self.folder_refresh_disabled,
         }
     }
     fn save_ui_settings(&mut self) {
@@ -1158,6 +1174,9 @@ impl DiskWeaveApp {
         }
     }
     pub fn tick_background(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) || self.desktop.life.hidden {
+            self.visible_watches.clear();
+        }
         self.settings_frame(ctx);
         if self.archive_record.is_none() {
             if self.scan.is_running() {
@@ -1340,6 +1359,7 @@ impl DiskWeaveApp {
         if !requested {
             return;
         }
+        self.visible_watches.clear();
         self.save_ui_settings();
         if !self.file_close_requested
             && self
@@ -1376,6 +1396,10 @@ impl DiskWeaveApp {
         }
     }
     fn selection_target(&self) -> Option<Target> {
+        if let Some(item) = self.live_selected_item() {
+            let source = self.source()?;
+            return item.map(|item| (source.id, source.generation, item));
+        }
         self.detail_target.or_else(|| {
             if self.locations_view.global_mode {
                 self.locations_view.selected_target()
@@ -1572,12 +1596,16 @@ impl DiskWeaveApp {
             query: self.search.input.clone(),
             whole_scan: self.search.whole_scan,
             global: self.locations_view.global_mode,
-            selected: if self.locations_view.global_mode {
-                self.locations_view.restoring_paths()
-            } else {
-                self.search.restoring_paths()
-            }
-            .unwrap_or_else(|| self.copy_selection_paths()),
+            selected: self
+                .live_selection_paths()
+                .or_else(|| {
+                    if self.locations_view.global_mode {
+                        self.locations_view.restoring_paths()
+                    } else {
+                        self.search.restoring_paths()
+                    }
+                })
+                .unwrap_or_else(|| self.copy_selection_paths()),
             scroll: [self.search.horizontal_offset, self.search.vertical_offset],
             tab: self.tab,
         })
@@ -1614,6 +1642,7 @@ impl DiskWeaveApp {
         next: crate::navigation::ViewState,
         resolved: crate::navigation::Resolved,
     ) {
+        self.live_rows.restore(next.selected.clone());
         let reuse_tree = self.scan.selected_id() == Some(resolved.source.id);
         self.scan.show_completed_view(resolved.source.id);
         let mut explorer = match self.explorer.take().filter(|_| reuse_tree) {
@@ -1682,6 +1711,7 @@ impl DiskWeaveApp {
             return;
         };
         self.detail_target = Some(selected.target);
+        self.live_select_hit(selected.target);
         self.statistics.select_target(selected.target);
         if self.locations_view.global_mode {
             self.locations_view.select_target(selected.target);
@@ -1729,6 +1759,9 @@ impl DiskWeaveApp {
                 }
             }
             Some(Action::Open) if matches!(self.tab, 0 | 3) => {
+                if self.live_keyboard_open() {
+                    return;
+                }
                 let target = if self.locations_view.global_mode {
                     self.locations_view.selected_target()
                 } else {
@@ -2009,6 +2042,13 @@ impl DiskWeaveApp {
                         |ui| {
                             ui.set_max_width(360.0);
                             ui.strong("화면 설정");
+                            let mut refresh = !self.folder_refresh_disabled;
+                            if ui
+                                .checkbox(&mut refresh, "보고 있는 폴더 자동 갱신")
+                                .changed()
+                            {
+                                self.folder_refresh_disabled = !refresh;
+                            }
                             ui.small("창·표·지도 설정을 자동으로 저장합니다.");
                             ui.small("분석 목록·파일 경로·검색어는 저장하지 않습니다.");
                             if let Some(error) = self.settings_error.clone() {
@@ -2861,6 +2901,9 @@ impl DiskWeaveApp {
             });
             return;
         };
+        if self.draw_live_folder(ui, &source) {
+            return;
+        }
         self.search.headers(ui);
         self.search.poll();
         let mut open = None;
@@ -3103,6 +3146,9 @@ impl DiskWeaveApp {
     fn details(&mut self, ui: &mut egui::Ui) {
         if self.show_preview() {
             self.preview_details(ui);
+            return;
+        }
+        if self.live_details(ui) {
             return;
         }
         let summary = if self.locations_view.global_mode {
@@ -3351,6 +3397,7 @@ impl eframe::App for DiskWeaveApp {
             self.document_tick();
         }
         if let crate::documents::View::Comparison(report) = &self.results.job.view {
+            self.visible_watches.clear();
             let report = Arc::clone(report);
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(bg()))
@@ -3376,6 +3423,7 @@ impl eframe::App for DiskWeaveApp {
                     });
                 });
             if !back {
+                self.visible_watches.clear();
                 if let Some(viewer) = &mut self.saved_viewer {
                     viewer.ui(ui, _frame);
                 }

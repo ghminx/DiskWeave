@@ -53,6 +53,8 @@ impl DiskWeaveApp {
 
     fn load_folder(&mut self, pane: PaneMemory) {
         self.other_rows.clear();
+        self.parked_live_rows = Default::default();
+        self.live_rows = Default::default();
         self.history = pane.history;
         self.unavailable_pane = None;
         self.input_error = None;
@@ -168,11 +170,16 @@ impl DiskWeaveApp {
         let resolved = view
             .resolve_on(&self.scan.completed_snapshot(view.location)?)
             .ok()?;
-        Some(
-            resolved.source.scan.folders[if view.whole_scan { 0 } else { resolved.folder }]
-                .path
-                .clone(),
-        )
+        let path =
+            &resolved.source.scan.folders[if view.whole_scan { 0 } else { resolved.folder }].path;
+        if self
+            .visible_watches
+            .get(path)
+            .is_some_and(|watch| watch.error().is_some())
+        {
+            return None;
+        }
+        Some(path.clone())
     }
     fn folder_tab_bar(&mut self, ui: &mut egui::Ui) {
         if self.folder_tabs.len() == 1 {
@@ -245,6 +252,7 @@ impl DiskWeaveApp {
         self.folder_tab_bar(ui);
         let tab_id = self.folder_tabs.id();
         if !self.folder_tabs.is_split() {
+            self.sync_visible_watches(ui.ctx(), false);
             if self.folder_tabs.len() == 1 {
                 self.center(ui);
             } else {
@@ -271,6 +279,7 @@ impl DiskWeaveApp {
             });
         });
         if !self.folder_tabs.is_split() || widths.is_none() {
+            self.sync_visible_watches(ui.ctx(), false);
             self.other_rows.clear();
             ui.push_id(("folder_tab", tab_id, self.folder_tabs.side()), |ui| {
                 self.center(ui)
@@ -278,6 +287,7 @@ impl DiskWeaveApp {
             return;
         }
 
+        self.sync_visible_watches(ui.ctx(), true);
         let [left, right] = widths.expect("두 목록을 배치할 수 있는 너비");
         let (area, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
         let divider = egui::Rect::from_min_size(
@@ -337,7 +347,15 @@ impl DiskWeaveApp {
     fn parked_folder(&mut self, ui: &mut egui::Ui, rect: egui::Rect, side: Side) {
         let mut picked = None;
         let mut can_drop = false;
-        if let Some(view) = self.folder_tabs.other() {
+        let mut live_pick = None;
+        if let Some(picked) = self.draw_parked_live_rows(ui) {
+            live_pick = picked;
+            can_drop = self.folder_tabs.other().is_some_and(|view| {
+                self.scan
+                    .get(view.location)
+                    .is_some_and(|entry| !entry.stale)
+            });
+        } else if let Some(view) = self.folder_tabs.other() {
             self.other_rows.refresh(view, &self.scan);
             if let Some(path) = self.other_rows.folder(view.whole_scan) {
                 egui::Frame::new()
@@ -457,7 +475,9 @@ impl DiskWeaveApp {
                 .input(|input| input.pointer.primary_clicked() || input.pointer.secondary_clicked())
         {
             self.focus_folder_side(side);
-            if let Some((target, open)) = picked {
+            if let Some((path, open)) = live_pick {
+                self.pick_parked_live_row(path, open);
+            } else if let Some((target, open)) = picked {
                 self.pick_parked_row(target, open);
             }
             ui.ctx().request_repaint();

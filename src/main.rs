@@ -52,6 +52,7 @@ mod treemap_view;
 mod ui_style;
 mod usn;
 mod usn_native;
+mod visible_watch;
 mod workspace;
 
 use std::io;

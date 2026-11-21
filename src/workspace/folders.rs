@@ -114,6 +114,17 @@ impl FolderTabs {
             .flatten()
     }
 
+    pub fn set_other_vertical_scroll(&mut self, offset: f32) {
+        let tab = &mut self.tabs[self.selected];
+        let pane = match tab.side {
+            Side::Left => tab.right.as_mut(),
+            Side::Right => Some(&mut tab.left),
+        };
+        if let Some(view) = pane.and_then(|pane| pane.view.as_mut()) {
+            view.scroll[1] = offset;
+        }
+    }
+
     pub fn tab_view(&self, index: usize) -> Option<&ViewState> {
         let tab = &self.tabs[index];
         tab.pane(tab.side).view.as_ref()

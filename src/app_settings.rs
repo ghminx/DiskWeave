@@ -118,6 +118,7 @@ pub struct UiSettings {
     pub map_height: f32,
     pub map_collapsed: bool,
     pub workers: u8,
+    pub folder_auto_refresh: bool,
 }
 impl Default for UiSettings {
     fn default() -> Self {
@@ -129,6 +130,7 @@ impl Default for UiSettings {
             map_height: 240.0,
             map_collapsed: false,
             workers: 0,
+            folder_auto_refresh: true,
         }
     }
 }
@@ -225,6 +227,8 @@ mod tests {
         save_quick(&path, quick).unwrap();
         let mut settings = load(&path).unwrap();
         assert_eq!(settings.quick, quick);
+        assert!(settings.ui.folder_auto_refresh);
+        settings.ui.folder_auto_refresh = false;
         settings.ui.map_collapsed = true;
         settings.ui.columns = Some([160.0; 8]);
         settings.ui.workers = 4;
