@@ -1,57 +1,66 @@
 <h1 align="center">
-  <img src="./assets/brand/diskweave-logo.png" alt="DiskWeave" width="320">
+  <img src="assets/brand/diskweave-logo.png" alt="DiskWeave" width="320">
 </h1>
 
+<p align="center"><strong>디스크 사용량을 한눈에 확인하는 Windows 파일 탐색 도구</strong></p>
+
 <p align="center">
-  <strong>어떤 파일과 폴더가 용량을 차지하는지 한눈에 보는 Windows 디스크 분석 도구</strong>
+  폴더별 용량을 살펴보고, 필요한 파일을 찾아 같은 화면에서 정리할 수 있는 데스크톱 앱
 </p>
 
 <p align="center">
-  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.1/DiskWeave-0.1.1-windows-x64-preview.zip"><strong>Windows x64 Portable ZIP 다운로드</strong></a>
-  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.1">v0.1.1 프리뷰</a>
+  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.1/DiskWeave-0.1.1-windows-x64-preview.zip"><strong>Windows x64 다운로드</strong></a>
   · <a href="#시작하기">시작하기</a>
+  · <a href="docs/portable-readme.md">사용 안내</a>
+  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.1">v0.1.1 프리뷰</a>
 </p>
 
-![DiskWeave에서 폴더별 용량, 확장자 통계, 공간 지도를 함께 보는 화면](docs/ui/diskweave-overview.png)
+<p align="center"><sub>Windows 10/11 x64 · 설치 없이 실행하는 Portable ZIP</sub></p>
 
-*예시 데이터로 표시한 DiskWeave 분석 화면*
+![DiskWeave에서 폴더 트리와 파일 목록, 확장자별 통계, 공간 지도를 함께 보는 화면](docs/ui/diskweave-overview.png)
 
-## DiskWeave로 할 수 있는 일
-
-| 작업 | 사용 예시 |
-| --- | --- |
-| **디스크 공간 분석** | 드라이브나 폴더를 스캔해 용량이 큰 폴더를 찾고, 공간 지도에서 용량 비중을 확인함. |
-| **파일 검색과 정리** | 스캔한 위치, 지정 폴더 또는 로컬 고정 드라이브 전체에서 이름·경로로 검색함. 파일 목록에서 복사·이동·휴지통 이동을 수행함. |
-| **중복 파일 찾기** | 선택한 범위에서 내용이 같은 파일을 묶어 보여 주고, 하드 링크는 복사본과 구분함. |
-| **폴더 나란히 탐색** | 폴더를 새 탭이나 오른쪽 창에 열어 두 위치를 오가며 확인함. |
-| **파일 변경 확인** | 화면에 열린 폴더의 파일 추가·수정·삭제를 자동으로 반영함. NTFS 실시간 갱신을 켜면 더 넓은 범위의 변경도 추적 가능함. |
-| **분석 결과 기록·비교** | 파일 목록을 CSV로 내보내거나, 분석 스냅샷 두 개의 항목 및 용량 변화를 비교함. |
+*예시 데이터로 구성한 DiskWeave 분석 화면*
 
 ## 시작하기
 
-1. Windows 10/11 x64에서 **Portable ZIP**을 다운로드한 뒤 원하는 폴더에 압축을 풂. 다운로드에는 저장소 읽기 권한이 필요함.
-2. **DiskWeave.exe**를 실행한 뒤 분석할 드라이브나 폴더를 선택하고 **스캔 시작**을 누름.
-3. 왼쪽 폴더 트리와 아래쪽 **공간 지도**에서 용량을 확인함. 아직 스캔하지 않은 위치의 파일을 찾으려면 상단 **빠른 검색**에서 **폴더 지정** 또는 **내 PC 전체**를 선택함.
+1. **Windows x64 다운로드**에서 받은 ZIP을 원하는 폴더에 압축 해제. 다운로드에는 저장소 읽기 권한이 필요함.
+2. `DiskWeave.exe`를 실행하고 드라이브나 폴더를 선택한 뒤 **스캔 시작**.
+3. **폴더 탐색**과 **공간 지도**에서 용량이 큰 폴더를 확인. 현재 분석 범위 밖의 파일은 **빠른 검색**의 **폴더 지정** 또는 **내 PC 전체**에서 이름이나 경로로 검색 가능함.
 
-일반 스캔은 관리자 권한 없이 동작함. 파일 변경은 사용자가 확인한 뒤 수행하며, NTFS 실시간 갱신을 시작할 때 Windows 관리자 승인이 필요함. [Portable 사용 안내](docs/portable-readme.md) · [릴리스 노트](docs/releases/v0.1.1.md)
+## 이렇게 활용할 수 있음
 
-## 프리뷰 참고 사항
+| 상황 | DiskWeave에서 할 수 있는 일 |
+| --- | --- |
+| **드라이브 여유 공간이 줄었을 때** | 폴더별 크기를 공간 지도로 보고, 대용량 파일 목록과 확장자별 통계로 용량을 차지하는 항목을 찾음. |
+| **여러 폴더의 파일을 정리할 때** | 두 폴더를 좌우 창이나 별도 탭에 열고 파일을 복사·이동하거나 휴지통으로 보냄. 열린 폴더의 파일 변경은 자동 반영됨. |
+| **복사본이 쌓였을 때** | 파일 내용을 대조해 중복 그룹을 찾고, 같은 파일을 가리키는 하드 링크는 별도로 확인함. |
+| **정리 전후를 비교할 때** | 파일·폴더 목록을 CSV로 내보내거나 두 시점에 저장한 분석 스냅샷을 비교해 추가·삭제 항목과 용량 변화를 확인함. |
 
-- 개발 PC에서 C드라이브 전체 NTFS 실시간 갱신의 첫 목록 표시에 약 11분 소요됨. 기준 목록이 만들어진 뒤 시험 파일의 생성·수정·삭제는 약 1초에 반영됨. [실측 기록](docs/usn.md#최신-코드-검토-후-전체-c드라이브-gui-대조)
-- 이 프리뷰의 실행 파일은 미서명 상태이며 일부 Windows 11 환경에서 Smart App Control에 의해 차단될 수 있음.
+일반 스캔은 관리자 권한 없이 가능하며, 파일 변경 작업은 사용자 확인 후 수행함. 로컬 NTFS 드라이브 또는 지정 폴더의 변경을 추적하는 **NTFS 실시간 갱신**은 별도로 켤 수 있으며 Windows 관리자 승인이 필요함.
+
+## 프리뷰에서 확인한 범위
+
+- ZIP을 별도 폴더에 풀어 개발 PC에서 GUI 및 CLI 실행을 확인함. 다른 Windows PC에서의 실행은 검증 예정임.
+- 개발 PC에서 C드라이브 전체 NTFS 실시간 갱신의 **첫 목록 표시**에 약 11분 소요됨. 첫 목록이 표시된 뒤 시험 파일 생성·수정·삭제는 각각 약 1초에 반영됨. [실측 기록](docs/usn.md#최신-코드-검토-후-전체-c드라이브-gui-대조)
+- 개발 PC에서는 Smart App Control을 켠 상태에서 실행을 확인함. 미서명 프리뷰이므로 다른 환경에서는 Windows의 평판 판정에 따라 실행이 차단될 수 있음. [v0.1.1 릴리스 노트](docs/releases/v0.1.1.md)
 
 ## 소스에서 실행
 
-Windows x64에서 Rust stable, MSVC 빌드 도구 및 Windows SDK를 준비한 뒤 실행함.
+Windows x64에 Rust stable, MSVC 빌드 도구 및 Windows SDK를 준비한 뒤 실행함.
 
 ~~~powershell
+# GUI
 cargo run --release
+
+# CLI에서 폴더 스캔과 파일 검색
 cargo run --release -- "D:\Workspace" --find "Video"
+
+# Portable ZIP 생성
 pwsh -NoProfile -File tools/Build-Portable.ps1
 ~~~
 
-[프로젝트 사양](PROJECT_SPEC.md) · [코드 구조](docs/architecture.md) · [개발·배포 검증](docs/usability-release.md)
+[프로젝트 사양](PROJECT_SPEC.md) · [코드 구조](docs/architecture.md) · [빌드 및 배포 검증](docs/usability-release.md)
 
-## 라이선스
+## License
 
-DiskWeave는 [Apache License 2.0](LICENSE)으로 제공함. [NOTICE](NOTICE)에 프로젝트 고지를 기록함. Portable ZIP에는 내장 Pretendard 글꼴과 의존성의 별도 라이선스 고지를 포함함.
+DiskWeave is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for project attribution. The portable ZIP includes license notices for bundled dependencies and the Pretendard font.
