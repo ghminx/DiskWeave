@@ -1,5 +1,8 @@
+mod path_match;
+
 use crate::explorer::Item;
 use crate::scanner::ScanResult;
+use path_match::FolderPath;
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
@@ -268,7 +271,10 @@ pub(crate) fn matching(
     let mut items = Vec::new();
     let mut unknown_dates = 0;
     let mut pending = vec![query.scope];
+    let mut path_buffer = String::new();
     while let Some(folder) = pending.pop() {
+        let mut folder_path = (query.mode == SearchMode::Path)
+            .then(|| FolderPath::new(&result.folders[folder].path, &mut path_buffer));
         for item in result.children[folder]
             .iter()
             .copied()
@@ -278,7 +284,7 @@ pub(crate) fn matching(
             if cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
             }
-            match match_item(result, query, item)? {
+            match match_item(result, query, item, folder_path.as_mut())? {
                 Match::Yes => items.push(item),
                 Match::UnknownDate => unknown_dates += 1,
                 Match::No => {}
@@ -301,7 +307,12 @@ enum Match {
     UnknownDate,
 }
 
-fn match_item(result: &ScanResult, query: &Query, item: Item) -> io::Result<Match> {
+fn match_item(
+    result: &ScanResult,
+    query: &Query,
+    item: Item,
+    folder_path: Option<&mut FolderPath<'_>>,
+) -> io::Result<Match> {
     if matches!(
         (query.kind, item),
         (EntryKind::Files, Item::Folder(_)) | (EntryKind::Folders, Item::File(_))
@@ -317,25 +328,38 @@ fn match_item(result: &ScanResult, query: &Query, item: Item) -> io::Result<Matc
     {
         return Ok(Match::No);
     }
-    let name = item_name(result, item).to_string_lossy().to_lowercase();
-    if !query.extensions.is_empty()
-        && (!matches!(item, Item::File(_))
-            || !query
-                .extensions
-                .iter()
-                .any(|ext| name.ends_with(&format!(".{ext}"))))
-    {
-        return Ok(Match::No);
+    if query.mode == SearchMode::Name || !query.extensions.is_empty() {
+        let name = item_name(result, item).to_string_lossy().to_lowercase();
+        if !query.extensions.is_empty()
+            && (!matches!(item, Item::File(_))
+                || !query
+                    .extensions
+                    .iter()
+                    .any(|ext| name.ends_with(&format!(".{ext}"))))
+        {
+            return Ok(Match::No);
+        }
+        if query.mode == SearchMode::Name && !name.contains(&query.text) {
+            return Ok(Match::No);
+        }
     }
-    let text = if query.mode == SearchMode::Path {
-        std::path::absolute(item_path(result, item))?
-            .to_string_lossy()
-            .to_lowercase()
-    } else {
-        name
-    };
-    if !text.contains(&query.text) {
-        return Ok(Match::No);
+    if query.mode == SearchMode::Path {
+        let reused = match (item, folder_path) {
+            (Item::File(row), Some(folder)) => {
+                folder.contains(&result.files[row].name, &query.text)
+            }
+            _ => None,
+        };
+        let matches = match reused {
+            Some(matches) => matches,
+            None => std::path::absolute(item_path(result, item))?
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&query.text),
+        };
+        if !matches {
+            return Ok(Match::No);
+        }
     }
     if query.from.is_some() || query.to.is_some() {
         let Some(modified) = item_modified(result, item) else {
@@ -445,7 +469,7 @@ pub(crate) fn matching_changes<'a>(
         if !in_scope(previous, item, previous_scope) || !changes.removed.insert(item) {
             continue;
         }
-        if matches!(match_item(previous, query, item)?, Match::UnknownDate) {
+        if matches!(match_item(previous, query, item, None)?, Match::UnknownDate) {
             changes.unknown_before += 1;
         }
     }
@@ -454,7 +478,7 @@ pub(crate) fn matching_changes<'a>(
         if !in_scope(current, item, query.scope) {
             continue;
         }
-        match match_item(current, query, item)? {
+        match match_item(current, query, item, None)? {
             Match::UnknownDate => changes.unknown_after += 1,
             Match::Yes => changes.added.push(item),
             Match::No => {}
@@ -782,6 +806,44 @@ mod tests {
         let hits = search(&fixture.scan, &input.compile(0).unwrap(), || false).unwrap();
         assert_eq!(hits.items.len(), 1);
         assert_eq!(item_name(&fixture.scan, hits.items[0]), "model.nii.gz");
+    }
+
+    #[test]
+    fn path_search_preserves_component_boundaries_and_unicode_on_extended_roots() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("Data/Update.TXT"), b"old").unwrap();
+        fs::write(fixture.root.join("Data/UPDATE-한글-İ.txt"), b"new").unwrap();
+        let extended = fs::canonicalize(&fixture.root).unwrap();
+        for root in [&fixture.root, &extended] {
+            let scan = scanner::scan(root, || false).unwrap();
+            let input = SearchInput {
+                text: "data\\update".into(),
+                mode: SearchMode::Path,
+                kind: EntryKind::Files,
+                extensions: "TXT".into(),
+                sort: SortField::Name,
+                descending: false,
+                ..SearchInput::default()
+            };
+            let query = input.compile(0).unwrap();
+            let hits = search(&scan, &query, || false).unwrap();
+            let names: Vec<_> = hits
+                .items
+                .iter()
+                .map(|&item| item_name(&scan, item))
+                .collect();
+            assert_eq!(names, ["UPDATE-한글-İ.txt", "Update.TXT"]);
+
+            let unicode = SearchInput {
+                text: "한글-i\u{307}.txt".into(),
+                ..input
+            }
+            .compile(0)
+            .unwrap();
+            let hits = search(&scan, &unicode, || false).unwrap();
+            assert_eq!(hits.items.len(), 1);
+            assert_eq!(item_name(&scan, hits.items[0]), "UPDATE-한글-İ.txt");
+        }
     }
 
     #[test]
