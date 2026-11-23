@@ -1,8 +1,10 @@
 mod path_match;
+mod path_order;
 
 use crate::explorer::Item;
 use crate::scanner::ScanResult;
 use path_match::FolderPath;
+pub(crate) use path_order::PathKey;
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
@@ -240,18 +242,42 @@ pub fn search(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<SearchResults> {
     let result_items = matching(result, query, &cancelled)?;
-    let mut keyed = Vec::with_capacity(result_items.items.len());
-    for item in result_items.items {
-        crate::output::check(&cancelled)?;
-        keyed.push((item, SortKey::new(result, item, query.sort)));
-    }
-    keyed.sort_unstable_by(|a, b| a.1.compare(&b.1, query.descending, !query.active));
-    crate::output::check(&cancelled)?;
+    let items = if query.sort == SortField::Path {
+        order_items(
+            result_items.items,
+            |item| PathKey::new(result, item),
+            |a, b| a.compare(b, query.descending, !query.active),
+            &cancelled,
+        )?
+    } else {
+        order_items(
+            result_items.items,
+            |item| SortKey::new(result, item, query.sort),
+            |a, b| a.compare(b, query.descending, !query.active),
+            &cancelled,
+        )?
+    };
     Ok(SearchResults {
         scope: query.scope,
-        items: keyed.into_iter().map(|(item, _)| item).collect(),
+        items,
         unknown_dates: result_items.unknown_dates,
     })
+}
+
+fn order_items<K>(
+    items: Vec<Item>,
+    make_key: impl Fn(Item) -> K,
+    compare: impl Fn(&K, &K) -> std::cmp::Ordering,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Vec<Item>> {
+    let mut keyed = Vec::with_capacity(items.len());
+    for item in items {
+        crate::output::check(cancelled)?;
+        keyed.push((item, make_key(item)));
+    }
+    keyed.sort_unstable_by(|a, b| compare(&a.1, &b.1));
+    crate::output::check(cancelled)?;
+    Ok(keyed.into_iter().map(|(item, _)| item).collect())
 }
 
 pub(crate) fn matching(

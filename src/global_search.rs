@@ -1,6 +1,6 @@
 use crate::explorer::Item;
 use crate::locations::Snapshot;
-use crate::search::{SearchInput, SortKey};
+use crate::search::{PathKey, Query, SearchInput, SortField, SortKey};
 use std::io;
 use std::sync::Arc;
 
@@ -21,28 +21,55 @@ pub fn search_all(
     cancelled: impl Fn() -> bool,
 ) -> io::Result<GlobalResults> {
     let query = input.compile(0)?;
+    let (hits, unknown_dates) = if input.sort == SortField::Path {
+        order_hits(
+            &sources,
+            &query,
+            PathKey::new,
+            |a, b| a.compare(b, input.descending, false),
+            &cancelled,
+        )?
+    } else {
+        order_hits(
+            &sources,
+            &query,
+            |scan, item| SortKey::new(scan, item, input.sort),
+            |a, b| a.compare(b, input.descending, false),
+            &cancelled,
+        )?
+    };
+    Ok(GlobalResults {
+        sources,
+        hits,
+        unknown_dates,
+    })
+}
+
+fn order_hits<'a, K>(
+    sources: &'a [Snapshot],
+    query: &Query,
+    make_key: impl Fn(&'a crate::scanner::ScanResult, Item) -> K,
+    compare: impl Fn(&K, &K) -> std::cmp::Ordering,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<(Vec<Hit>, usize)> {
     let mut keyed = Vec::new();
     let mut unknown_dates = 0;
     for (source, snapshot) in sources.iter().enumerate() {
-        let result = crate::search::matching(&snapshot.scan, &query, &cancelled)?;
+        let result = crate::search::matching(&snapshot.scan, query, cancelled)?;
         unknown_dates += result.unknown_dates;
         for item in result.items {
-            crate::output::check(&cancelled)?;
-            keyed.push((
-                Hit { source, item },
-                SortKey::new(&snapshot.scan, item, input.sort),
-            ));
+            crate::output::check(cancelled)?;
+            keyed.push((Hit { source, item }, make_key(&snapshot.scan, item)));
         }
     }
-    keyed.sort_unstable_by(|a, b| a.1.compare(&b.1, input.descending, false));
+    keyed.sort_unstable_by(|a, b| compare(&a.1, &b.1));
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "검색 취소"));
     }
-    Ok(GlobalResults {
-        sources,
-        hits: keyed.into_iter().map(|(hit, _)| hit).collect(),
+    Ok((
+        keyed.into_iter().map(|(hit, _)| hit).collect(),
         unknown_dates,
-    })
+    ))
 }
 
 // 같은 검색 조건의 직전 결과를 확인된 변경분으로 갱신하고 순서가 불명확하면 전체 검색.
@@ -248,7 +275,98 @@ mod tests {
                 .ends_with(std::path::Path::new("z/a/moved.bin"))
         );
     }
-    use crate::search::SortField;
+    #[test]
+    fn path_sort_preserves_full_windows_order_and_cancellation_across_scans() {
+        use crate::search::{item_path, search, EntryKind};
+        use std::cell::Cell;
+
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let root = std::fs::canonicalize(&fixture.0).unwrap();
+        let long = root.join("한글".repeat(55)).join("긴이름".repeat(45));
+        std::fs::create_dir_all(&long).unwrap();
+        let paths = [
+            root.join("a.BIN"),
+            root.join("a-뒤.BIN"),
+            long.join("한글-한.BIN"),
+            long.join("한글-가.BIN"),
+            root.join("other").join("한글-가.BIN"),
+        ];
+        std::fs::create_dir(root.join("other")).unwrap();
+        for path in &paths {
+            std::fs::write(path, []).unwrap();
+        }
+        let whole = Arc::new(crate::scanner::scan(&root, || false).unwrap());
+        let nested = Arc::new(crate::scanner::scan(&long, || false).unwrap());
+        let sources = || {
+            [&nested, &whole, &whole]
+                .into_iter()
+                .enumerate()
+                .map(|(i, scan)| Snapshot {
+                    id: i as u64 + 1,
+                    generation: 0,
+                    entries: None,
+                    scan: Arc::clone(scan),
+                })
+                .collect()
+        };
+
+        for descending in [false, true] {
+            let input = SearchInput {
+                text: ".bin".into(),
+                kind: EntryKind::Files,
+                sort: SortField::Path,
+                descending,
+                ..Default::default()
+            };
+            let by_path = |a: &std::path::PathBuf, b: &std::path::PathBuf| {
+                if descending {
+                    b.cmp(a)
+                } else {
+                    a.cmp(b)
+                }
+            };
+            let query = input.compile(0).unwrap();
+            let local = search(&whole, &query, || false).unwrap();
+            let mut local_expected = paths.to_vec();
+            local_expected.sort_by(by_path);
+            assert_eq!(
+                local
+                    .items
+                    .into_iter()
+                    .map(|item| item_path(&whole, item))
+                    .collect::<Vec<_>>(),
+                local_expected
+            );
+
+            let calls = Cell::new(0);
+            let global = search_all(sources(), &input, || {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .unwrap();
+            let mut global_expected = local_expected.clone();
+            global_expected.extend(local_expected);
+            global_expected.extend(paths.iter().filter(|path| path.starts_with(&long)).cloned());
+            global_expected.sort_by(by_path);
+            assert_eq!(
+                global
+                    .hits
+                    .iter()
+                    .map(|hit| item_path(&global.sources[hit.source].scan, hit.item))
+                    .collect::<Vec<_>>(),
+                global_expected
+            );
+            for stop in [0, calls.get() / 2, calls.get() - 1] {
+                let count = Cell::new(0);
+                let outcome = search_all(sources(), &input, || {
+                    count.set(count.get() + 1);
+                    count.get() > stop
+                });
+                assert_eq!(outcome.err().unwrap().kind(), io::ErrorKind::Interrupted);
+            }
+        }
+    }
+
     #[test]
     fn sorting_across_locations_preserves_case_folding_path_ties_and_unknown_dates() {
         use crate::search::{item_path, EntryKind};
