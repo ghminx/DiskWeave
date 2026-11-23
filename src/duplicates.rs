@@ -1,3 +1,5 @@
+mod full_hash;
+
 use crate::{explorer::Item, locations::Snapshot, metadata::Identity, search::item_path};
 use std::{
     collections::BTreeMap,
@@ -9,15 +11,29 @@ use std::{
     },
     path::PathBuf,
 };
-use windows_sys::Win32::{
-    Security::Cryptography::*,
-    Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_OFFLINE,
-        FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_FLAG_OPEN_NO_RECALL,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-    },
+use windows_sys::Win32::Storage::FileSystem::{
+    FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_OFFLINE,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_INFO,
 };
 const REMOTE_CONTENT: u32 = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+const MIB: u64 = 1024 * 1024;
+const SAMPLE_BYTES: usize = 64 * 1024;
+const FULL_IN_SAMPLE: u64 = (2 * SAMPLE_BYTES) as u64;
+const FULL_HASH_LIMIT: usize = 8;
+
+fn full_hash_workers(file_bytes: u64, candidates: usize, limit: usize) -> usize {
+    // 중간 크기 파일에서 작업 스레드 생성과 동시 읽기 부담이 커지는 구간 제외.
+    if limit <= 1
+        || file_bytes < 8 * MIB
+        || candidates < 4
+        || file_bytes.saturating_mul(candidates as u64) < 128 * MIB
+    {
+        1
+    } else {
+        candidates.min(limit)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -109,49 +125,6 @@ fn open(member: &Member) -> io::Result<File> {
     }
     Ok(f)
 }
-struct Hash(BCRYPT_HASH_HANDLE);
-fn status(code: i32) -> io::Result<()> {
-    if code < 0 {
-        Err(io::Error::other(format!(
-            "SHA-256 처리 실패 (NTSTATUS {code:#X})"
-        )))
-    } else {
-        Ok(())
-    }
-}
-impl Hash {
-    fn new() -> io::Result<Self> {
-        let mut h = std::ptr::null_mut();
-        // Windows 10/11의 SHA-256 공급자와 OS 소유 해시 버퍼 사용
-        status(unsafe {
-            BCryptCreateHash(
-                BCRYPT_SHA256_ALG_HANDLE,
-                &mut h,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-                0,
-                0,
-            )
-        })?;
-        Ok(Self(h))
-    }
-    fn add(&mut self, bytes: &[u8]) -> io::Result<()> {
-        status(unsafe { BCryptHashData(self.0, bytes.as_ptr(), bytes.len() as u32, 0) })
-    }
-    fn finish(self) -> io::Result<[u8; 32]> {
-        let mut digest = [0; 32];
-        status(unsafe { BCryptFinishHash(self.0, digest.as_mut_ptr(), 32, 0) })?;
-        Ok(digest)
-    }
-}
-impl Drop for Hash {
-    fn drop(&mut self) {
-        unsafe {
-            BCryptDestroyHash(self.0);
-        }
-    }
-}
 fn digest(
     member: &Member,
     partial: bool,
@@ -161,14 +134,14 @@ fn digest(
     notify: &mut impl FnMut(Progress),
 ) -> io::Result<[u8; 32]> {
     let mut f = open(member)?;
-    let mut hash = Hash::new()?;
-    if partial && member.bytes > 131072 {
-        for offset in [0, member.bytes - 65536] {
+    let mut hash = blake3::Hasher::new();
+    if partial && member.bytes > FULL_IN_SAMPLE {
+        for offset in [0, member.bytes - SAMPLE_BYTES as u64] {
             crate::output::check(cancelled)?;
             f.seek(SeekFrom::Start(offset))?;
-            f.read_exact(&mut buffer[..65536])?;
-            hash.add(&buffer[..65536])?;
-            progress.bytes += 65536;
+            f.read_exact(&mut buffer[..SAMPLE_BYTES])?;
+            hash.update(&buffer[..SAMPLE_BYTES]);
+            progress.bytes += SAMPLE_BYTES as u64;
             notify(*progress);
         }
     } else {
@@ -178,7 +151,7 @@ fn digest(
             if n == 0 {
                 break;
             }
-            hash.add(&buffer[..n])?;
+            hash.update(&buffer[..n]);
             progress.bytes += n as u64;
             notify(*progress);
         }
@@ -188,11 +161,23 @@ fn digest(
     }
 
     notify(*progress);
-    hash.finish()
+    Ok(*hash.finalize().as_bytes())
 }
 pub fn inspect(
     sources: Vec<Snapshot>,
     scope: Scope,
+    cancelled: &impl Fn() -> bool,
+    notify: &mut impl FnMut(Progress),
+) -> io::Result<Report> {
+    let limit =
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(FULL_HASH_LIMIT));
+    inspect_with_limit(sources, scope, limit, cancelled, notify)
+}
+
+fn inspect_with_limit(
+    sources: Vec<Snapshot>,
+    scope: Scope,
+    limit: usize,
     cancelled: &impl Fn() -> bool,
     notify: &mut impl FnMut(Progress),
 ) -> io::Result<Report> {
@@ -282,8 +267,8 @@ pub fn inspect(
             }
         }
     }
-    let mut buffer = vec![0; 1024 * 1024];
-    for members in sizes.into_values().filter(|v| v.len() > 1) {
+    let mut buffer = vec![0; MIB as usize];
+    for (size, members) in sizes.into_iter().filter(|(_, members)| members.len() > 1) {
         let mut objects: std::collections::HashMap<Identity, Vec<Member>> =
             std::collections::HashMap::new();
         for (source, file, stamp) in members {
@@ -337,11 +322,29 @@ pub fn inspect(
             }
         }
         report.progress.stage = "전체 내용 확인";
-        for (partial, objects) in partials.into_iter().filter(|(_, v)| v.len() > 1) {
+        partials.retain(|_, objects| objects.len() > 1);
+        let candidates = partials.values().map(Vec::len).sum();
+        let workers = full_hash_workers(size, candidates, limit);
+        let mut parallel_hashes = if workers > 1 {
+            let jobs: Vec<_> = partials
+                .values()
+                .flatten()
+                .map(|object| &object[0])
+                .collect();
+            Some(
+                full_hash::calculate(&jobs, workers, cancelled, &mut report.progress, notify)?
+                    .into_iter(),
+            )
+        } else {
+            None
+        };
+        for (partial, objects) in partials {
             let mut hashes: BTreeMap<[u8; 32], Vec<Vec<Member>>> = BTreeMap::new();
             for object in objects {
-                let hash = if object[0].bytes <= 131072 {
+                let hash = if size <= FULL_IN_SAMPLE {
                     Ok(partial)
+                } else if let Some(hashes) = &mut parallel_hashes {
+                    hashes.next().expect("전체 해시 결과 수와 작업 수 일치")
                 } else {
                     digest(
                         &object[0],
@@ -398,6 +401,12 @@ pub fn inspect(
                 .any(|member| member.stamp.id != first.stamp.id)
         })
     });
+    // 화면 그룹 순서를 해시 값과 작업 완료 순서에서 분리.
+    report.groups.sort_by(|a, b| {
+        a[0].bytes
+            .cmp(&b[0].bytes)
+            .then_with(|| a[0].path.cmp(&b[0].path))
+    });
     report.links.retain(|group| group.len() > 1);
     let mut reported = std::collections::HashSet::new();
     report
@@ -441,6 +450,127 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn streamed_file_digest_matches_the_blake3_reference() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("abc.bin");
+        fs::write(&path, b"abc").unwrap();
+        let member = Member {
+            source: 0,
+            file: 0,
+            stamp: stamp(&File::open(&path).unwrap()).unwrap(),
+            path,
+            bytes: 3,
+        };
+        let digest = digest(
+            &member,
+            false,
+            &mut [0; 2],
+            &|| false,
+            &mut Progress::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex,
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+    }
+
+    #[test]
+    fn full_hash_workers_require_enough_large_candidates_and_respect_limits() {
+        assert_eq!(full_hash_workers(8 * MIB - 1, 128, 8), 1);
+        assert_eq!(full_hash_workers(64 * MIB, 3, 8), 1);
+        assert_eq!(full_hash_workers(32 * MIB - 1, 4, 8), 1);
+        assert_eq!(full_hash_workers(32 * MIB, 4, 8), 4);
+        assert_eq!(full_hash_workers(16 * MIB, 8, 4), 4);
+        assert_eq!(full_hash_workers(16 * MIB, 8, 8), 8);
+        assert_eq!(full_hash_workers(16 * MIB, 8, 1), 1);
+    }
+
+    #[test]
+    fn parallel_large_files_keep_duplicate_groups_links_and_cancel_safely() {
+        let fixture = Fixture::new();
+        for name in ["a", "b", "c", "d"] {
+            File::create(fixture.0.join(name))
+                .unwrap()
+                .set_len(32 * MIB)
+                .unwrap();
+        }
+        let mut middle = File::options()
+            .write(true)
+            .open(fixture.0.join("c"))
+            .unwrap();
+        middle.seek(SeekFrom::Start(16 * MIB)).unwrap();
+        std::io::Write::write_all(&mut middle, &[1]).unwrap();
+        drop(middle);
+        fs::hard_link(fixture.0.join("a"), fixture.0.join("a-alias")).unwrap();
+        let source = fixture.snapshot();
+        let bytes = 128 * MIB + 4 * FULL_IN_SAMPLE;
+        let run = |limit| {
+            inspect_with_limit(
+                vec![source.clone()],
+                Scope::All,
+                limit,
+                &|| false,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let paths = |report: &Report| {
+            report
+                .groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|member| member.path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = run(1);
+        for limit in [4, 8] {
+            let report = run(limit);
+            assert_eq!(paths(&report), paths(&expected));
+            assert_eq!(report.groups.len(), 1);
+            assert_eq!(report.groups[0].len(), 4);
+            assert!(report.groups[0]
+                .iter()
+                .all(|file| !file.path.ends_with("c")));
+            assert_eq!(report.links.len(), 1);
+            assert_eq!(report.links[0].len(), 2);
+            assert_eq!(report.progress.bytes, bytes);
+            assert!(report.issues.is_empty());
+
+            let stopped = std::cell::Cell::new(false);
+            let cancelled = inspect_with_limit(
+                vec![source.clone()],
+                Scope::All,
+                limit,
+                &|| stopped.get(),
+                &mut |progress| {
+                    if progress.stage == "전체 내용 확인" && progress.bytes > 4 * FULL_IN_SAMPLE
+                    {
+                        stopped.set(true);
+                    }
+                },
+            );
+            assert!(stopped.get());
+            assert_eq!(cancelled.err().unwrap().kind(), io::ErrorKind::Interrupted);
+        }
+        for path in ["a", "b", "c", "d"] {
+            File::options()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(fixture.0.join(path))
+                .unwrap();
+        }
+        assert_eq!(paths(&run(4)), paths(&expected));
     }
 
     #[test]
