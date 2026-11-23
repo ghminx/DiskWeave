@@ -15,6 +15,66 @@ mod live;
 pub use live::Hit;
 use live::LiveSearch;
 
+impl Hit {
+    pub fn analysis_folder(&self) -> Option<&Path> {
+        match self.kind {
+            TargetKind::Folder => Some(&self.path),
+            TargetKind::File => self.path.parent(),
+        }
+    }
+
+    pub fn verify_for_analysis(&self) -> io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let folder = self
+            .analysis_folder()
+            .ok_or_else(|| io::Error::other("분석할 폴더를 확인할 수 없습니다"))?;
+        live::check_root(folder)?;
+        let current = std::fs::symlink_metadata(&self.path)?;
+        if current.is_dir() != (self.kind == TargetKind::Folder)
+            || current.file_attributes() & 0x400 != 0
+            || self.identity.is_some_and(|expected| {
+                crate::metadata::read(&self.path).values.identity.value() != Some(expected)
+            })
+        {
+            return Err(io::Error::other(
+                "검색 결과의 항목이 바뀌었습니다. 다시 검색해 주세요",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn analysis_item(&self, scan: &crate::scanner::ScanResult) -> Option<Item> {
+        let root = &scan.folders[0].path;
+        let folder_path = self.analysis_folder()?;
+        let relative = if let Ok(relative) = folder_path.strip_prefix(root) {
+            relative
+        } else if crate::locations::contains_path(root, folder_path).ok()? {
+            let mut components = folder_path.components();
+            for _ in root.components() {
+                components.next();
+            }
+            components.as_path()
+        } else {
+            return None;
+        };
+        let folder = scan.folder_index(relative).ok()?;
+        if scan.folders[folder].access.unreadable() {
+            return None;
+        }
+        match self.kind {
+            TargetKind::Folder => Some(Item::Folder(folder)),
+            TargetKind::File => {
+                let file = scan.file_named(folder, self.path.file_name()?)?;
+                let observed = scan.files[file].extra.identity.value();
+                if self.identity.is_some() && observed.is_some() && observed != self.identity {
+                    return None;
+                }
+                Some(Item::File(file))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
     #[default]
@@ -47,6 +107,7 @@ pub struct QuickSearch {
     pub live: LiveSearch,
     request: Option<(String, SearchMode, EntryKind, u64)>,
     due: Option<Instant>,
+    return_hit: Option<Hit>,
 }
 impl QuickSearch {
     pub fn pending(&self) -> bool {
@@ -185,7 +246,17 @@ impl QuickSearch {
     pub fn open(&mut self) {
         self.visible = true;
         self.focus = true;
-        self.request = None;
+        if self.return_hit.is_none() {
+            self.request = None;
+        }
+    }
+    pub fn leave_for_analysis(&mut self) {
+        self.return_hit = self.selection.and_then(|row| self.row(row));
+        self.live.stop();
+        self.visible = false;
+    }
+    pub fn can_return_from_analysis(&self) -> bool {
+        !self.visible && self.return_hit.is_some()
     }
     pub fn hide(&mut self) {
         self.visible = false;
@@ -194,6 +265,7 @@ impl QuickSearch {
         self.live.stop();
         self.request = None;
         self.selection = None;
+        self.return_hit = None;
     }
     pub fn toggle(&mut self, focused: bool) {
         if self.visible && focused {
@@ -209,6 +281,7 @@ impl QuickSearch {
             return;
         }
         if self.scope != Scope::Scanned {
+            self.return_hit = None;
             return;
         }
         let edited = self.request.as_ref().is_none_or(|(text, mode, kind, _)| {
@@ -223,6 +296,7 @@ impl QuickSearch {
             if edited {
                 self.job.cancel();
                 self.due = Some(now + Duration::from_millis(150));
+                self.return_hit = None;
             } else if self.due.is_none() {
                 self.due = Some(now);
             }
@@ -246,6 +320,19 @@ impl QuickSearch {
             );
         }
         self.job.poll();
+        if !self.job.running && self.due.is_none() {
+            if let (Some(hit), Some(results)) = (self.return_hit.take(), &self.job.results) {
+                let candidates: Vec<_> = results
+                    .sources
+                    .iter()
+                    .map(|s| hit.analysis_item(&s.scan))
+                    .collect();
+                self.selection = results
+                    .hits
+                    .iter()
+                    .position(|row| candidates[row.source] == Some(row.item));
+            }
+        }
     }
     pub fn step(&mut self, direction: i32) {
         let count = self.count();

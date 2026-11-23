@@ -12,6 +12,8 @@ pub enum Action {
     Apply(Preferences),
     Open(OpenRequest),
     Analyze((u64, u64, Item)),
+    AnalyzePath(Hit),
+    ScanFolder(Hit),
     Copy(std::path::PathBuf),
     Recycle(Hit),
 }
@@ -34,6 +36,7 @@ pub struct QuickUi {
     draft: Preferences,
     key: String,
     scroll: Option<usize>,
+    scan_confirmation: Option<Hit>,
 }
 impl Default for QuickUi {
     fn default() -> Self {
@@ -47,6 +50,7 @@ impl Default for QuickUi {
             draft: Preferences::default(),
             key: "Space".into(),
             scroll: None,
+            scan_confirmation: None,
         }
     }
 }
@@ -69,6 +73,10 @@ impl QuickUi {
         self.draft = p;
         self.key = p.shortcut.key_name();
         self.settings = true;
+    }
+
+    pub fn confirm_folder_scan(&mut self, hit: Hit) {
+        self.scan_confirmation = Some(hit);
     }
 
     fn draw_search_fields(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) -> bool {
@@ -312,9 +320,15 @@ impl QuickUi {
                         chosen |= choose(RowAction::Reveal, ui.button("파일 위치 열기").clicked());
                     }
                     chosen |= choose(RowAction::Copy, ui.button("경로 복사").clicked());
-                    if scanned {
-                        chosen |= choose(RowAction::Analyze, ui.button("분석에서 보기").clicked());
-                    }
+                    chosen |= choose(
+                        RowAction::Analyze,
+                        ui.button(if scanned {
+                            "분석에서 보기"
+                        } else {
+                            "용량 분석…"
+                        })
+                        .clicked(),
+                    );
                     ui.separator();
                     let recycle = ui
                         .add_enabled(
@@ -340,13 +354,11 @@ impl QuickUi {
         if allow_enter && !self.settings && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             quick.selection.get_or_insert(0);
             let ctrl = ui.input(|i| i.modifiers.ctrl);
-            if !ctrl || scanned {
-                action = Some(if ctrl {
-                    RowAction::Analyze
-                } else {
-                    RowAction::Open
-                });
-            }
+            action = Some(if ctrl {
+                RowAction::Analyze
+            } else {
+                RowAction::Open
+            });
         }
         action
     }
@@ -360,6 +372,7 @@ impl QuickUi {
     ) -> Option<Action> {
         if !quick.visible {
             self.seen_focus = false;
+            self.scan_confirmation = None;
             if !keep_alive {
                 return None;
             }
@@ -386,8 +399,9 @@ impl QuickUi {
             if focused {
                 self.seen_focus = true;
             }
+            let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if ctx.input(|i| i.viewport().close_requested())
-                || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                || escape && self.scan_confirmation.is_none()
                 || self.seen_focus && !focused && quick.scope() == Scope::Scanned
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -396,6 +410,7 @@ impl QuickUi {
                 ctx.request_repaint();
                 return;
             }
+            let interactive = !self.settings && self.scan_confirmation.is_none();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()
@@ -415,7 +430,7 @@ impl QuickUi {
                         });
                     });
                     ui.add_space(8.0);
-                    if !self.settings {
+                    if interactive {
                         let direction = ui.input_mut(|i| {
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
                                 1
@@ -430,7 +445,7 @@ impl QuickUi {
                             self.scroll = quick.selection;
                         }
                     }
-                    if !self.settings {
+                    if interactive {
                         let dropped = ctx.input(|i| {
                             i.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect::<Vec<_>>()
                         });
@@ -438,7 +453,7 @@ impl QuickUi {
                             self.error = quick.drop_folder(&dropped).err().map(|e| e.to_string());
                         }
                     }
-                    let start_search = ui.add_enabled_ui(!self.settings, |ui| {
+                    let start_search = ui.add_enabled_ui(interactive, |ui| {
                         self.draw_search_fields(ui, quick)
                     }).inner;
                     quick.invalidate_live();
@@ -461,8 +476,8 @@ impl QuickUi {
                         }
                     }
                     if quick.count() > 0 {
-                        let menu = ui.add_enabled_ui(!self.settings, |ui| {
-                            self.draw_results(ui, quick, !start_search)
+                        let menu = ui.add_enabled_ui(interactive, |ui| {
+                            self.draw_results(ui, quick, interactive && !start_search)
                         }).inner;
                         if let Some(menu) = menu {
                             match result_action(quick, locations, menu) {
@@ -488,9 +503,36 @@ impl QuickUi {
                             ui.small("↑↓ 선택   Enter 열기   Ctrl+Enter 분석에서 보기   Esc 닫기");
                         } else {
                             live_status(ui, quick);
+                            if quick.count() > 0 {
+                                ui.small("Ctrl+Enter 용량 분석");
+                            }
                         }
                     });
                 });
+            if let Some(hit) = self.scan_confirmation.as_ref() {
+                let mut start = false;
+                let mut cancel = escape;
+                egui::Modal::new(egui::Id::unique("quick_folder_analysis")).show(&ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.heading(if hit.kind == TargetKind::Folder {
+                        "이 폴더 분석"
+                    } else {
+                        "이 파일이 있는 폴더 분석"
+                    });
+                    if let Some(folder) = hit.analysis_folder() {
+                        ui.add(egui::Label::new(folder.display().to_string()).wrap());
+                    }
+                    ui.horizontal(|ui| {
+                        start = ui.button("분석 시작").clicked();
+                        cancel |= ui.button("취소").clicked();
+                    });
+                });
+                if cancel {
+                    self.scan_confirmation = None;
+                } else if start {
+                    action = self.scan_confirmation.take().map(Action::ScanFolder);
+                }
+            }
             if self.settings {
                 let mut open = true;
                 let settings = |ui: &mut egui::Ui| {
@@ -638,7 +680,11 @@ fn result_action(
     action: RowAction,
 ) -> std::io::Result<Action> {
     if matches!(action, RowAction::Analyze) {
-        return quick.selected(locations).map(Action::Analyze);
+        return if quick.scope() == Scope::Scanned {
+            quick.selected(locations).map(Action::Analyze)
+        } else {
+            quick.selected_hit(locations).map(Action::AnalyzePath)
+        };
     }
     let hit = quick.selected_hit(locations)?;
     Ok(match action {
@@ -763,6 +809,50 @@ mod tests {
         })
         .unwrap();
         assert!(opened);
+        let mut draw_key = |ui: &mut QuickUi, key: Option<(egui::Key, egui::Modifiers)>| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            if let Some((key, modifiers)) = key {
+                input.events.push(egui::Event::ModifiersChanged(modifiers));
+                input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+            let mut action = None;
+            let mut frame = ctx.run_ui(input, |root| {
+                action = ui.show(
+                    root.ctx(),
+                    &mut quick,
+                    &locations,
+                    Preferences::default(),
+                    false,
+                );
+            });
+            frame.textures_delta.clear();
+            (action, frame)
+        };
+        let (action, _) = draw_key(&mut ui, Some((egui::Key::Enter, egui::Modifiers::CTRL)));
+        let Some(Action::AnalyzePath(match_hit)) = action else {
+            panic!("Ctrl+Enter로 직접 검색 항목 분석 요청 필요");
+        };
+        assert_eq!(match_hit.path, hit.path);
+        ui.confirm_folder_scan(match_hit);
+        draw_key(&mut ui, None);
+        let (action, frame) = draw_key(&mut ui, None);
+        assert!(action.is_none());
+        assert!(frame
+            .shapes
+            .iter()
+            .any(|shape| matches!(&shape.shape, egui::Shape::Text(draw)
+            if draw.galley.text() == "분석 시작")));
+        let (action, _) = draw_key(&mut ui, Some((egui::Key::Escape, egui::Modifiers::NONE)));
+        assert!(action.is_none() && quick.visible);
         fs::remove_dir_all(path).unwrap();
     }
     #[test]

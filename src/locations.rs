@@ -331,6 +331,18 @@ impl Locations {
         })
     }
     pub fn start(&mut self, path: PathBuf) -> io::Result<()> {
+        let id = self.scan_location(path)?;
+        self.choose(id);
+        self.start_selected(&[id])
+    }
+
+    pub fn start_background(&mut self, path: PathBuf) -> io::Result<u64> {
+        let id = self.scan_location(path)?;
+        self.start_selected(&[id])?;
+        Ok(id)
+    }
+
+    fn scan_location(&mut self, path: PathBuf) -> io::Result<u64> {
         if self.is_running() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -345,12 +357,10 @@ impl Locations {
                 break;
             }
         }
-        let id = match existing {
-            Some(id) => id,
-            None => self.add(&absolute)?,
-        };
-        self.choose(id);
-        self.start_selected(&[id])
+        match existing {
+            Some(id) => Ok(id),
+            None => self.add(&absolute),
+        }
     }
     pub fn start_selected(&mut self, ids: &[u64]) -> io::Result<()> {
         if self.is_running() {
