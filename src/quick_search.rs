@@ -108,13 +108,49 @@ pub struct QuickSearch {
     request: Option<(String, SearchMode, EntryKind, u64)>,
     due: Option<Instant>,
     return_hit: Option<Hit>,
+    timing: Option<SearchTiming>,
 }
+
+struct SearchTiming {
+    started: Instant,
+    finished: Option<Instant>,
+}
+
 impl QuickSearch {
+    pub fn elapsed(&self, now: Instant) -> Option<Duration> {
+        let timing = self.timing.as_ref()?;
+        Some(
+            timing
+                .finished
+                .unwrap_or(now)
+                .saturating_duration_since(timing.started),
+        )
+    }
+
+    fn finish_timing(&mut self, now: Instant) {
+        if let Some(timing) = &mut self.timing {
+            timing.finished.get_or_insert(now);
+        }
+    }
+
     pub fn pending(&self) -> bool {
         self.visible && (self.due.is_some() || self.job.running || self.live.running())
     }
     pub fn scope(&self) -> Scope {
         self.scope
+    }
+    fn scanned_query_matches(&self) -> bool {
+        self.request.as_ref().is_some_and(|(text, mode, kind, _)| {
+            text == &self.text && *mode == self.mode && *kind == self.kind
+        })
+    }
+    pub fn scanned_request_current(&self, epoch: u64) -> bool {
+        self.due.is_none()
+            && self.scanned_query_matches()
+            && self
+                .request
+                .as_ref()
+                .is_some_and(|(_, _, _, current)| *current == epoch)
     }
     pub fn set_scope(&mut self, scope: Scope) {
         if scope != self.scope {
@@ -124,6 +160,7 @@ impl QuickSearch {
             self.due = None;
             self.selection = None;
             self.live.clear();
+            self.timing = None;
         }
     }
     pub fn folder(&self) -> &std::path::Path {
@@ -167,6 +204,7 @@ impl QuickSearch {
         {
             self.live.clear();
             self.selection = None;
+            self.timing = None;
         }
     }
     pub fn start_live(&mut self) -> io::Result<()> {
@@ -190,7 +228,12 @@ impl QuickSearch {
             mode: self.mode,
             kind: self.kind,
         };
+        let started = Instant::now();
         self.live.start(input, fixed_roots)?;
+        self.timing = Some(SearchTiming {
+            started,
+            finished: None,
+        });
         self.selection = None;
         Ok(())
     }
@@ -277,6 +320,9 @@ impl QuickSearch {
     pub fn tick(&mut self, locations: &Locations, now: Instant) {
         self.invalidate_live();
         self.live.poll();
+        if self.scope != Scope::Scanned && !self.live.running() {
+            self.finish_timing(now);
+        }
         if !self.visible {
             return;
         }
@@ -284,9 +330,7 @@ impl QuickSearch {
             self.return_hit = None;
             return;
         }
-        let edited = self.request.as_ref().is_none_or(|(text, mode, kind, _)| {
-            text != &self.text || *mode != self.mode || *kind != self.kind
-        });
+        let edited = !self.scanned_query_matches();
         if edited
             || self
                 .request
@@ -301,6 +345,7 @@ impl QuickSearch {
                 self.due = Some(now);
             }
             self.selection = None;
+            self.timing = None;
             self.request = Some((self.text.clone(), self.mode, self.kind, locations.epoch));
         }
         if self.text.trim().is_empty() {
@@ -309,6 +354,10 @@ impl QuickSearch {
         }
         if self.due.is_some_and(|due| now >= due) {
             self.due = None;
+            self.timing = Some(SearchTiming {
+                started: now,
+                finished: None,
+            });
             self.job.submit(
                 locations.snapshots(),
                 SearchInput {
@@ -321,6 +370,7 @@ impl QuickSearch {
         }
         self.job.poll();
         if !self.job.running && self.due.is_none() {
+            self.finish_timing(now);
             if let (Some(hit), Some(results)) = (self.return_hit.take(), &self.job.results) {
                 let candidates: Vec<_> = results
                     .sources
@@ -352,11 +402,7 @@ impl QuickSearch {
         });
     }
     pub fn selected(&self, locations: &Locations) -> io::Result<(u64, u64, Item)> {
-        if self.scope != Scope::Scanned
-            || self.request.as_ref().is_none_or(|(text, mode, kind, _)| {
-                *text != self.text || *mode != self.mode || *kind != self.kind
-            })
-        {
+        if self.scope != Scope::Scanned || !self.scanned_query_matches() {
             return Err(io::Error::other("현재 범위에서 다시 검색해 주세요"));
         }
         let r = self

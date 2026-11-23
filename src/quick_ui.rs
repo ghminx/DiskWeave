@@ -80,6 +80,11 @@ impl QuickUi {
     }
 
     fn draw_search_fields(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) -> bool {
+        let gap = if ui.available_height() < 300.0 {
+            1.0
+        } else {
+            6.0
+        };
         ui.spacing_mut().interact_size.y = crate::ui_style::FIELD_HEIGHT;
         ui.horizontal(|ui| {
             let response = crate::ui_style::scope_button(ui, quick.scope().label(), 118.0);
@@ -123,11 +128,39 @@ impl QuickUi {
                     }
                     quick.focus = true;
                 }
-            } else if quick.scope() == Scope::Computer {
-                ui.small("연결된 로컬 고정 드라이브에서 검색합니다.");
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(gap);
+        ui.horizontal(|ui| {
+            use crate::search::{EntryKind, SearchMode};
+            for (kind, label) in [
+                (EntryKind::All, "모두"),
+                (EntryKind::Files, "파일"),
+                (EntryKind::Folders, "폴더"),
+            ] {
+                if ui.selectable_label(quick.kind() == kind, label).clicked() {
+                    quick.set_kind(kind);
+                    self.error = None;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt("quick_mode")
+                    .selected_text(if quick.mode == SearchMode::Name {
+                        "이름"
+                    } else {
+                        "전체 경로"
+                    })
+                    .show_ui(ui, |ui| {
+                        let name = ui.selectable_value(&mut quick.mode, SearchMode::Name, "이름");
+                        let path =
+                            ui.selectable_value(&mut quick.mode, SearchMode::Path, "전체 경로");
+                        if name.changed() || path.changed() {
+                            self.error = None;
+                        }
+                    });
+            });
+        });
+        ui.add_space(gap);
         let started = ui
             .horizontal(|ui| {
                 let manual = quick.scope() != Scope::Scanned;
@@ -162,32 +195,7 @@ impl QuickUi {
                 }
             })
             .inner;
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            use crate::search::{EntryKind, SearchMode};
-            for (kind, label) in [
-                (EntryKind::All, "모두"),
-                (EntryKind::Files, "파일"),
-                (EntryKind::Folders, "폴더"),
-            ] {
-                if ui.selectable_label(quick.kind() == kind, label).clicked() {
-                    quick.set_kind(kind);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("quick_mode")
-                    .selected_text(if quick.mode == SearchMode::Name {
-                        "이름"
-                    } else {
-                        "전체 경로"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut quick.mode, SearchMode::Name, "이름");
-                        ui.selectable_value(&mut quick.mode, SearchMode::Path, "전체 경로");
-                    });
-            });
-        });
-        ui.add_space(8.0);
+        ui.add_space(gap);
         started
     }
 
@@ -218,7 +226,7 @@ impl QuickUi {
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("quick_results")
             .auto_shrink([false, false])
-            .max_height((ui.available_height() - if scanned { 28.0 } else { 56.0 }).max(0.0));
+            .max_height((ui.available_height() - 28.0).max(0.0));
         if let Some(row) = self.scroll.take() {
             scroll = scroll
                 .vertical_scroll_offset(row as f32 * (row_height + ui.spacing().item_spacing.y));
@@ -429,7 +437,7 @@ impl QuickUi {
                             }
                         });
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
                     if interactive {
                         let direction = ui.input_mut(|i| {
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
@@ -447,65 +455,59 @@ impl QuickUi {
                     }
                     if interactive {
                         let dropped = ctx.input(|i| {
-                            i.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect::<Vec<_>>()
+                            i.raw
+                                .dropped_files
+                                .iter()
+                                .map(|file| file.path().to_path_buf())
+                                .collect::<Vec<_>>()
                         });
                         if !dropped.is_empty() {
                             self.error = quick.drop_folder(&dropped).err().map(|e| e.to_string());
                         }
                     }
-                    let start_search = ui.add_enabled_ui(interactive, |ui| {
-                        self.draw_search_fields(ui, quick)
-                    }).inner;
+                    let start_search = ui
+                        .add_enabled_ui(interactive, |ui| self.draw_search_fields(ui, quick))
+                        .inner;
                     quick.invalidate_live();
                     if start_search {
                         self.error = quick.start_live().err().map(|e| e.to_string());
                     }
 
                     let scanned = quick.scope() == Scope::Scanned;
-                    if let Some(error) = self.error.as_ref().or(quick.job.error.as_ref()).or(quick.live.error.as_ref()) {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    let current = if scanned {
+                        scanned_status(ui, quick, locations)
+                    } else {
+                        live_status(ui, quick);
+                        true
+                    };
+                    if let Some(error) = &self.error {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(error).color(egui::Color32::LIGHT_RED),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(error);
                     }
-                    if scanned {
-                        let sources = locations.snapshots();
-                        let skipped = locations.entries.len() - sources.len();
-                        if sources.is_empty() {
-                            ui.small("스캔한 위치가 없습니다. 폴더를 끌어놓거나 다른 검색 범위를 선택하세요.");
-                        } else if skipped > 0 || locations.is_running() {
-                            let previous = if locations.is_running() { " · 스캔 중인 위치는 이전 결과 사용" } else { "" };
-                            ui.small(format!("스캔한 위치 {}곳 · 제외 {skipped}곳{previous}", sources.len()));
-                        }
-                    }
-                    if quick.count() > 0 {
-                        let menu = ui.add_enabled_ui(interactive, |ui| {
-                            self.draw_results(ui, quick, interactive && !start_search)
-                        }).inner;
+                    if current && quick.count() > 0 {
+                        let menu = ui
+                            .add_enabled_ui(interactive, |ui| {
+                                self.draw_results(ui, quick, interactive && !start_search)
+                            })
+                            .inner;
                         if let Some(menu) = menu {
                             match result_action(quick, locations, menu) {
                                 Ok(next) => action = Some(next),
                                 Err(e) => self.error = Some(e.to_string()),
                             }
                         }
-                    } else if scanned && quick.job.running {
-                        ui.horizontal(|ui| {
-                            crate::ui_style::activity_indicator(ui);
-                            ui.label("검색 중…");
-                        });
-                    } else if (scanned && quick.job.results.is_some())
-                        || (quick.live.input.is_some() && !quick.live.running() && !quick.live.stopped
-                            && quick.live.error.is_none() && !quick.live.coverage.limited
-                            && quick.live.coverage.skipped == 0)
-                    {
-                        ui.label("일치하는 파일이나 폴더가 없습니다.");
                     }
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         if scanned {
                             ui.small("↑↓ 선택   Enter 열기   Ctrl+Enter 분석에서 보기   Esc 닫기");
-                        } else {
-                            live_status(ui, quick);
-                            if quick.count() > 0 {
-                                ui.small("Ctrl+Enter 용량 분석");
-                            }
+                        } else if quick.count() > 0 {
+                            ui.small("Ctrl+Enter 용량 분석");
                         }
                     });
                 });
@@ -625,53 +627,136 @@ fn result_columns(row: egui::Rect, scanned: bool) -> [egui::Rect; 4] {
     ]
 }
 
-fn live_status(ui: &mut egui::Ui, quick: &mut QuickSearch) {
-    let count = quick.count();
-    let live = &mut quick.live;
-    if live.input.is_none() {
-        ui.small(if live.running() {
-            "이전 검색 중지 중…"
-        } else {
-            "검색을 누르면 이 위치에서 파일과 폴더를 찾습니다."
-        });
-        return;
+fn scanned_status(ui: &mut egui::Ui, quick: &QuickSearch, locations: &Locations) -> bool {
+    let available = locations
+        .entries
+        .iter()
+        .filter(|entry| !entry.stale && entry.scan.completed().is_some())
+        .count();
+    let skipped = locations.entries.len() - available;
+    let current = available > 0
+        && !quick.text.trim().is_empty()
+        && quick.scanned_request_current(locations.epoch);
+    let error = current.then_some(quick.job.error.as_deref()).flatten();
+    let (mut status, busy) = if available == 0 {
+        (
+            "스캔한 위치 없음 · 폴더 지정 또는 내 PC 전체 선택".to_owned(),
+            false,
+        )
+    } else if quick.text.trim().is_empty() {
+        ("입력하면 스캔한 위치에서 검색".to_owned(), false)
+    } else if !current {
+        ("검색 준비 중…".to_owned(), true)
+    } else if quick.job.running {
+        ("검색 중…".to_owned(), true)
+    } else if let Some(error) = error {
+        (format!("검색 실패 · {error}"), false)
+    } else if quick.job.results.is_some() {
+        (format!("검색 완료 · {}건", quick.count()), false)
+    } else {
+        ("검색 대기 중".to_owned(), false)
+    };
+    if skipped > 0 {
+        status.push_str(&format!(" · 스캔 전/갱신 필요 {skipped}곳 제외"));
     }
-    if live.coverage.skipped > 0 {
-        ui.small(format!(
-            "접근 불가·특수 경로 {}건 제외",
-            live.coverage.skipped
-        ))
-        .on_hover_text(live.coverage.first_issue.as_deref().unwrap_or_default());
+    if available > 0 && locations.is_running() {
+        status.push_str(" · 이전 완료 결과 포함");
     }
-    let running = live.running();
     ui.horizontal(|ui| {
-        if running {
-            crate::ui_style::activity_indicator(ui);
-        }
-        let status = if running && live.stopped {
-            "검색 중지 중"
-        } else if running {
-            "검색 중"
-        } else if live.stopped {
-            "검색 중지됨"
-        } else if live.error.is_some() {
-            "검색 실패"
-        } else if live.coverage.limited {
-            "표시 한도 도달 · 범위를 좁혀 주세요"
-        } else {
-            "검색 완료"
-        };
-        ui.label(format!("{status} · {count}건"));
-        if running && !live.stopped {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("중지").clicked() {
-                    live.stop();
-                }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if current {
+                elapsed_label(ui, quick.elapsed(std::time::Instant::now()), busy);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                status_label(ui, &status, busy, error.is_some(), None);
             });
-        }
+        });
     });
-    ui.add_space(6.0);
-    ui.separator();
+    current
+}
+
+fn live_status(ui: &mut egui::Ui, quick: &mut QuickSearch) {
+    let scope = quick.scope();
+    let count = quick.count();
+    let elapsed = quick.elapsed(std::time::Instant::now());
+    let live = &mut quick.live;
+    let running = live.running();
+    let mut status = if live.input.is_none() {
+        if running {
+            "이전 검색 중지 중…".to_owned()
+        } else if scope == Scope::Computer {
+            "검색을 누르면 로컬 고정 드라이브 탐색 시작".to_owned()
+        } else {
+            "검색을 누르면 지정한 폴더 탐색 시작".to_owned()
+        }
+    } else if running && live.stopped {
+        format!("검색 중지 중 · {count}건 발견")
+    } else if running {
+        format!("검색 중 · {count}건 발견")
+    } else if live.stopped {
+        format!("검색 중지됨 · {count}건")
+    } else if let Some(error) = &live.error {
+        format!("검색 실패 · {error}")
+    } else if live.coverage.limited {
+        format!("표시 한도 도달 · {count}건 · 범위를 좁혀 주세요")
+    } else if live.coverage.skipped > 0 {
+        format!("검색 완료 · {count}건 · 일부 제외")
+    } else {
+        format!("검색 완료 · {count}건")
+    };
+    if live.coverage.skipped > 0 {
+        status.push_str(&format!(
+            " · 접근 불가·특수 경로 {}건",
+            live.coverage.skipped
+        ));
+    }
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if running && !live.stopped && live.input.is_some() && ui.button("중지").clicked() {
+                live.stop();
+            }
+            if live.input.is_some() {
+                elapsed_label(ui, elapsed, running);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                status_label(
+                    ui,
+                    &status,
+                    running,
+                    live.error.is_some(),
+                    live.coverage.first_issue.as_deref(),
+                );
+            });
+        });
+    });
+}
+
+fn elapsed_label(ui: &mut egui::Ui, elapsed: Option<std::time::Duration>, running: bool) {
+    if let Some(elapsed) = elapsed {
+        let label = if !running && elapsed < std::time::Duration::from_millis(100) {
+            "경과 0.1초 미만".to_owned()
+        } else {
+            format!("경과 {:.1}초", elapsed.as_secs_f64())
+        };
+        ui.small(label);
+    }
+}
+
+fn status_label(ui: &mut egui::Ui, status: &str, busy: bool, failed: bool, detail: Option<&str>) {
+    if busy {
+        crate::ui_style::activity_indicator(ui);
+    }
+    let text = if failed {
+        egui::RichText::new(status).color(egui::Color32::LIGHT_RED)
+    } else {
+        egui::RichText::new(status)
+    };
+    let response = ui.add(egui::Label::new(text).truncate());
+    if let Some(detail) = detail {
+        response.on_hover_text(format!("{status}\n{detail}"));
+    } else {
+        response.on_hover_text(status);
+    }
 }
 
 fn result_action(
@@ -771,6 +856,7 @@ mod tests {
             assert!(Instant::now() < until);
             std::thread::yield_now();
         }
+        render(&mut quick, false, false);
         let output = render(&mut quick, false, false);
         let visible: Vec<_> = output
             .shapes
@@ -795,6 +881,17 @@ mod tests {
                 "화면 안에 {label} 필요: {visible:?}"
             );
         }
+        let label_y = |label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(draw) if draw.galley.text() == label => Some(draw.pos.y),
+                    _ => None,
+                })
+                .expect("검색 상태와 결과 머리글 필요")
+        };
+        assert!(label_y("검색 완료 · 2건") < label_y("전체 경로"));
         quick.step(1);
         let hit = quick.selected_hit(&locations).unwrap();
         let Action::Open(request) = result_action(&quick, &locations, RowAction::Open).unwrap()
@@ -855,6 +952,158 @@ mod tests {
         assert!(action.is_none() && quick.visible);
         fs::remove_dir_all(path).unwrap();
     }
+    #[test]
+    fn status_at_minimum_size_distinguishes_scope_progress_outcome_and_new_input() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let search_root = fixture.0.join("search");
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&search_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(search_root.join("sample.txt"), b"example").unwrap();
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(true);
+        crate::ui_style::apply(&ctx);
+        let mut ui = QuickUi::default();
+        let mut quick = QuickSearch::default();
+        let mut locations = Locations::default();
+        quick.open();
+        let mut render = |quick: &mut QuickSearch, locations: &Locations| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 320.0));
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .focused = Some(true);
+            let mut frame = ctx.run_ui(raw, |root| {
+                ui.show(root.ctx(), quick, locations, Preferences::default(), false);
+            });
+            frame.textures_delta.clear();
+            frame
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if screen.contains_rect(text.visual_bounding_rect()) =>
+                    {
+                        Some(text.galley.text().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let label = |labels: Vec<String>, expected: &str| {
+            assert!(
+                labels.iter().any(|label| label.starts_with(expected)),
+                "{expected:?}: {labels:?}"
+            );
+        };
+        let finish = |quick: &mut QuickSearch, locations: &Locations| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let now = Instant::now();
+                quick.tick(locations, now + Duration::from_millis(200));
+                if !quick.pending() {
+                    break;
+                }
+                assert!(now < deadline);
+                std::thread::yield_now();
+            }
+        };
+
+        render(&mut quick, &locations);
+        label(render(&mut quick, &locations), "스캔한 위치 없음");
+        quick.set_scope(Scope::Computer);
+        label(
+            render(&mut quick, &locations),
+            "검색을 누르면 로컬 고정 드라이브 탐색 시작",
+        );
+        quick.set_folder(search_root.clone());
+        quick.text = "sample".into();
+        label(
+            render(&mut quick, &locations),
+            "검색을 누르면 지정한 폴더 탐색 시작",
+        );
+        quick.start_live().unwrap();
+        let active = render(&mut quick, &locations);
+        assert!(active.iter().any(|label| label == "중지"));
+        label(active.clone(), "경과 ");
+        label(active, "검색 중 · 0건 발견");
+        quick.live.stop();
+        finish(&mut quick, &locations);
+        let stopped = render(&mut quick, &locations);
+        label(stopped.clone(), "경과 ");
+        label(stopped, "검색 중지됨 · 0건");
+
+        quick.text = "missing".into();
+        quick.start_live().unwrap();
+        finish(&mut quick, &locations);
+        label(render(&mut quick, &locations), "검색 완료 · 0건");
+        quick.set_folder(fixture.0.join("deleted-folder"));
+        quick.start_live().unwrap();
+        finish(&mut quick, &locations);
+        label(render(&mut quick, &locations), "검색 실패");
+        quick.set_scope(Scope::Computer);
+        let switched = render(&mut quick, &locations);
+        assert!(!switched.iter().any(|label| label.starts_with("검색 실패")));
+        assert!(!switched.iter().any(|label| label.starts_with("경과 ")));
+        label(switched, "검색을 누르면 로컬 고정 드라이브 탐색 시작");
+
+        locations.start(search_root.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while locations.is_running() {
+            locations.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        quick.set_scope(Scope::Scanned);
+        quick.text.clear();
+        label(
+            render(&mut quick, &locations),
+            "입력하면 스캔한 위치에서 검색",
+        );
+        quick.text = "sample".into();
+        finish(&mut quick, &locations);
+        let completed = render(&mut quick, &locations);
+        let elapsed = completed
+            .iter()
+            .find(|label| label.starts_with("경과 "))
+            .expect("완료한 검색의 경과 시간")
+            .clone();
+        label(completed, "검색 완료 · 1건");
+        quick.tick(&locations, Instant::now() + Duration::from_secs(10));
+        assert!(render(&mut quick, &locations).contains(&elapsed));
+        quick.text = "new query".into();
+        let pending = render(&mut quick, &locations);
+        assert!(!pending.iter().any(|label| label == "sample.txt"
+            || label.starts_with("검색 완료")
+            || label.starts_with("경과 ")));
+        label(pending, "검색 준비 중…");
+
+        use std::os::windows::process::CommandExt;
+        let junction = search_root.join("junction");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+        quick.set_folder(search_root);
+        quick.text = "sample".into();
+        quick.start_live().unwrap();
+        finish(&mut quick, &locations);
+        let partial = render(&mut quick, &locations);
+        fs::remove_dir(junction).unwrap();
+        label(
+            partial,
+            "검색 완료 · 1건 · 일부 제외 · 접근 불가·특수 경로 1건",
+        );
+    }
+
     #[test]
     fn reopening_requests_focus_before_dismissing_for_old_focus_state() {
         let ctx = egui::Context::default();
