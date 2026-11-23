@@ -248,7 +248,7 @@ impl DuplicateUi {
             report.links.len(),
             report.empty,
             report.issues.len()
-        )).truncate()).on_hover_text("중복 그룹은 전체 내용 SHA-256이 일치하는 별도 파일입니다. Hard Link는 동일 파일 객체의 여러 경로입니다. 기본 스트림만 비교하며 ADS·권한은 비교하지 않습니다.");
+        )).truncate()).on_hover_text("중복 그룹은 기본 파일 내용 전체의 BLAKE3 해시가 같은 별도 파일입니다. 하드 링크는 같은 파일을 가리키는 여러 경로이며 하나의 파일로 계산합니다. 대체 데이터 스트림(ADS)과 권한은 비교 범위에서 제외됩니다.");
         if !compact {
             ui.small(
                 "검사 당시 결과이며 이후 파일이 바뀔 수 있습니다. ADS·권한 등은 비교하지 않습니다.",

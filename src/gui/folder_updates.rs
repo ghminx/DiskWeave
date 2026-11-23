@@ -275,6 +275,11 @@ impl DiskWeaveApp {
             .is_none_or(|watch| watch.error().is_none())
     }
 
+    pub(super) fn live_selection_count(&self) -> Option<usize> {
+        self.live_selected_item()
+            .map(|_| self.live_rows.selection.count())
+    }
+
     pub(super) fn live_selected_item(&self) -> Option<Option<Item>> {
         let path = self.current_live_folder()?;
         let entries = self.visible_watches.get(&path)?.entries()?;
@@ -506,7 +511,16 @@ impl DiskWeaveApp {
                                 if self.search.show_allocated {
                                     crate::ui_style::cell(ui, widths.get(7), "—", true);
                                 }
-                                for column in [4, 5, 6] {
+                                crate::ui_style::cell(ui, widths.get(4), "—", true);
+                                if self.search.show_modified {
+                                    crate::ui_style::cell(
+                                        ui,
+                                        widths.get(3),
+                                        &crate::local_date::display(row.current.modified),
+                                        false,
+                                    );
+                                }
+                                for column in [5, 6] {
                                     crate::ui_style::cell(ui, widths.get(column), "—", true);
                                 }
                                 if self.search.show_path {
@@ -517,14 +531,6 @@ impl DiskWeaveApp {
                                         false,
                                     )
                                     .on_hover_text(full_path.display().to_string());
-                                }
-                                if self.search.show_modified {
-                                    crate::ui_style::cell(
-                                        ui,
-                                        widths.get(3),
-                                        &crate::local_date::display(row.current.modified),
-                                        false,
-                                    );
                                 }
                             }
                         })

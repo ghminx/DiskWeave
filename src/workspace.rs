@@ -13,31 +13,6 @@ pub struct Panels {
     pub body: f32,
 }
 
-pub struct SearchLayout {
-    pub stacked: bool,
-    pub input: f32,
-    pub scope: f32,
-    pub header: f32,
-    pub chips: f32,
-}
-impl SearchLayout {
-    pub fn new(width: f32) -> Self {
-        let stacked = width < 760.0;
-        let scope = 170.0;
-        let input = if stacked {
-            (width - 24.0 - scope - 16.0).max(70.0)
-        } else {
-            210.0
-        };
-        Self {
-            stacked,
-            input,
-            scope,
-            header: if stacked { 68.0 } else { 44.0 },
-            chips: 30.0,
-        }
-    }
-}
 impl Panels {
     pub fn new(width: f32, height: f32, map_height: f32, collapsed: bool) -> Self {
         let header = 36.0;
@@ -78,16 +53,6 @@ mod tests {
         let small = Panels::new(760.0, 500.0, 192.0, true);
         assert!(small.center >= 400.0);
         assert!(small.body >= 300.0);
-    }
-    #[test]
-    fn search_controls_fit_and_leave_a_result_row_in_the_smallest_workspace() {
-        let panels = Panels::new(760.0, 500.0, 245.0, true);
-        let layout = SearchLayout::new(panels.center);
-        assert!(layout.stacked);
-        assert!(layout.header >= 68.0);
-        assert!(layout.input >= 70.0);
-        assert!(layout.input + layout.scope + 16.0 <= panels.center - 24.0);
-        assert!(panels.body - layout.header - layout.chips - 28.0 - 30.0 >= 39.0);
     }
     #[test]
     fn frame_regions_fit_without_hiding_the_list_at_supported_window_sizes() {

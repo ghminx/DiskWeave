@@ -194,6 +194,12 @@ impl ColumnWidths {
         }
         if !self.result_mode {
             crate::ui_style::cell(ui, self.get(4), &values.parent_percentage(), true);
+        }
+        if modified {
+            let date = crate::local_date::display(crate::search::item_modified(scan, item));
+            crate::ui_style::cell(ui, self.get(3), &date, false);
+        }
+        if !self.result_mode {
             for (column, count) in [(5, values.files), (6, values.folders)] {
                 crate::ui_style::cell(
                     ui,
@@ -206,7 +212,7 @@ impl ColumnWidths {
             }
         }
         if let Some(source) = path {
-            let path = crate::search::item_path(scan, item).display().to_string();
+            let path = crate::search::item_path(scan, item);
             if source {
                 let (rect, response) = ui.allocate_exact_size(
                     eframe::egui::vec2(self.get(1), crate::ui_style::ROW),
@@ -217,7 +223,18 @@ impl ColumnWidths {
                     rect.min + eframe::egui::vec2(0.0, 3.0),
                     eframe::egui::vec2(rect.width(), 17.0),
                 );
-                crate::ui_style::text(ui, line, &path, false, crate::ui_style::TEXT, 11.0);
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(&path);
+                crate::ui_style::text(
+                    ui,
+                    line,
+                    &parent.display().to_string(),
+                    false,
+                    crate::ui_style::TEXT,
+                    11.0,
+                );
                 let origin = format!("분석 위치: {}", scan.folders[0].path.display());
                 crate::ui_style::text(
                     ui,
@@ -227,14 +244,11 @@ impl ColumnWidths {
                     crate::ui_style::SOFT,
                     10.0,
                 );
-                response.on_hover_text(format!("{path}\n{origin}"));
+                response.on_hover_text(format!("{}\n{origin}", path.display()));
             } else {
+                let path = path.display().to_string();
                 crate::ui_style::cell(ui, self.get(1), &path, false).on_hover_text(path);
             }
-        }
-        if modified {
-            let date = crate::local_date::display(crate::search::item_modified(scan, item));
-            crate::ui_style::cell(ui, self.get(3), &date, false);
         }
     }
     pub fn fit(&mut self, available: f32, path: bool, modified: bool, allocated: bool) {

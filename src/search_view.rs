@@ -29,8 +29,8 @@ impl SearchScope {
     pub fn label(self) -> &'static str {
         match self {
             Self::Folder => "현재 폴더 안에서",
-            Self::Location => "스캔한 위치 전체",
-            Self::Registered => "모든 스캔 위치",
+            Self::Location => "현재 스캔 위치 전체",
+            Self::Registered => "완료된 모든 스캔 위치",
         }
     }
 }
@@ -430,14 +430,28 @@ impl SearchView {
         self.editing = false;
         let current = self.scope(global);
         let mut chosen = None;
-        let width = crate::workspace::SearchLayout::new(ui.available_width() + 24.0);
+        let scope_width = 170.0;
+        let input_width =
+            (ui.available_width() - scope_width - ui.spacing().item_spacing.x).max(70.0);
         ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+        self.editing = ui
+            .add(
+                crate::ui_style::text_field(&mut self.input.text, input_width)
+                    .id(egui::Id::unique("search_query"))
+                    .hint_text(if self.input.mode == SearchMode::Name {
+                        "파일·폴더 이름 검색"
+                    } else {
+                        "파일·폴더 경로 검색"
+                    }),
+            )
+            .has_focus();
         crate::ui_style::slot(
             ui,
-            egui::vec2(width.scope, crate::ui_style::FIELD_HEIGHT),
+            egui::vec2(scope_width, crate::ui_style::FIELD_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                let response = crate::ui_style::scope_button(ui, current.label(), width.scope);
+                let response = crate::ui_style::scope_button(ui, current.label(), scope_width)
+                    .on_hover_text("목록 검색 범위");
                 egui::Popup::menu(&response).show(|ui| {
                     crate::ui_style::menu_spacing(ui);
                     for scope in [
@@ -466,22 +480,14 @@ impl SearchView {
                             ui.close();
                         }
                     }
-                    ui.small("현재 폴더: 선택한 폴더와 하위 항목");
-                    ui.small("스캔한 위치 전체: 현재 위치의 스캔 시작점부터");
+                    ui.small("현재 폴더와 하위 항목");
+                    ui.small("현재 스캔 위치 전체는 스캔을 시작한 경로부터 검색합니다.");
                     if multiple {
-                        ui.small("모든 스캔 위치: 수집이 완료된 여러 위치를 함께 검색");
+                        ui.small("완료된 모든 스캔 위치는 여러 위치를 함께 검색합니다.");
                     }
                 });
             },
         );
-        let input_width = ui.available_width();
-        self.editing |= ui
-            .add(
-                crate::ui_style::text_field(&mut self.input.text, input_width)
-                    .id(egui::Id::unique("search_query"))
-                    .hint_text("선택한 범위에서 이름 검색"),
-            )
-            .has_focus();
         chosen
     }
     pub fn filter_chips(&mut self, ui: &mut egui::Ui) {
@@ -552,18 +558,18 @@ impl SearchView {
                         (2, Some(SortField::Size), "크기"),
                         (7, None, "할당 크기"),
                         (4, None, "부모 대비"),
+                        (3, Some(SortField::Modified), "수정 날짜"),
                         (5, None, "파일"),
                         (6, None, "폴더"),
                         (
                             1,
                             Some(SortField::Path),
                             if self.show_source {
-                                "전체 경로 · 분석 위치"
+                                "있는 폴더 · 분석 위치"
                             } else {
                                 "전체 경로"
                             },
                         ),
-                        (3, Some(SortField::Modified), "수정 날짜"),
                     ]
                     .into_iter()
                     {
@@ -630,6 +636,9 @@ impl SearchView {
                                 self.input.sort = field;
                                 self.input.descending = false;
                             }
+                        }
+                        if column == 1 && self.show_source {
+                            response.on_hover_text("항목의 전체 경로를 기준으로 정렬합니다.");
                         }
                     }
                 });

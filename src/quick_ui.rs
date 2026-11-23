@@ -406,7 +406,7 @@ impl QuickUi {
                     ui.horizontal(|ui| {
                         ui.heading("빠른 검색");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("설정").clicked() {
+                            if ui.button("검색 설정").clicked() {
                                 self.open_settings(applied);
                             }
                             if ui.button("메인 창").clicked() {
