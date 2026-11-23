@@ -29,6 +29,22 @@ struct QuickFolderScan {
     hit: crate::quick_search::Hit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SizeFreshness {
+    LastScan,
+    Refreshing,
+    NeedsRefresh,
+}
+impl SizeFreshness {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LastScan => "마지막 스캔 기준",
+            Self::Refreshing => "갱신 중 · 이전 값",
+            Self::NeedsRefresh => "갱신 필요",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct DiskWeaveApp {
     settings_path: Option<PathBuf>,
@@ -43,6 +59,7 @@ pub struct DiskWeaveApp {
     visible_watches: crate::visible_watch::VisibleWatches,
     live_rows: folder_updates::LiveRows,
     parked_live_rows: folder_updates::LiveRows,
+    list_only_generations: std::collections::HashMap<u64, u64>,
     folder_tabs: FolderTabs,
     unavailable_pane: Option<crate::navigation::ViewState>,
     other_rows: crate::workspace::pane_rows::PaneRows,
@@ -2467,6 +2484,20 @@ impl DiskWeaveApp {
             }
         });
     }
+    fn size_freshness(&self, id: u64, generation: u64) -> Option<SizeFreshness> {
+        let entry = self.scan.get(id)?;
+        let refreshing = self.file_refresh.pending_at(id) || entry.scan.is_running();
+        if entry.stale && !refreshing {
+            Some(SizeFreshness::NeedsRefresh)
+        } else if refreshing || entry.generation != generation {
+            Some(SizeFreshness::Refreshing)
+        } else if self.list_only_generations.get(&id) == Some(&generation) {
+            Some(SizeFreshness::LastScan)
+        } else {
+            None
+        }
+    }
+
     fn summary(&self, ui: &mut egui::Ui) {
         let sources = if self.show_preview() {
             Vec::new()
@@ -2507,6 +2538,10 @@ impl DiskWeaveApp {
         let stale = sources
             .iter()
             .any(|s| self.scan.get(s.id).is_some_and(|e| e.stale));
+        let freshness = sources
+            .iter()
+            .filter_map(|s| self.size_freshness(s.id, s.generation))
+            .max();
         let size = if !has_results {
             SizeDisplay {
                 text: "—".into(),
@@ -2541,17 +2576,18 @@ impl DiskWeaveApp {
                 "스캔 대기"
             };
             ui.small(state);
-            ui.label(
-                egui::RichText::new(if preview.is_some() {
+            let mut size_text = if preview.is_some() {
                     format!("{} · 계산 중", size.text)
                 } else if errors > 0 {
                     format!("{} · 일부", size.text)
                 } else {
                     size.text
-                })
-                .size(12.0),
-            )
-            .on_hover_text(size.exact);
+                };
+            if let Some(freshness) = freshness {
+                size_text.push_str(" · ");
+                size_text.push_str(freshness.label());
+            }
+            ui.label(egui::RichText::new(size_text).size(12.0)).on_hover_text(size.exact);
             ui.small(format!("파일 {}개", crate::ui_style::count(files)));
             ui.small(format!("폴더 {}개", crate::ui_style::count(folders)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3412,7 +3448,27 @@ impl DiskWeaveApp {
         );
         response.on_hover_text(info.path.display().to_string());
         ui.add_space(5.0);
-        crate::ui_style::property(ui, "크기", &info.size.text).on_hover_text(info.size.exact);
+        let freshness = if matches!(item, Item::Folder(_)) {
+            self.size_freshness(id, generation)
+        } else {
+            None
+        };
+        if let Some(freshness) = freshness {
+            let size = format!("{} · {}", info.size.text, freshness.label());
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new("크기")
+                        .size(11.0)
+                        .color(crate::ui_style::MUTED),
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(&size).size(12.0)).truncate())
+                        .on_hover_text(format!("{}\n{}", info.size.exact, freshness.label()));
+                });
+            });
+        } else {
+            crate::ui_style::property(ui, "크기", &info.size.text).on_hover_text(info.size.exact);
+        }
         crate::ui_style::property(ui, "할당 크기", &info.allocated.text)
             .on_hover_text(info.allocated.exact);
         if let (Some(files), Some(folders)) = (info.files, info.folders) {
@@ -3528,7 +3584,19 @@ impl DiskWeaveApp {
             return;
         }
         let selected = self.selection_target();
-        if let Some(event) = self.map_view.show(ui, &self.map, selected) {
+        let size_note = self
+            .map
+            .output
+            .as_ref()
+            .and_then(|output| {
+                output
+                    .sources
+                    .iter()
+                    .filter_map(|s| self.size_freshness(s.id, s.generation))
+                    .max()
+            })
+            .map(SizeFreshness::label);
+        if let Some(event) = self.map_view.show(ui, &self.map, selected, size_note) {
             match event {
                 MapEvent::Pick(row) => self.pick_map(row),
                 MapEvent::Analyze(row) => {

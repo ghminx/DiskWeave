@@ -21,6 +21,7 @@ impl MapView {
         ui: &mut egui::Ui,
         map: &MapController,
         selected: Option<Target>,
+        size_note: Option<&str>,
     ) -> Option<MapEvent> {
         if map.running {
             ui.horizontal(|ui| {
@@ -46,15 +47,23 @@ impl MapView {
             return None;
         };
         if output.data.tiles.is_empty() {
-            ui.label("표시할 용량이 없습니다 · 0 B 항목은 목록에서 확인하세요");
+            if let Some(note) = size_note {
+                ui.label(format!("전체 크기 0 B · {note}"));
+            } else {
+                ui.label("표시할 용량이 없습니다 · 0 B 항목은 목록에서 확인하세요");
+            }
             return None;
         }
-        let summary = format!(
-            "전체 크기 {} · {}개 영역 · 0 B {}개 제외",
-            SizeDisplay::new(output.data.total).text,
+        let mut summary = format!("전체 크기 {}", SizeDisplay::new(output.data.total).text);
+        if let Some(note) = size_note {
+            summary.push_str(" · ");
+            summary.push_str(note);
+        }
+        summary.push_str(&format!(
+            " · {}개 영역 · 0 B {}개 제외",
             output.data.tiles.len(),
             output.data.zero_count
-        );
+        ));
         let size = egui::vec2(
             ui.available_width().max(0.0),
             (ui.available_height() - 23.0).max(0.0),
@@ -226,7 +235,9 @@ impl MapView {
             }
         }
         ui.horizontal(|ui| {
-            let summary_width = ui.available_width().min(300.0);
+            let summary_width =
+                ui.available_width()
+                    .min(if size_note.is_some() { 390.0 } else { 300.0 });
             let legend_width = (ui.available_width() - summary_width - 8.0).max(0.0);
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.allocate_ui_with_layout(

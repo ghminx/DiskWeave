@@ -32,6 +32,10 @@ impl Controller {
     pub fn busy(&self) -> bool {
         self.receiver.is_some() || self.waiting.is_some()
     }
+    pub fn pending_at(&self, location: u64) -> bool {
+        (self.receiver.is_some() && self.pending.contains_key(&location))
+            || self.waiting.is_some_and(|(id, _)| id == location)
+    }
     pub fn label(&self) -> &str {
         if self.busy() {
             "분석 목록 갱신 중"

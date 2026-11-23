@@ -31,6 +31,7 @@ struct Key {
 pub(super) struct LiveRows {
     key: Option<Key>,
     rows: Vec<Row>,
+    differs_from_scan: bool,
     selection: ListSelection,
     seed: Option<Vec<PathBuf>>,
 }
@@ -105,6 +106,7 @@ impl LiveRows {
             .iter()
             .map(|&id| (scan.files[id].name.as_os_str(), id))
             .collect();
+        let mut differs_from_scan = entries.len() != scanned_folders.len() + scanned_files.len();
         let mut rows: Vec<_> = entries
             .iter()
             .map(|(name, current)| {
@@ -121,6 +123,18 @@ impl LiveRows {
                         .filter(|&id| scan.files[id].created == current.created)
                         .map(Item::File)
                 };
+                differs_from_scan = differs_from_scan
+                    || match known {
+                        None => true,
+                        Some(Item::Folder(id)) => scan.folders[id]
+                            .modified
+                            .zip(current.modified)
+                            .is_some_and(|(scanned, observed)| scanned != observed),
+                        Some(Item::File(id)) => {
+                            scan.files[id].logical_bytes != current.bytes
+                                || scan.files[id].modified != current.modified
+                        }
+                    };
                 let bytes = if current.folder {
                     known.map(|item| item_bytes(scan, item))
                 } else {
@@ -169,6 +183,7 @@ impl LiveRows {
             })
             .collect();
         self.key = Some(key);
+        self.differs_from_scan = differs_from_scan;
         true
     }
 
@@ -198,10 +213,10 @@ pub(super) fn watch_status(ui: &mut egui::Ui, watch: &FolderWatch) {
         if let Some(error) = watch.error() {
             info.on_hover_text(error);
             ui.add(egui::Label::new(error).truncate());
-        } else {
-            let note = "용량 통계·전체 검색은 마지막 스캔 기준";
-            ui.add(egui::Label::new(egui::RichText::new(note).weak()).truncate())
-                .on_hover_text(note);
+        } else if watch.entries().is_some() {
+            info.on_hover_text(
+                "현재 폴더 목록만 갱신됩니다. 용량 통계와 전체 검색은 별도로 갱신됩니다.",
+            );
         }
     });
 }
@@ -452,6 +467,14 @@ impl DiskWeaveApp {
         {
             return false;
         }
+        if self.live_rows.differs_from_scan
+            && self
+                .list_only_generations
+                .insert(source.id, source.generation)
+                != Some(source.generation)
+        {
+            ui.ctx().request_repaint();
+        }
         self.search.headers(ui);
         if self.live_rows.rows.is_empty() {
             ui.weak("이 폴더는 비어 있습니다.");
@@ -678,6 +701,14 @@ impl DiskWeaveApp {
         {
             return None;
         }
+        if self.parked_live_rows.differs_from_scan
+            && self
+                .list_only_generations
+                .insert(source.id, source.generation)
+                != Some(source.generation)
+        {
+            ui.ctx().request_repaint();
+        }
         let label = super::folders::pane_path_label(ui, path, ui.available_width());
         ui.add(egui::Label::new(label).truncate())
             .on_hover_text(path.display().to_string());
@@ -804,6 +835,135 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn external_removal_marks_the_old_total_until_a_new_scan_is_published() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let removed = fixture.0.join("cleanup.bin");
+        fs::write(&removed, [0; 5]).unwrap();
+        fs::write(fixture.0.join("keep.bin"), [0; 7]).unwrap();
+        let mut app = analyze(&fixture.0);
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["cleanup.bin", "목록 자동 갱신"], &[]);
+        assert_summary(&app, &ctx, "12 B");
+        fs::remove_file(removed).unwrap();
+        observe(&mut app, &ctx, &["keep.bin"], &["cleanup.bin"]);
+        assert_summary(&app, &ctx, "12 B · 마지막 스캔 기준");
+        assert_drawn(&ctx, 208.0, "12 B · 마지막 스캔 기준", |ui| {
+            app.details(ui);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.map.output.is_none() {
+            app.refresh_derived();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_drawn(
+            &ctx,
+            760.0,
+            "전체 크기 12 B · 마지막 스캔 기준 · 2개 영역 · 0 B 0개 제외",
+            |ui| {
+                app.map_panel(ui);
+            },
+        );
+        app.scan.start(fixture.0.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_summary(&app, &ctx, "7 B");
+        assert_drawn(&ctx, 208.0, "7 B", |ui| app.details(ui));
+        fs::write(fixture.0.join("keep.bin"), [0; 2]).unwrap();
+        observe(&mut app, &ctx, &["keep.bin", "2 B"], &[]);
+        assert_summary(&app, &ctx, "7 B · 마지막 스캔 기준");
+    }
+
+    fn assert_summary(app: &DiskWeaveApp, ctx: &egui::Context, text: &str) {
+        assert_drawn(ctx, 760.0, text, |ui| app.summary(ui));
+    }
+
+    fn assert_drawn(
+        ctx: &egui::Context,
+        width: f32,
+        text: &str,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 500.0),
+            )),
+            ..Default::default()
+        };
+        let mut frame = ctx.run_ui(input, |ui| draw(ui));
+        frame.textures_delta.clear();
+        assert!(frame.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(label)
+            if label.galley.text() == text && shape.clip_rect.contains_rect(label.visual_bounding_rect()))),
+            "{text} 표시 필요");
+    }
+
+    #[test]
+    fn file_refresh_labels_only_its_location_and_replaces_the_total_on_success() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let touched = fixture.0.join("touched");
+        let untouched = fixture.0.join("untouched");
+        fs::create_dir(&touched).unwrap();
+        fs::create_dir(&untouched).unwrap();
+        let file = touched.join("cleanup.bin");
+        fs::write(&file, [0; 11]).unwrap();
+        fs::write(untouched.join("keep.bin"), [0; 3]).unwrap();
+        let mut app = analyze(&touched);
+        let touched_id = app.scan.selected_id().unwrap();
+        app.scan.start(untouched).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(Instant::now() < deadline);
+        }
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        fs::write(&file, [0; 8]).unwrap();
+        app.file_refresh
+            .begin(&app.scan, std::slice::from_ref(&file), None)
+            .unwrap();
+        assert_summary(&app, &ctx, "3 B");
+        app.select_registered_location(touched_id);
+        assert_summary(&app, &ctx, "11 B · 갱신 중 · 이전 값");
+        while app.file_refresh.busy() {
+            app.file_tick();
+            assert!(Instant::now() < deadline);
+        }
+        assert_summary(&app, &ctx, "8 B");
+
+        let offline = fixture.0.join("offline");
+        fs::rename(&touched, &offline).unwrap();
+        app.file_refresh
+            .begin(&app.scan, std::slice::from_ref(&file), None)
+            .unwrap();
+        while app.file_refresh.busy() {
+            app.file_tick();
+            assert!(Instant::now() < deadline);
+        }
+        assert!(!app.file_refresh.errors.is_empty());
+        assert_summary(&app, &ctx, "8 B · 갱신 필요");
+        fs::rename(&offline, touched).unwrap();
+        app.file_refresh
+            .begin(&app.scan, std::slice::from_ref(&file), None)
+            .unwrap();
+        while app.file_refresh.busy() {
+            app.file_tick();
+            assert!(Instant::now() < deadline);
+        }
+        assert_summary(&app, &ctx, "8 B");
+
+        fs::remove_file(&file).unwrap();
+        app.file_refresh.begin(&app.scan, &[file], None).unwrap();
+        app.file_refresh.cancel(&mut app.scan);
+        assert_summary(&app, &ctx, "8 B · 갱신 필요");
     }
 
     #[test]
