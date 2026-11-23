@@ -1,3 +1,5 @@
+mod parallel;
+
 use crate::{
     file_open::TargetKind,
     metadata::Identity,
@@ -181,116 +183,183 @@ fn search(
     sender: &SyncSender<Message>,
 ) -> io::Result<Coverage> {
     let cancelled = || cancel.load(Ordering::Relaxed);
-    let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
-    let roots = if let Some(root) = &input.folder {
-        let root = std::path::absolute(root)?;
-        vec![root]
-    } else {
-        fixed_roots()?
+    let roots = match &input.folder {
+        Some(root) => vec![std::path::absolute(root)?],
+        None => fixed_roots()?,
     };
     if roots.is_empty() {
         return Err(io::Error::other("검색할 로컬 고정 드라이브가 없습니다"));
     }
-    let needle = input.text.to_lowercase();
-    let mut coverage = Coverage::default();
+    let mut results = Results::new(sender);
     let mut scoped = Vec::with_capacity(roots.len());
-    for root in roots {
-        match directory::scoped_root(&root, &cancelled) {
-            Ok(expected) => scoped.push((root, expected)),
+    for path in roots {
+        match directory::scoped_root(&path, &cancelled) {
+            Ok(resolved) => scoped.push(SearchRoot { path, resolved }),
             Err(error) if error.kind() == io::ErrorKind::Interrupted || input.folder.is_some() => {
                 return Err(error)
             }
-            Err(error) => coverage.skip(&root, error),
+            Err(error) => results.coverage.skip(&path, error),
         }
     }
-    let mut pending: Vec<_> = scoped
-        .iter()
-        .enumerate()
-        .map(|(index, (root, _))| (root.clone(), index))
-        .collect();
-    let mut batch = Vec::with_capacity(64);
-    let mut sent = 0;
-    let mut emitted_at = Instant::now();
-    while let Some((folder, scope)) = pending.pop() {
-        crate::output::check(&cancelled)?;
-        let (root, resolved) = &scoped[scope];
-        let expected = resolved.join(folder.strip_prefix(root).map_err(io::Error::other)?);
-        let result = directory::collect_scoped(&folder, &expected, &cancelled, &mut |entries| {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err((path, error)) => {
-                        coverage.skip(&path, error);
-                        continue;
-                    }
-                };
-                if entry.attributes & 0x400 != 0 {
-                    coverage.skip(&entry.path, "특수 경로 제외");
-                    continue;
-                }
-                let folder = entry.attributes & 0x10 != 0;
-                if folder {
-                    pending.push((entry.path.clone(), scope));
-                }
-                if matches!(
-                    (input.kind, folder),
-                    (EntryKind::Files, true) | (EntryKind::Folders, false)
-                ) {
-                    continue;
-                }
-                let value = match input.mode {
-                    SearchMode::Name => entry.name.to_string_lossy(),
-                    SearchMode::Path => entry.path.to_string_lossy(),
-                };
-                if value.to_lowercase().contains(&needle) {
-                    if sent == MAX_HITS {
-                        coverage.limited = true;
-                        return Err(interrupted());
-                    }
-                    sent += 1;
-                    batch.push(Hit {
-                        path: entry.path,
-                        kind: if folder {
-                            TargetKind::Folder
-                        } else {
-                            TargetKind::File
-                        },
-                        bytes: (!folder).then_some(entry.logical_bytes),
-                        identity: entry.extra.identity.value().filter(|id| id.file != [0; 16]),
-                    });
-                }
+    let needle = input.text.to_lowercase();
+    if input.folder.is_none() {
+        parallel::walk(&scoped, &input, &needle, &cancelled, &mut results)?;
+    } else if let Some(root) = scoped.first() {
+        walk_folder(root, &input, &needle, &cancelled, &mut results)?;
+    }
+    results.finish()
+}
+
+fn interrupted() -> io::Error {
+    io::Error::from(io::ErrorKind::Interrupted)
+}
+
+struct SearchRoot {
+    path: PathBuf,
+    resolved: PathBuf,
+}
+
+impl SearchRoot {
+    fn expected(&self, folder: &Path) -> io::Result<PathBuf> {
+        let relative = folder.strip_prefix(&self.path).map_err(io::Error::other)?;
+        Ok(self.resolved.join(relative))
+    }
+}
+
+#[derive(Default)]
+struct Page {
+    folders: Vec<PathBuf>,
+    hits: Vec<Hit>,
+    coverage: Coverage,
+}
+
+fn match_page(input: &Input, needle: &str, entries: Vec<directory::Item>) -> Page {
+    let mut page = Page::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err((path, error)) => {
+                page.coverage.skip(&path, error);
+                continue;
             }
-            if !batch.is_empty()
-                && (sent == batch.len()
-                    || batch.len() >= 64
-                    || emitted_at.elapsed() >= Duration::from_millis(50))
-            {
-                sender
-                    .send(Message::Hits(std::mem::replace(
-                        &mut batch,
-                        Vec::with_capacity(64),
-                    )))
-                    .map_err(|_| interrupted())?;
-                emitted_at = Instant::now();
-            }
-            Ok(())
+        };
+        if entry.attributes & 0x400 != 0 {
+            page.coverage.skip(&entry.path, "특수 경로 제외");
+            continue;
+        }
+        let folder = entry.attributes & 0x10 != 0;
+        if folder {
+            page.folders.push(entry.path.clone());
+        }
+        if matches!(
+            (input.kind, folder),
+            (EntryKind::Files, true) | (EntryKind::Folders, false)
+        ) {
+            continue;
+        }
+        let value = match input.mode {
+            SearchMode::Name => entry.name.to_string_lossy(),
+            SearchMode::Path => entry.path.to_string_lossy(),
+        };
+        if value.to_lowercase().contains(needle) {
+            page.hits.push(Hit {
+                path: entry.path,
+                kind: if folder {
+                    TargetKind::Folder
+                } else {
+                    TargetKind::File
+                },
+                bytes: (!folder).then_some(entry.logical_bytes),
+                identity: entry.extra.identity.value().filter(|id| id.file != [0; 16]),
+            });
+        }
+    }
+    page
+}
+
+struct Results<'a> {
+    sender: &'a SyncSender<Message>,
+    batch: Vec<Hit>,
+    sent: usize,
+    emitted_at: Instant,
+    coverage: Coverage,
+}
+
+impl<'a> Results<'a> {
+    fn new(sender: &'a SyncSender<Message>) -> Self {
+        Self {
+            sender,
+            batch: Vec::with_capacity(64),
+            sent: 0,
+            emitted_at: Instant::now(),
+            coverage: Coverage::default(),
+        }
+    }
+
+    fn add_page(&mut self, hits: Vec<Hit>, coverage: Coverage) -> io::Result<()> {
+        self.coverage.skipped += coverage.skipped;
+        if self.coverage.first_issue.is_none() {
+            self.coverage.first_issue = coverage.first_issue;
+        }
+        let remaining = MAX_HITS - self.sent;
+        let accepted = remaining.min(hits.len());
+        self.coverage.limited = hits.len() > remaining;
+        self.sent += accepted;
+        self.batch.extend(hits.into_iter().take(accepted));
+        if !self.batch.is_empty()
+            && (self.sent == self.batch.len()
+                || self.batch.len() >= 64
+                || self.emitted_at.elapsed() >= Duration::from_millis(50))
+        {
+            self.sender
+                .send(Message::Hits(std::mem::replace(
+                    &mut self.batch,
+                    Vec::with_capacity(64),
+                )))
+                .map_err(|_| interrupted())?;
+            self.emitted_at = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<Coverage> {
+        if !self.batch.is_empty() {
+            self.sender
+                .send(Message::Hits(self.batch))
+                .map_err(|_| interrupted())?;
+        }
+        Ok(self.coverage)
+    }
+}
+
+fn walk_folder(
+    root: &SearchRoot,
+    input: &Input,
+    needle: &str,
+    cancelled: &impl Fn() -> bool,
+    results: &mut Results<'_>,
+) -> io::Result<()> {
+    let mut pending = vec![root.path.clone()];
+    while let Some(folder) = pending.pop() {
+        crate::output::check(cancelled)?;
+        let expected = root.expected(&folder)?;
+        let outcome = directory::collect_scoped(&folder, &expected, cancelled, &mut |entries| {
+            let page = match_page(input, needle, entries);
+            pending.extend(page.folders);
+            results.add_page(page.hits, page.coverage)?;
+            crate::output::check(&|| results.coverage.limited)
         });
-        if let Err(error) = result {
-            if coverage.limited {
-                break;
-            }
+        if results.coverage.limited {
+            break;
+        }
+        if let Err(error) = outcome {
             if error.kind() == io::ErrorKind::Interrupted {
                 return Err(error);
             }
-            coverage.skip(&folder, error);
+            results.coverage.skip(&folder, error);
         }
     }
-    if !batch.is_empty() {
-        sender
-            .send(Message::Hits(batch))
-            .map_err(|_| interrupted())?;
-    }
-    Ok(coverage)
+    Ok(())
 }
 
 #[cfg(test)]

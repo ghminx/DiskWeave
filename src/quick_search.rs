@@ -432,14 +432,25 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn folders_only_does_not_spend_its_limit_on_files_in_an_earlier_root() {
+    fn computer_search_applies_the_limit_only_to_the_requested_kind() {
         let owned = crate::duplicates::tests::Fixture::new();
         let earlier = owned.0.join("earlier");
         let later = owned.0.join("later");
         fs::create_dir(&earlier).unwrap();
         fs::create_dir_all(later.join("match-folder")).unwrap();
+        let parts: Vec<_> = (0..4)
+            .map(|part| {
+                let path = earlier.join(format!("part-{part}"));
+                fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect();
         for row in 0..10_001 {
-            fs::write(earlier.join(format!("match-{row:05}.txt")), []).unwrap();
+            fs::write(
+                parts[row % parts.len()].join(format!("match-{row:05}.txt")),
+                [],
+            )
+            .unwrap();
         }
         let locations = Locations::default();
         let mut quick = QuickSearch::default();
@@ -447,9 +458,9 @@ mod tests {
         quick.set_kind(EntryKind::Folders);
         quick.open();
         quick.text = "match".into();
-        quick
-            .start_live_using(move || Ok(vec![later, earlier]))
-            .unwrap();
+        let roots = vec![later, earlier];
+        let folder_roots = roots.clone();
+        quick.start_live_using(move || Ok(folder_roots)).unwrap();
         let until = Instant::now() + Duration::from_secs(30);
         while quick.pending() {
             quick.tick(&locations, Instant::now());
@@ -462,6 +473,41 @@ mod tests {
             quick.row(0).unwrap().path.file_name().unwrap(),
             "match-folder"
         );
+
+        quick.set_kind(EntryKind::Files);
+        let stop_roots = roots.clone();
+        quick.start_live_using(move || Ok(stop_roots)).unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while quick.pending() && quick.count() == 0 {
+            quick.tick(&locations, Instant::now());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(quick.pending());
+        let before_stop = quick.count();
+        assert!(before_stop > 0);
+        quick.live.stop();
+        while quick.pending() {
+            quick.tick(&locations, Instant::now());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(quick.count(), before_stop);
+        assert!(quick.live.error.is_none());
+
+        quick.start_live_using(move || Ok(roots)).unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while quick.pending() {
+            quick.tick(&locations, Instant::now());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(quick.live.error.is_none());
+        assert!(quick.live.coverage.limited);
+        assert_eq!(quick.count(), 10_000);
+        let paths: std::collections::HashSet<_> =
+            quick.live_hits().iter().map(|hit| &hit.path).collect();
+        assert_eq!(paths.len(), 10_000);
     }
     #[test]
     fn quick_search_uses_live_locations_and_rejects_changed_results() {
