@@ -59,9 +59,18 @@ pub struct Locations {
     selected: Option<u64>,
     active: Option<u64>,
     queue: VecDeque<u64>,
+    replacement: Option<(Location, Vec<u64>)>,
+    replacement_status: Option<ScanStatus>,
     changed: bool,
     pub epoch: u64,
     idle: ScanStatus,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct RootReplacement {
+    pub path: PathBuf,
+    pub overlaps: Vec<u64>,
+    identity: PathBuf,
 }
 
 #[link(name = "kernel32")]
@@ -256,7 +265,7 @@ impl Locations {
         self.parallelism = value;
         Ok(())
     }
-    pub fn add(&mut self, path: &Path) -> io::Result<u64> {
+    fn folder_identity(path: &Path) -> io::Result<PathBuf> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
             return Err(io::Error::new(
@@ -264,32 +273,47 @@ impl Locations {
                 "재분석 지점이 아닌 폴더를 등록하세요",
             ));
         }
-        let identity = std::fs::canonicalize(path)?;
+        std::fs::canonicalize(path)
+    }
+
+    pub fn add(&mut self, path: &Path) -> io::Result<u64> {
+        if self.replacing() {
+            return Err(io::Error::other(
+                "새 최상위 폴더 스캔이 끝난 뒤 위치를 등록하세요",
+            ));
+        }
+        let identity = Self::folder_identity(path)?;
         if self.overlapping(&identity)?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "이미 등록됐거나 상위·하위 위치가 겹칩니다",
             ));
         }
+        let location = self.new_location(std::path::absolute(path)?, identity)?;
+        let id = location.id;
+        self.entries.push(location);
+        self.epoch += 1;
+        if self.selected.is_none() {
+            self.selected = Some(id);
+            self.changed = true;
+        }
+        Ok(id)
+    }
+
+    fn new_location(&mut self, path: PathBuf, identity: PathBuf) -> io::Result<Location> {
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("등록 위치 ID 범위 초과"))?;
-        self.entries.push(Location {
+        Ok(Location {
             id: self.next_id,
-            path: std::path::absolute(path)?,
+            path,
             identity,
             scan: ScanController::default(),
             stale: false,
             enabled: true,
             generation: 0,
-        });
-        self.epoch += 1;
-        if self.selected.is_none() {
-            self.selected = Some(self.next_id);
-            self.changed = true;
-        }
-        Ok(self.next_id)
+        })
     }
     pub fn remove(&mut self, id: u64) -> io::Result<()> {
         if self.is_running() {
@@ -328,9 +352,13 @@ impl Locations {
         self.selected
     }
     pub fn active_path(&self) -> Option<&Path> {
-        self.active
-            .and_then(|id| self.get(id))
-            .map(|entry| entry.path.as_path())
+        self.active_location().map(|entry| entry.path.as_path())
+    }
+    fn active_location(&self) -> Option<&Location> {
+        self.replacement
+            .as_ref()
+            .map(|(location, _)| location)
+            .or_else(|| self.active.and_then(|id| self.get(id)))
     }
     pub fn choose(&mut self, id: u64) {
         if self.selected != Some(id) && self.get(id).is_some() {
@@ -368,6 +396,54 @@ impl Locations {
         Ok(id)
     }
 
+    pub fn plan_root_replacement(&self, path: &Path) -> io::Result<Option<RootReplacement>> {
+        let path = std::path::absolute(path)?;
+        let identity = Self::folder_identity(&path)?;
+        let mut overlaps = Vec::new();
+        for entry in &self.entries {
+            match (
+                contains_path(&entry.identity, &identity)?,
+                contains_path(&identity, &entry.identity)?,
+            ) {
+                (true, true) => return Ok(None),
+                (true, false) | (false, true) => overlaps.push(entry.id),
+                (false, false) => {}
+            }
+        }
+        Ok((!overlaps.is_empty()).then_some(RootReplacement {
+            path,
+            overlaps,
+            identity,
+        }))
+    }
+
+    pub fn start_root_replacement(&mut self, plan: RootReplacement) -> io::Result<()> {
+        if self.is_running() {
+            return Err(io::Error::other("이미 스캔 중입니다"));
+        }
+        if self.plan_root_replacement(&plan.path)?.as_ref() != Some(&plan) {
+            return Err(io::Error::other(
+                "분석 위치가 바뀌었습니다. 스캔을 다시 시작하세요.",
+            ));
+        }
+        let mut location = self.new_location(plan.path, plan.identity)?;
+        location
+            .scan
+            .configure_parallelism(self.parallelism)
+            .map_err(io::Error::other)?;
+        location
+            .scan
+            .start(location.path.clone())
+            .map_err(io::Error::other)?;
+        self.replacement_status = None;
+        self.replacement = Some((location, plan.overlaps));
+        Ok(())
+    }
+
+    pub fn replacing(&self) -> bool {
+        self.replacement.is_some()
+    }
+
     fn scan_location(&mut self, path: PathBuf) -> io::Result<u64> {
         if self.is_running() {
             return Err(io::Error::new(
@@ -401,6 +477,7 @@ impl Locations {
                 "등록 위치를 선택하세요",
             ));
         }
+        self.replacement_status = None;
         for id in ids {
             if !self.queue.contains(id) {
                 self.queue.push_back(*id);
@@ -432,6 +509,27 @@ impl Locations {
     }
     pub fn poll(&mut self) -> bool {
         let mut changed = std::mem::take(&mut self.changed);
+        if let Some((location, _)) = &mut self.replacement {
+            let completed = location.scan.poll();
+            if location.scan.is_running() {
+                return changed;
+            }
+            let (mut location, overlaps) =
+                self.replacement.take().expect("종료된 최상위 교체 스캔");
+            if completed {
+                self.entries.retain(|entry| !overlaps.contains(&entry.id));
+                location.generation = 1;
+                self.selected = Some(location.id);
+                self.entries.push(location);
+                self.epoch += 1;
+                return true;
+            }
+            self.replacement_status = Some(match location.scan.status() {
+                ScanStatus::Failed(error) => ScanStatus::Failed(error.clone()),
+                _ => ScanStatus::Cancelled,
+            });
+            return changed;
+        }
         if let Some(id) = self.active {
             let entry = self
                 .entries
@@ -457,6 +555,9 @@ impl Locations {
     }
     pub fn cancel(&mut self) {
         self.queue.clear();
+        if let Some((location, _)) = &mut self.replacement {
+            location.scan.cancel();
+        }
         if let Some(id) = self.active {
             self.entries
                 .iter_mut()
@@ -467,24 +568,24 @@ impl Locations {
         }
     }
     pub fn is_running(&self) -> bool {
-        self.active.is_some() || !self.queue.is_empty()
+        self.replacing() || self.active.is_some() || !self.queue.is_empty()
     }
     pub fn status(&self) -> &ScanStatus {
-        self.active
-            .or(self.selected)
-            .and_then(|id| self.get(id))
+        self.active_location()
             .map(|e| e.scan.status())
+            .or(self.replacement_status.as_ref())
+            .or_else(|| {
+                self.selected
+                    .and_then(|id| self.get(id))
+                    .map(|e| e.scan.status())
+            })
             .unwrap_or(&self.idle)
     }
     pub fn progress(&self) -> Option<ScanProgress> {
-        self.active
-            .and_then(|id| self.get(id))
-            .and_then(|e| e.scan.progress())
+        self.active_location().and_then(|e| e.scan.progress())
     }
     pub fn elapsed(&self) -> Option<Duration> {
-        self.active
-            .and_then(|id| self.get(id))
-            .and_then(|e| e.scan.elapsed())
+        self.active_location().and_then(|e| e.scan.elapsed())
     }
     pub fn completed(&self) -> Option<&CompletedScan> {
         self.selected
@@ -524,6 +625,119 @@ impl Locations {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_unreadable_new_root_cannot_replace_a_completed_scan() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let blocked = fixture.0.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("sample.bin"), [0; 9]).unwrap();
+        let mut locations = Locations::default();
+        let finish = |locations: &mut Locations| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while locations.is_running() {
+                locations.poll();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        locations.start(fixture.0.clone()).unwrap();
+        finish(&mut locations);
+        let old = Arc::clone(&locations.completed().unwrap().result);
+        let plan = locations.plan_root_replacement(&blocked).unwrap().unwrap();
+
+        struct RestoreListPermission(PathBuf, String);
+        impl Drop for RestoreListPermission {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.0)
+                    .args(["/remove:d", &self.1])
+                    .output();
+            }
+        }
+        let account = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        let _restore = RestoreListPermission(blocked.clone(), account.clone());
+        let denied = std::process::Command::new("icacls")
+            .arg(&blocked)
+            .arg("/deny")
+            .arg(format!("{account}:(RD)"))
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{denied:?}");
+
+        locations.start_root_replacement(plan).unwrap();
+        finish(&mut locations);
+        assert!(matches!(locations.status(), ScanStatus::Failed(_)));
+        assert!(Arc::ptr_eq(&old, &locations.completed().unwrap().result));
+    }
+
+    #[test]
+    fn parent_replacement_publishes_a_single_root_and_preserves_unrelated_results() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let parent = fixture.0.join("parent");
+        let first = parent.join("first");
+        let second = parent.join("second");
+        let outside = fixture.0.join("outside");
+        for (folder, size) in [(&first, 2), (&second, 3), (&outside, 11)] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("data.bin"), vec![0; size]).unwrap();
+        }
+        std::fs::write(parent.join("direct.bin"), [0; 7]).unwrap();
+
+        let mut locations = Locations::default();
+        let ids = [&first, &second, &outside].map(|folder| locations.add(folder).unwrap());
+        let finish = |locations: &mut Locations| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while locations.is_running() {
+                locations.poll();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        let totals = |locations: &Locations| -> u64 {
+            locations
+                .snapshots()
+                .iter()
+                .map(|item| item.scan.folders[0].logical_bytes)
+                .sum()
+        };
+        locations.start_selected(&ids).unwrap();
+        finish(&mut locations);
+        let unrelated = locations.completed_snapshot(ids[2]).unwrap();
+
+        let plan = locations.plan_root_replacement(&parent).unwrap().unwrap();
+        assert_eq!(plan.overlaps, [ids[0], ids[1]]);
+        locations.start_root_replacement(plan).unwrap();
+        assert_eq!(totals(&locations), 16);
+        locations.cancel();
+        finish(&mut locations);
+        assert!(matches!(locations.status(), ScanStatus::Cancelled));
+        assert_eq!(totals(&locations), 16);
+        assert_eq!(locations.selected_id(), Some(ids[0]));
+
+        let plan = locations.plan_root_replacement(&parent).unwrap().unwrap();
+        let moved = fixture.0.join("moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        assert!(locations.start_root_replacement(plan).is_err());
+        assert_eq!(totals(&locations), 16);
+        std::fs::rename(&moved, &parent).unwrap();
+
+        let plan = locations.plan_root_replacement(&parent).unwrap().unwrap();
+        locations.start_root_replacement(plan).unwrap();
+        finish(&mut locations);
+        assert_eq!(locations.completed().unwrap().path, parent);
+        assert_eq!(locations.snapshots().len(), 2);
+        assert_eq!(totals(&locations), 23);
+        assert!(Arc::ptr_eq(
+            &unrelated.scan,
+            &locations.completed_snapshot(ids[2]).unwrap().scan
+        ));
+    }
+
     #[test]
     fn preview_is_location_scoped_and_never_published_as_a_saved_or_searchable_result() {
         let root = std::env::temp_dir().join(format!(

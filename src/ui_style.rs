@@ -47,6 +47,25 @@ pub fn activity_indicator(ui: &mut Ui) -> Response {
     ui.add(egui::Spinner::new().size(14.0).color(ACCENT))
 }
 
+pub fn activity_bar(ui: &mut Ui) {
+    let size = egui::vec2(ui.available_width(), 4.0);
+    let (track, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let position = if ui.style().animation_time == 0.0 {
+        0.5
+    } else {
+        let cycle = (ui.input(|input| input.time) / 1.5).rem_euclid(2.0) as f32;
+        cycle.min(2.0 - cycle)
+    };
+    let width = track.width() * 0.18;
+    let left = track.left() + (track.width() - width) * position;
+    let segment = egui::Rect::from_min_size(
+        egui::pos2(left, track.top()),
+        egui::vec2(width, track.height()),
+    );
+    ui.painter().rect_filled(track, 2.0, LINE);
+    ui.painter().rect_filled(segment, 2.0, ACCENT);
+}
+
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();

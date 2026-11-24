@@ -83,6 +83,7 @@ pub struct DiskWeaveApp {
     statistics: AnalysisPanel,
     scan: Locations,
     target: TargetSelection,
+    root_replacement: Option<crate::locations::RootReplacement>,
     input_error: Option<String>,
     explorer: Option<Explorer>,
     file_open: OpenController,
@@ -648,6 +649,7 @@ impl DiskWeaveApp {
         self.archive_record.is_none()
             && !self.duplicates.running()
             && !self.scan.is_running()
+            && self.root_replacement.is_none()
             && !self.file_job.busy()
             && !self.file_refresh.busy()
             && self.file_ui.dialog.is_none()
@@ -1524,12 +1526,19 @@ impl DiskWeaveApp {
         self.input_error = self.file_open.start(request).err().map(|e| e.to_string());
     }
     fn sync_scan(&mut self) {
+        let replacing = self.scan.replacing();
+        let selected = self.scan.selected_id();
         let previous = if self.folder_tabs.len() > 1 || self.folder_tabs.is_split() {
             self.source()
         } else {
             None
         };
         if self.scan.poll() {
+            if replacing && self.scan.selected_id() != selected {
+                self.locations_view
+                    .choose_scope(&mut self.search, SearchScope::Folder);
+                self.tab = 0;
+            }
             if self.scan.selected_id().is_some() {
                 self.unavailable_pane = None;
             }
@@ -1574,12 +1583,81 @@ impl DiskWeaveApp {
             self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 스캔하세요".into());
             return;
         }
-        self.tracking.stop();
         let Some(path) = self.target.path().map(PathBuf::from) else {
             self.input_error = Some("분석할 폴더를 선택하세요".into());
             return;
         };
-        self.input_error = self.scan.start(path).err().map(|e| e.to_string());
+        self.input_error = match self.scan.start(path.clone()) {
+            Ok(()) => {
+                self.tracking.stop();
+                None
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match self.scan.plan_root_replacement(&path) {
+                    Ok(Some(plan)) => {
+                        self.root_replacement = Some(plan);
+                        None
+                    }
+                    Ok(None) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                }
+            }
+            Err(error) => Some(error.to_string()),
+        };
+    }
+
+    fn confirm_root_replacement(&mut self, ctx: &egui::Context) {
+        let Some(plan) = &self.root_replacement else {
+            return;
+        };
+        let dialog = egui::Modal::new(egui::Id::unique("replace_scan_root")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("새 최상위 폴더 스캔");
+            ui.add(egui::Label::new(plan.path.display().to_string()).wrap());
+            ui.add_space(8.0);
+            ui.label(format!(
+                "완료되면 겹치는 기존 분석 {}곳을 교체합니다.",
+                plan.overlaps.len()
+            ));
+            for path in plan
+                .overlaps
+                .iter()
+                .take(3)
+                .filter_map(|id| self.scan.get(*id))
+            {
+                ui.add(egui::Label::new(path.path.display().to_string()).truncate());
+            }
+            ui.small("취소하거나 실패하면 기존 분석을 유지합니다.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                (
+                    ui.button("취소").clicked(),
+                    ui.button("새 최상위로 스캔").clicked(),
+                )
+            })
+            .inner
+        });
+        let (cancel, start) = dialog.inner;
+        if cancel || dialog.should_close() {
+            self.root_replacement = None;
+        } else if start {
+            let plan = self
+                .root_replacement
+                .take()
+                .expect("사용자가 확인한 새 최상위 폴더");
+            if self.file_blocked() {
+                self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 스캔하세요".into());
+            } else {
+                self.input_error = self
+                    .scan
+                    .start_root_replacement(plan)
+                    .err()
+                    .map(|error| error.to_string());
+                if self.input_error.is_none() {
+                    self.tracking.stop();
+                }
+            }
+        }
     }
     fn accept_drop(&mut self, paths: Vec<PathBuf>) {
         self.input_error = if self.scan.is_running() {
@@ -1790,7 +1868,9 @@ impl DiskWeaveApp {
         if self.archive_record.is_some() {
             return;
         }
-        let popup = egui::Popup::is_any_open(ctx) || self.file_ui.dialog.is_some();
+        let popup = egui::Popup::is_any_open(ctx)
+            || self.file_ui.dialog.is_some()
+            || self.root_replacement.is_some();
         let editing = ctx.egui_wants_keyboard_input();
         let busy = self.scan.is_running() || self.file_blocked() || self.results.busy();
         let action = ctx.input_mut(|i| {
@@ -2413,6 +2493,10 @@ impl DiskWeaveApp {
     }
 
     fn summary(&self, ui: &mut egui::Ui) {
+        if self.scan.is_running() {
+            crate::ui_style::activity_bar(ui);
+            ui.add_space(2.0);
+        }
         let sources = if self.show_preview() {
             Vec::new()
         } else if self.locations_view.global_mode {
@@ -2470,7 +2554,11 @@ impl DiskWeaveApp {
             ui.spacing_mut().item_spacing.x = 22.0;
             ui.spacing_mut().interact_size.y = 22.0;
             ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
-            let state = if self.scan.is_running() {
+            let state = if matches!(self.scan.status(), ScanStatus::Cancelling) {
+                "취소 중"
+            } else if self.scan.replacing() {
+                "새 최상위 스캔 중 · 이전 결과"
+            } else if self.scan.is_running() {
                 "스캔 중"
             } else if stale {
                 "갱신 필요"
@@ -3705,7 +3793,10 @@ impl eframe::App for DiskWeaveApp {
             .frame(
                 egui::Frame::new()
                     .fill(bg())
-                    .inner_margin(egui::Margin::symmetric(14, 4)),
+                    .inner_margin(egui::Margin::symmetric(
+                        14,
+                        if self.scan.is_running() { 2 } else { 4 },
+                    )),
             )
             .show(ui, |ui| self.summary(ui));
         egui::Panel::bottom("status")
@@ -3951,6 +4042,7 @@ impl eframe::App for DiskWeaveApp {
             && !ui.ctx().egui_wants_keyboard_input()
             && !egui::Popup::is_any_open(ui.ctx())
             && self.file_ui.dialog.is_none()
+            && self.root_replacement.is_none()
             && !self.scan.is_running();
         if file_keys_enabled
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F2))
@@ -3963,6 +4055,7 @@ impl eframe::App for DiskWeaveApp {
             self.begin_file_action(crate::file_ui::Kind::Recycle, None);
         }
         self.file_ui.show(ui.ctx(), &mut self.file_job);
+        self.confirm_root_replacement(ui.ctx());
         if self.file_refresh.busy() || !self.file_refresh.errors.is_empty() {
             egui::Window::new("분석 목록 갱신")
                 .id(egui::Id::unique("file_refresh_status"))
@@ -4038,6 +4131,126 @@ mod session_tests {
         };
         draw(input(true));
         draw(input(false))
+    }
+
+    #[test]
+    fn starting_a_child_scan_offers_a_new_root_without_discarding_the_parent() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let child = fixture.0.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let mut app = DiskWeaveApp::new();
+        let finish = |app: &mut DiskWeaveApp| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.scan.is_running() {
+                app.sync_scan();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish(&mut app);
+        app.target.choose_folder(child.clone()).unwrap();
+        app.begin_scan();
+        assert!(app.input_error.is_none(), "{:?}", app.input_error);
+        assert_eq!(app.scan.snapshots()[0].scan.folders[0].path, fixture.0);
+        assert!(!app.scan.is_running());
+
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        let mut draw = |events| {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.confirm_root_replacement(ui.ctx()),
+            );
+            frame.textures_delta.clear();
+            frame
+        };
+        draw(Vec::new());
+        let frame = draw(Vec::new());
+        let button = visible_text(&frame, "새 최상위로 스캔").unwrap();
+        click_at(&mut draw, button.center());
+        assert!(app.scan.is_running());
+        assert_eq!(app.scan.snapshots()[0].scan.folders[0].path, fixture.0);
+        finish(&mut app);
+        assert_eq!(app.scan.snapshots().len(), 1);
+        assert_eq!(app.source().unwrap().scan.folders[0].path, child);
+    }
+
+    #[test]
+    fn scan_summary_shows_a_moving_bar_until_the_scan_finishes() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::write(fixture.0.join("sample.txt"), b"test").unwrap();
+        for width in [760.0, 1380.0] {
+            let ctx = egui::Context::default();
+            crate::ui_style::apply(&ctx);
+            let mut app = DiskWeaveApp::new();
+            let draw = |app: &DiskWeaveApp, time| {
+                let mut frame = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 500.0),
+                        )),
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ui| app.summary(ui),
+                );
+                frame.textures_delta.clear();
+                frame
+            };
+            let marker = |frame: &egui::FullOutput| {
+                frame.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == crate::ui_style::ACCENT
+                            && rect.rect.height() <= 5.0
+                            && rect.rect.width() > 20.0 =>
+                    {
+                        assert!(shape.clip_rect.contains_rect(rect.rect));
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+            };
+
+            assert!(marker(&draw(&app, 0.0)).is_none());
+            app.scan.start(fixture.0.clone()).unwrap();
+            let first = draw(&app, 0.25);
+            let first_bar = marker(&first).expect("스캔 중 가로 진행 막대");
+            assert!(first_bar.bottom() < visible_text(&first, "스캔 중").unwrap().top());
+            let second_bar = marker(&draw(&app, 0.75)).expect("계속 진행 중인 스캔");
+            assert!(second_bar.left() > first_bar.left());
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.scan.is_running() {
+                app.sync_scan();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let completed = draw(&app, 1.0);
+            assert!(visible_text(&completed, "분석 완료").is_some());
+            assert!(marker(&completed).is_none());
+
+            app.scan.start(fixture.0.clone()).unwrap();
+            app.scan.cancel();
+            let cancelling = draw(&app, 1.25);
+            assert!(visible_text(&cancelling, "취소 중").is_some());
+            assert!(marker(&cancelling).is_some());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.scan.is_running() {
+                app.sync_scan();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(marker(&draw(&app, 1.5)).is_none());
+        }
     }
 
     #[test]
