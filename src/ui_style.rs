@@ -1,5 +1,7 @@
 use eframe::egui::{self, Color32, Response, Ui};
 
+mod file_icons;
+
 pub const BG: Color32 = Color32::from_rgb(12, 17, 24);
 pub const SURFACE: Color32 = Color32::from_rgb(18, 26, 36);
 pub const SIDEBAR: Color32 = Color32::from_rgb(16, 24, 34);
@@ -240,9 +242,15 @@ pub fn icon(ui: &Ui, rect: egui::Rect, folder: bool) {
     ));
 }
 
+pub fn entry_icon(ui: &Ui, rect: egui::Rect, name: &str, folder: bool) {
+    if folder || !file_icons::paint(ui, rect.left_center(), name) {
+        icon(ui, rect, folder);
+    }
+}
+
 pub fn name_cell(ui: &mut Ui, width: f32, name: &str, folder: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW), egui::Sense::hover());
-    icon(ui, rect.shrink2(egui::vec2(12.0, 0.0)), folder);
+    entry_icon(ui, rect.shrink2(egui::vec2(12.0, 0.0)), name, folder);
     text(
         ui,
         egui::Rect::from_min_max(
@@ -633,6 +641,45 @@ mod tests {
             });
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn file_icons_distinguish_known_types_and_keep_a_generic_fallback() {
+        let render = |name, folder| {
+            let ctx = egui::Context::default();
+            apply(&ctx);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                name_cell(ui, 220.0, name, folder);
+            });
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .map(|shape| shape.shape)
+                .filter(|shape| !matches!(shape, egui::Shape::Text(_)))
+                .collect::<Vec<_>>()
+        };
+        let generic = render("파일.unknown", false);
+        assert_eq!(generic, render("LICENSE", false));
+        assert_eq!(generic, render("메모.txt", false));
+        assert_eq!(render("파일.PDF", false), render("파일.pdf", false));
+        assert_eq!(render("파일.pdf", true), render("폴더", true));
+        let mut kinds = vec![generic, render("폴더", true)];
+        for name in [
+            "보고서.docx",
+            "보고서.pdf",
+            "표.csv",
+            "발표.pptx",
+            "사진.psd",
+            "영상.mp4",
+            "음성.m4a",
+            "묶음.7z",
+            "설정.json",
+        ] {
+            let icon = render(name, false);
+            assert!(!kinds.contains(&icon), "{name}: 기존 유형과 아이콘이 같음");
+            kinds.push(icon);
+        }
     }
 
     #[test]

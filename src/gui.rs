@@ -2373,7 +2373,7 @@ impl DiskWeaveApp {
             !self.scan.is_running() && !self.file_blocked() && self.archive_record.is_none(),
             |ui| {
                 egui::ComboBox::from_id_salt("scan_parallelism")
-                    .selected_text(format!("스캔 동시 작업: {}", parallelism.label()))
+                    .selected_text(parallelism.label())
                     .show_ui(ui, |ui| {
                         for choice in [
                             crate::scanner::Parallelism::Auto,
@@ -2394,7 +2394,6 @@ impl DiskWeaveApp {
                 .err()
                 .map(|e| e.to_string());
         }
-        ui.small("자동은 최대 8개 작업을 사용합니다.");
     }
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let editable = !self.scan.is_running() && !self.file_blocked();
@@ -4538,6 +4537,7 @@ mod session_tests {
                     egui::Panel::top("brand").exact_size(36.0).show(ui, |ui| {
                         app.header(ui, width >= 1050.0);
                     });
+                    app.settings_window(ui.ctx());
                 });
                 frame.textures_delta.clear();
                 frame
@@ -4549,6 +4549,15 @@ mod session_tests {
                 "{button:?}, 창 너비 {width}, 배율 {scale}"
             );
             assert!(visible_text(&frame, "빠른 검색 · 별도 창").is_none());
+            click_at(&mut draw, button.center());
+            let frame = draw(Vec::new());
+            let name = visible_text(&frame, "스캔 동시 작업").unwrap();
+            let value = visible_text(&frame, "자동").unwrap();
+            let shortcut = visible_text(&frame, "검색 단축키").unwrap();
+            let change = visible_text(&frame, "변경").unwrap();
+            assert!(name.right() < value.left() && shortcut.right() < change.left());
+            assert!((name.left() - shortcut.left()).abs() <= 2.0);
+            assert!(visible_text(&frame, "닫기").is_some());
         }
     }
 
@@ -4596,6 +4605,13 @@ mod session_tests {
             assert!(visible_text(&frame, label).is_some(), "{label}");
         }
         assert!(visible_text(&frame, "일반·표시").is_none());
+        let parallelism =
+            visible_text(&frame, "스캔 동시 작업").expect("드롭다운 왼쪽의 설정 이름");
+        let automatic = visible_text(&frame, "자동").expect("드롭다운의 현재 값");
+        let shortcut = visible_text(&frame, "검색 단축키").unwrap();
+        let change = visible_text(&frame, "변경").unwrap();
+        assert!(parallelism.right() < automatic.left());
+        assert!(shortcut.right() + 40.0 < change.left());
         let toggle = visible_text(&frame, "보고 있는 폴더 자동 갱신").unwrap();
         click_at(&mut draw, toggle.center());
         let close = visible_text(&draw(Vec::new()), "닫기").expect("설정 닫기");
@@ -4611,6 +4627,23 @@ mod session_tests {
         let mut restored = DiskWeaveApp::new();
         restored.apply_ui_settings(crate::app_settings::load(&path).unwrap().ui);
         assert!(restored.folder_refresh_disabled);
+        app.open_settings(&ctx);
+        let mut draw = |events| frame_for(&mut app, events);
+        draw(Vec::new());
+        let frame = draw(Vec::new());
+        let toggle = visible_text(&frame, "보고 있는 폴더 자동 갱신").unwrap();
+        click_at(&mut draw, toggle.center());
+        draw(vec![egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            app.folder_refresh_disabled,
+            "포커스된 토글은 Space로 변경 가능"
+        );
         app.quick.open();
         app.apply_search_action(
             &ctx,
@@ -4702,7 +4735,7 @@ mod session_tests {
         let fixture = crate::duplicates::tests::Fixture::new();
         let child = fixture.0.join("child");
         std::fs::create_dir(&child).unwrap();
-        std::fs::write(child.join("sample.txt"), b"test").unwrap();
+        std::fs::write(child.join("sample.pdf"), b"test").unwrap();
         let mut app = DiskWeaveApp::new();
         app.folder_refresh_disabled = true;
         assert_eq!(app.details_title(), "상세 정보");
@@ -4737,12 +4770,24 @@ mod session_tests {
             )),
             ..Default::default()
         };
+        let wait_for_rows = |app: &mut DiskWeaveApp| {
+            app.refresh_derived();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.search.job.results().is_none() {
+                app.search.poll();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
         for scope in [
             crate::search_view::SearchScope::Folder,
             crate::search_view::SearchScope::Location,
             crate::search_view::SearchScope::Registered,
         ] {
             app.locations_view.choose_scope(&mut app.search, scope);
+            if scope == crate::search_view::SearchScope::Folder {
+                wait_for_rows(&mut app);
+            }
             let mut frame = ctx.run_ui(raw.clone(), |ui| app.center(ui));
             frame.textures_delta.clear();
             let search = visible_text(&frame, "파일·폴더 이름 검색").expect("목록 검색 입력");
@@ -4757,7 +4802,21 @@ mod session_tests {
                 assert!(ratio.right() < date.left());
                 assert!(search.bottom() < date.top());
             }
+            if scope == crate::search_view::SearchScope::Folder {
+                let file = visible_text(&frame, "sample.pdf").expect("폴더 목록의 파일 행");
+                let icon = visible_text(&frame, "PDF").expect("폴더 목록의 PDF 아이콘");
+                assert!(icon.right() < file.left());
+                assert!((icon.center().y - file.center().y).abs() <= 3.0);
+            }
         }
+        app.locations_view
+            .choose_scope(&mut app.search, crate::search_view::SearchScope::Folder);
+        app.search.input.text = "sample".into();
+        wait_for_rows(&mut app);
+        let mut frame = ctx.run_ui(raw, |ui| app.center(ui));
+        frame.textures_delta.clear();
+        let icon = visible_text(&frame, "PDF").expect("검색 결과의 PDF 아이콘");
+        assert!(icon.right() < visible_text(&frame, "sample.pdf").unwrap().left());
     }
 
     #[test]

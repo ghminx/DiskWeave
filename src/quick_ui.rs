@@ -396,7 +396,7 @@ impl QuickUi {
                     egui::pos2(rect.left() + 18.0, rect.center().y),
                     egui::vec2(18.0, 18.0),
                 );
-                crate::ui_style::icon(ui, icon_rect, folder);
+                crate::ui_style::entry_icon(ui, icon_rect, &name, folder);
                 crate::ui_style::text(ui, name_rect, &name, false, crate::ui_style::TEXT, 15.0);
                 crate::ui_style::text(
                     ui,
@@ -872,7 +872,7 @@ mod tests {
     fn folder_search_accepts_explorer_drop_without_focus_and_renders_at_minimum_width() {
         let path = std::env::temp_dir().join(format!("diskweave-quick-ui-{}", std::process::id()));
         fs::create_dir_all(path.join("sample-folder")).unwrap();
-        fs::write(path.join("sample.txt"), b"example").unwrap();
+        fs::write(path.join("sample.pdf"), b"example").unwrap();
         let ctx = egui::Context::default();
         ctx.set_embed_viewports(true);
         crate::ui_style::apply(&ctx);
@@ -930,7 +930,8 @@ mod tests {
             })
             .collect();
         for label in [
-            "sample.txt",
+            "sample.pdf",
+            "PDF",
             "sample-folder",
             "검색 완료 · 2건",
             "전체 경로",
@@ -951,6 +952,7 @@ mod tests {
                 .expect("검색 상태와 결과 머리글 필요")
         };
         assert!(label_y("검색 완료 · 2건") < label_y("전체 경로"));
+        assert!((label_y("PDF") - label_y("sample.pdf")).abs() <= 12.0);
         quick.step(1);
         let hit = quick.selected_hit(&locations).unwrap();
         let Action::Open(request) = result_action(&quick, &locations, RowAction::Open).unwrap()
