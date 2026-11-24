@@ -5,17 +5,3 @@
 *.dwsnap
 DiskWeave.csv
 DiskWeave.json
-
-/IMPLEMENTED_FEATURES.md
-
-# 폐기된 설계 기록과 이전 디자인 시안의 로컬 보관
-/docs/automatic-scan-selection.md
-/docs/index.md
-/docs/ui/README.md
-/docs/ui/integrated-comparison.html
-/docs/ui/integrated-previews/
-/docs/ui/integrated-ui-plan.md
-/docs/ui/integrated-ui.html
-/docs/ui/main-screen.html
-/docs/ui/treemap-layout.html
-/assets/brand/concepts/

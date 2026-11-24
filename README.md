@@ -40,7 +40,7 @@
 
 ## Preview Notes
 
-v0.1.3은 개발 PC에서 ZIP을 풀어 실행과 재시작을 확인한 프리뷰입니다. 다른 Windows PC에서의 실행은 아직 확인하지 않았습니다. 실행 파일은 미서명 상태이며, Windows 11의 Smart App Control 설정에 따라 실행이 차단될 수 있습니다. [v0.1.3 릴리스 노트](docs/releases/v0.1.3.md)
+v0.1.3은 개발 PC에서 ZIP을 풀어 실행과 재시작을 확인한 프리뷰입니다. 다른 Windows PC에서의 실행은 아직 확인하지 않았습니다. 실행 파일은 미서명 상태이며, Windows 11의 Smart App Control 설정에 따라 실행이 차단될 수 있습니다. [v0.1.3 릴리스 노트](https://github.com/ghminx/DiskWeave/releases/tag/v0.1.3)
 
 ## Build from Source
 
@@ -57,7 +57,7 @@ cargo run --release -- "D:\Workspace" --find "Video"
 pwsh -NoProfile -File tools/Build-Portable.ps1
 ~~~
 
-[프로젝트 사양](PROJECT_SPEC.md) · [코드 구조](docs/architecture.md) · [빌드 및 배포 검증](docs/usability-release.md)
+[코드 구조와 테스트 안내](docs/architecture.md)
 
 ## License
 
