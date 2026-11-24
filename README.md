@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.2/DiskWeave-0.1.2-windows-x64-preview.zip"><strong>Windows x64 다운로드</strong></a>
+  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.3/DiskWeave-0.1.3-windows-x64-preview.zip"><strong>Windows x64 다운로드</strong></a>
   · <a href="#시작하기">시작하기</a>
   · <a href="docs/portable-readme.md">사용 안내</a>
-  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.2">v0.1.2 프리뷰</a>
+  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.3">v0.1.3 프리뷰</a>
 </p>
 
 <p align="center"><sub>Windows 10/11 x64 · 설치 없이 실행하는 Portable ZIP</sub></p>
@@ -24,7 +24,7 @@
 ## 시작하기
 
 1. **Windows x64 다운로드**에서 받은 ZIP을 원하는 폴더에 압축 해제. 다운로드에는 저장소 읽기 권한이 필요함.
-2. `DiskWeave.exe`를 실행하고 드라이브나 폴더를 선택한 뒤 **스캔 시작**.
+2. `DiskWeave.exe`를 실행하고 드라이브나 폴더를 선택한 뒤 **스캔 시작**. 진행 막대 아래에서 확인한 파일·폴더 수와 경과 시간을 볼 수 있음.
 3. **폴더 탐색**과 **공간 지도**에서 용량이 큰 폴더를 확인. 현재 분석 범위 밖의 파일은 **빠른 검색**의 **폴더 지정** 또는 **내 PC 전체**에서 이름이나 경로로 검색 가능함.
 
 ## 이렇게 활용할 수 있음
