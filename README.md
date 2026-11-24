@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.1/DiskWeave-0.1.1-windows-x64-preview.zip"><strong>Windows x64 다운로드</strong></a>
+  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.2/DiskWeave-0.1.2-windows-x64-preview.zip"><strong>Windows x64 다운로드</strong></a>
   · <a href="#시작하기">시작하기</a>
   · <a href="docs/portable-readme.md">사용 안내</a>
-  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.1">v0.1.1 프리뷰</a>
+  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.2">v0.1.2 프리뷰</a>
 </p>
 
 <p align="center"><sub>Windows 10/11 x64 · 설치 없이 실행하는 Portable ZIP</sub></p>
@@ -36,12 +36,11 @@
 | **복사본이 쌓였을 때** | 파일 내용을 대조해 중복 그룹을 찾고, 같은 파일을 가리키는 하드 링크는 별도로 확인함. |
 | **정리 전후를 비교할 때** | 파일·폴더 목록을 CSV로 내보내거나 두 시점에 저장한 분석 스냅샷을 비교해 추가·삭제 항목과 용량 변화를 확인함. |
 
-일반 스캔은 관리자 권한 없이 가능하며, 파일 변경 작업은 사용자 확인 후 수행함. 로컬 NTFS 드라이브 또는 지정 폴더의 변경을 추적하는 **NTFS 실시간 갱신**은 별도로 켤 수 있으며 Windows 관리자 승인이 필요함.
+일반 스캔과 **보고 있는 폴더 자동 갱신**은 관리자 권한 없이 이용 가능함. 하위 폴더로 이동하면 해당 폴더의 바로 아래 목록을 다시 확인하며, 외부 파일 변경에 대한 전체 검색과 용량 통계는 마지막 스캔 기준으로 표시함. 파일 변경 작업은 사용자 확인 후 수행함.
 
 ## 프리뷰에서 확인한 범위
 
 - ZIP을 별도 폴더에 풀어 개발 PC에서 GUI 및 CLI 실행을 확인함. 다른 Windows PC에서의 실행은 검증 예정임.
-- 이전 프리뷰에서 C드라이브 전체 NTFS 실시간 갱신의 **첫 목록 표시**에 약 11분 소요됨. 첫 목록 표시 뒤 시험 파일 생성·수정·삭제는 각각 약 1초에 반영됨. 2026-11-24 갱신본의 전체 드라이브 재시험은 미수행 상태임. [실측 기록](docs/usn.md#최신-코드-검토-후-전체-c드라이브-gui-대조)
 - 이전 프리뷰는 Smart App Control을 켠 개발 PC에서 실행을 확인함. 미서명 프리뷰이므로 다른 환경에서는 Windows의 평판 판정에 따라 실행이 차단될 수 있음. [v0.1.1 릴리스 노트](docs/releases/v0.1.1.md)
 
 ## 소스에서 실행
