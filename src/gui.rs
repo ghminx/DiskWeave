@@ -4515,14 +4515,18 @@ mod session_tests {
 
     #[test]
     fn settings_are_at_top_right_at_supported_scales() {
-        for (width, scale) in [(760.0, 1.0), (760.0, 2.0), (1380.0, 1.5)] {
+        for (width, height, scale) in [
+            (760.0, 500.0, 1.0),
+            (760.0, 500.0, 2.0),
+            (1380.0, 880.0, 1.5),
+        ] {
             let ctx = egui::Context::default();
             crate::ui_style::apply(&ctx);
             let mut app = DiskWeaveApp::new();
             let mut raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(width, 500.0),
+                    egui::vec2(width, height),
                 )),
                 ..Default::default()
             };
@@ -4558,6 +4562,18 @@ mod session_tests {
             assert!(name.right() < value.left() && shortcut.right() < change.left());
             assert!((name.left() - shortcut.left()).abs() <= 2.0);
             assert!(visible_text(&frame, "닫기").is_some());
+            let stay = visible_text(&frame, "창을 닫아도 백그라운드에서 실행").unwrap();
+            let apply = visible_text(&frame, "검색 설정 적용").unwrap();
+            let help = visible_text(&frame, "도움말").unwrap();
+            assert!(
+                (0.0..=48.0).contains(&(apply.top() - stay.bottom())),
+                "토글과 적용 버튼 사이 여백: {stay:?} {apply:?}"
+            );
+            assert!(
+                (0.0..=48.0).contains(&(help.top() - apply.bottom())),
+                "적용 버튼과 도움말 사이 여백: {apply:?} {help:?}"
+            );
+            assert!(visible_text(&frame, "자동은 최대 8개 작업을 사용합니다.").is_none());
         }
     }
 

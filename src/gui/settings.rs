@@ -166,7 +166,6 @@ impl DiskWeaveApp {
                             self.folder_refresh_disabled = !refresh;
                         }
                         setting_row(ui, "스캔 동시 작업", |ui| self.scan_settings(ui));
-                        ui.small("자동은 최대 8개 작업을 사용합니다.");
                         ui.separator();
                         ui.label(
                             egui::RichText::new("검색 및 단축키")
@@ -188,7 +187,8 @@ impl DiskWeaveApp {
                             let changed = draft.preferences != self.desktop.applied
                                 || draft.key != self.desktop.applied.shortcut.key_name();
                             let apply = ui
-                                .with_layout(
+                                .allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.add_enabled(changed, egui::Button::new("검색 설정 적용"))
@@ -251,9 +251,11 @@ impl DiskWeaveApp {
                     });
                 ui.separator();
                 let close_from_footer = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.button("닫기").clicked()
-                    })
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| ui.button("닫기").clicked(),
+                    )
                     .inner;
                 close_from_title || close_from_footer
             });
