@@ -17,6 +17,12 @@ pub struct Location {
     pub enabled: bool,
     pub generation: u64,
 }
+
+impl Location {
+    pub fn relative_folder<'a>(&self, canonical: &'a Path) -> io::Result<Option<&'a Path>> {
+        relative_folder(&self.identity, canonical)
+    }
+}
 #[derive(Clone)]
 pub struct Snapshot {
     pub entries: Option<Arc<crate::usn::entries::Projection>>,
@@ -89,6 +95,20 @@ pub(crate) fn contains_path(parent: &Path, child: &Path) -> io::Result<bool> {
         }
     }
     Ok(true)
+}
+
+pub(crate) fn relative_folder<'a>(root: &Path, folder: &'a Path) -> io::Result<Option<&'a Path>> {
+    if let Ok(relative) = folder.strip_prefix(root) {
+        return Ok(Some(relative));
+    }
+    if !contains_path(root, folder)? {
+        return Ok(None);
+    }
+    let mut components = folder.components();
+    for _ in root.components() {
+        components.next();
+    }
+    Ok(Some(components.as_path()))
 }
 
 impl Locations {
@@ -245,15 +265,11 @@ impl Locations {
             ));
         }
         let identity = std::fs::canonicalize(path)?;
-        for entry in &self.entries {
-            if contains_path(&entry.identity, &identity)?
-                || contains_path(&identity, &entry.identity)?
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "이미 등록됐거나 상위·하위 위치가 겹칩니다",
-                ));
-            }
+        if self.overlapping(&identity)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "이미 등록됐거나 상위·하위 위치가 겹칩니다",
+            ));
         }
         self.next_id = self
             .next_id
@@ -297,6 +313,16 @@ impl Locations {
     }
     pub fn get(&self, id: u64) -> Option<&Location> {
         self.entries.iter().find(|e| e.id == id)
+    }
+    pub fn overlapping(&self, canonical: &Path) -> io::Result<Option<&Location>> {
+        for entry in &self.entries {
+            if contains_path(&entry.identity, canonical)?
+                || contains_path(canonical, &entry.identity)?
+            {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
     pub fn selected_id(&self) -> Option<u64> {
         self.selected

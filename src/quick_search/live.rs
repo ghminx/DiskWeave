@@ -60,6 +60,7 @@ enum Message {
 struct Worker {
     messages: Receiver<Message>,
     cancel: Arc<AtomicBool>,
+    recycled: Vec<PathBuf>,
 }
 
 impl Drop for Worker {
@@ -84,8 +85,12 @@ impl LiveSearch {
     }
 
     pub fn remove_recycled(&mut self, path: &Path) -> bool {
+        let path = crate::file_ops::comparable_path(path).unwrap_or_else(|_| path.to_owned());
         let before = self.hits.len();
-        self.hits.retain(|hit| !hit.path.starts_with(path));
+        retain_unrecycled(&mut self.hits, std::slice::from_ref(&path));
+        if let Some(worker) = self.worker.as_mut().filter(|_| !self.stopped) {
+            worker.recycled.push(path);
+        }
         before != self.hits.len()
     }
 
@@ -110,7 +115,11 @@ impl LiveSearch {
         });
         *self = Self {
             input: Some(input),
-            worker: Some(Worker { messages, cancel }),
+            worker: Some(Worker {
+                messages,
+                cancel,
+                recycled: Vec::new(),
+            }),
             ..Self::default()
         };
         Ok(())
@@ -137,6 +146,7 @@ impl LiveSearch {
             match worker.messages.try_recv() {
                 Ok(Message::Hits(mut hits)) => {
                     if !self.stopped {
+                        retain_unrecycled(&mut hits, &worker.recycled);
                         self.hits.append(&mut hits);
                     }
                 }
@@ -161,6 +171,24 @@ impl LiveSearch {
             }
         }
     }
+}
+
+fn retain_unrecycled(hits: &mut Vec<Hit>, roots: &[PathBuf]) {
+    if roots.is_empty() {
+        return;
+    }
+    hits.retain(|hit| {
+        let normalized;
+        let path = if matches!(hit.path.components().next(),
+            Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+        {
+            normalized = crate::file_ops::comparable_path(&hit.path);
+            normalized.as_deref().unwrap_or(&hit.path)
+        } else {
+            &hit.path
+        };
+        !roots.iter().any(|root| path.starts_with(root))
+    });
 }
 
 pub fn check_root(path: &Path) -> io::Result<()> {
@@ -364,8 +392,8 @@ fn walk_folder(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::scanner::directory::{collect_scoped, scoped_root};
-    use std::fs;
 
     #[test]
     fn scoped_enumeration_rejects_a_handle_to_a_different_directory() {
@@ -436,5 +464,36 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("검색 범위"));
         assert!(root_result.is_err());
         assert!(!emitted);
+    }
+    #[test]
+    fn late_recycled_path_stays_removed() {
+        let deleted = PathBuf::from(r"C:\test-only\removed");
+        let keep = PathBuf::from(r"C:\test-only\keep.bin");
+        let hit = |path| Hit {
+            path,
+            kind: TargetKind::File,
+            bytes: Some(1),
+            identity: None,
+        };
+        let (sender, messages) = mpsc::sync_channel(8);
+        let mut search = LiveSearch {
+            hits: vec![hit(deleted.join("first.bin"))],
+            worker: Some(Worker {
+                messages,
+                cancel: Arc::new(AtomicBool::new(false)),
+                recycled: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(search.remove_recycled(&deleted));
+        sender
+            .send(Message::Hits(vec![
+                hit(PathBuf::from(r"\\?\C:\test-only\removed\late.bin")),
+                hit(keep.clone()),
+            ]))
+            .unwrap();
+        search.poll();
+        let paths: Vec<_> = search.hits.into_iter().map(|hit| hit.path).collect();
+        assert_eq!(paths, vec![keep]);
     }
 }

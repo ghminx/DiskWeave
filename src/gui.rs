@@ -59,7 +59,6 @@ pub struct DiskWeaveApp {
     visible_watches: crate::visible_watch::VisibleWatches,
     live_rows: folder_updates::LiveRows,
     parked_live_rows: folder_updates::LiveRows,
-    list_only_generations: std::collections::HashMap<u64, u64>,
     folder_tabs: FolderTabs,
     unavailable_pane: Option<crate::navigation::ViewState>,
     other_rows: crate::workspace::pane_rows::PaneRows,
@@ -1378,7 +1377,7 @@ impl DiskWeaveApp {
                     }
                     crate::quick_ui::Action::Apply(p) => self.desktop.apply(ctx, p)?,
                     crate::quick_ui::Action::Analyze((id, generation, item)) => {
-                        self.open_quick_analysis(ctx, (id, generation, item));
+                        self.open_quick_analysis(ctx, (id, generation, item))?;
                     }
                     crate::quick_ui::Action::AnalyzePath(hit) => {
                         self.analyze_quick_path(ctx, hit)?
@@ -1414,35 +1413,68 @@ impl DiskWeaveApp {
             }
         }
     }
-    fn open_quick_analysis(&mut self, ctx: &egui::Context, (id, generation, item): Target) {
-        self.quick_ui.error = None;
-        self.input_error = None;
+    fn check_analysis_documents(&self) -> std::io::Result<()> {
+        if self.results.busy()
+            || self
+                .saved_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.results.busy())
+        {
+            return Err(std::io::Error::other(
+                "문서 작업이 끝난 뒤 분석을 열어 주세요",
+            ));
+        }
+        Ok(())
+    }
+
+    fn select_quick_analysis(&mut self, (id, generation, item): Target) -> std::io::Result<()> {
+        self.check_analysis_documents()?;
+        self.try_analyze_at(id, generation, item)?;
         if let Some(entry) = self.scan.get(id) {
             self.target.choose_registered(entry.path.clone());
         }
         self.results.job.back();
         self.saved_viewer = None;
-        self.analyze_at(id, generation, item);
+        self.input_error = None;
+        Ok(())
+    }
+
+    fn open_quick_analysis(&mut self, ctx: &egui::Context, target: Target) -> std::io::Result<()> {
+        self.select_quick_analysis(target)?;
+        self.quick_ui.error = None;
         self.show_main(ctx);
         self.quick.leave_for_analysis();
+        Ok(())
     }
     fn analyze_quick_path(
         &mut self,
         ctx: &egui::Context,
         hit: crate::quick_search::Hit,
     ) -> std::io::Result<()> {
-        hit.verify_for_analysis()?;
-        let target = self.scan.snapshots().into_iter().find_map(|source| {
-            let item = hit.analysis_item(&source.scan)?;
-            Some((source.id, source.generation, item))
-        });
-        if let Some(target) = target {
-            self.open_quick_analysis(ctx, target);
-        } else {
-            self.quick_ui.error = None;
-            self.quick_ui.confirm_folder_scan(hit);
-            ctx.request_repaint();
+        let verified = hit.verify_for_analysis()?;
+        let folder = std::fs::canonicalize(hit.analysis_folder().expect("확인한 분석 폴더"))?;
+        if let Some(entry) = self.scan.overlapping(&folder)? {
+            let relative = entry.relative_folder(&folder)?;
+            if let (Some(relative), Some(completed)) =
+                (relative, entry.scan.completed().filter(|_| !entry.stale))
+            {
+                if let Some(item) =
+                    hit.analysis_item_at(&completed.result, relative, verified.created().ok())
+                {
+                    return self.open_quick_analysis(ctx, (entry.id, entry.generation, item));
+                }
+            }
+            if !relative.is_some_and(|path| path.as_os_str().is_empty())
+                || entry.scan.completed().is_some()
+            {
+                return Err(std::io::Error::other(
+                    "기존 분석 위치와 범위가 겹칩니다. 기존 위치를 다시 스캔하거나 위치 관리를 확인하세요",
+                ));
+            }
         }
+        self.quick_ui.error = None;
+        self.quick_ui.confirm_folder_scan(hit);
+        ctx.request_repaint();
         Ok(())
     }
     fn scan_quick_folder(
@@ -1455,11 +1487,23 @@ impl DiskWeaveApp {
                 "스캔·파일 작업·실시간 갱신이 끝난 뒤 분석을 시작하세요",
             ));
         }
+        self.check_analysis_documents()?;
         hit.verify_for_analysis()?;
         let path = hit
             .analysis_folder()
             .expect("확인한 분석 폴더")
             .to_path_buf();
+        let canonical = std::fs::canonicalize(&path)?;
+        let path = match self.scan.overlapping(&canonical)? {
+            Some(entry)
+                if entry
+                    .relative_folder(&canonical)?
+                    .is_some_and(|path| path.as_os_str().is_empty()) =>
+            {
+                entry.path.clone()
+            }
+            _ => path,
+        };
         let location = self.scan.start_background(path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 std::io::Error::other("기존 분석 위치와 범위가 겹칩니다. 기존 위치를 다시 스캔하거나 위치 관리를 확인하세요")
@@ -1479,8 +1523,6 @@ impl DiskWeaveApp {
         });
         self.quick_ui.error = None;
         self.input_error = None;
-        self.results.job.back();
-        self.saved_viewer = None;
         self.show_main(ctx);
         self.quick.leave_for_analysis();
         Ok(())
@@ -1511,17 +1553,20 @@ impl DiskWeaveApp {
                 .completed()
                 .filter(|_| !entry.stale && entry.generation != pending.generation)
                 .ok_or_else(|| std::io::Error::other("폴더 분석이 완료되지 않았습니다"))?;
-            pending.hit.verify_for_analysis()?;
+            let verified = pending.hit.verify_for_analysis()?;
+            let folder =
+                std::fs::canonicalize(pending.hit.analysis_folder().expect("확인한 분석 폴더"))?;
+            let relative = entry.relative_folder(&folder)?.ok_or_else(|| {
+                std::io::Error::other("검색한 폴더가 새 분석 범위를 벗어났습니다")
+            })?;
             let item = pending
                 .hit
-                .analysis_item(&completed.result)
+                .analysis_item_at(&completed.result, relative, verified.created().ok())
                 .ok_or_else(|| std::io::Error::other("검색한 항목이 새 분석 결과에 없습니다"))?;
-            self.target.choose_registered(entry.path.clone());
             Ok((entry.id, entry.generation, item))
         })();
-        match result {
-            Ok((id, generation, item)) => self.analyze_at(id, generation, item),
-            Err(error) => self.input_error = Some(error.to_string()),
+        if let Err(error) = result.and_then(|target| self.select_quick_analysis(target)) {
+            self.input_error = Some(error.to_string());
         }
     }
     fn close_windows(&mut self, ctx: &egui::Context) {
@@ -1696,30 +1741,34 @@ impl DiskWeaveApp {
         };
     }
     pub fn analyze_at(&mut self, id: u64, generation: u64, item: Item) {
-        if !self
+        if let Err(error) = self.try_analyze_at(id, generation, item) {
+            self.input_error = Some(error.to_string());
+        }
+    }
+
+    fn try_analyze_at(&mut self, id: u64, generation: u64, item: Item) -> std::io::Result<()> {
+        self.sync_scan();
+        let source = self
             .scan
             .get(id)
-            .is_some_and(|e| e.generation == generation && !e.stale)
-        {
-            self.input_error = Some("결과가 변경되었습니다. 다시 스캔해 주세요.".into());
-            return;
-        }
+            .filter(|entry| !entry.stale && entry.generation == generation)
+            .and_then(|_| self.scan.completed_snapshot(id))
+            .ok_or_else(|| std::io::Error::other("결과가 변경되었습니다. 다시 스캔해 주세요."))?;
         let previous = self.capture_navigation();
-        self.scan.choose(id);
-        self.sync_scan();
-        if let Some(source) = self.source() {
-            let explorer = source.analyze(item);
-            self.locations_view
-                .choose_scope(&mut self.search, SearchScope::Folder);
-            self.search.reset();
-            self.search.refresh(&source.scan, explorer.folder());
-            self.search.focus_item(item);
-            self.explorer = Some(explorer);
-            self.locations_view.global_mode = false;
-            self.tab = 0;
-            self.detail_target = Some((id, generation, item));
-        }
+        self.scan.show_completed_view(id);
+        self.unavailable_pane = None;
+        let explorer = source.analyze(item);
+        self.locations_view
+            .choose_scope(&mut self.search, SearchScope::Folder);
+        self.search.reset();
+        self.search.refresh(&source.scan, explorer.folder());
+        self.search.focus_item(item);
+        self.explorer = Some(explorer);
+        self.locations_view.global_mode = false;
+        self.tab = 0;
+        self.detail_target = Some((id, generation, item));
         self.remember_navigation(previous);
+        Ok(())
     }
     pub fn navigate(&mut self, folder: usize, clear_search: bool) {
         let previous = self.capture_navigation();
@@ -2489,12 +2538,31 @@ impl DiskWeaveApp {
         let refreshing = self.file_refresh.pending_at(id) || entry.scan.is_running();
         if entry.stale && !refreshing {
             Some(SizeFreshness::NeedsRefresh)
-        } else if refreshing || entry.generation != generation {
+        } else if refreshing
+            || entry.generation != generation
+            || (self.tracking.location == Some(id) && self.tracking.applying())
+        {
             Some(SizeFreshness::Refreshing)
-        } else if self.list_only_generations.get(&id) == Some(&generation) {
-            Some(SizeFreshness::LastScan)
-        } else {
+        } else if self.tracking.location == Some(id)
+            && matches!(self.tracking.status, crate::tracking::Status::Following)
+        {
             None
+        } else {
+            Some(SizeFreshness::LastScan)
+        }
+    }
+
+    fn size_note(&self, sources: &[Snapshot]) -> Option<&'static str> {
+        let mut highest = None;
+        let mut following = false;
+        for source in sources {
+            let freshness = self.size_freshness(source.id, source.generation);
+            highest = highest.max(freshness);
+            following |= freshness.is_none();
+        }
+        match highest? {
+            SizeFreshness::LastScan if following => Some("일부는 마지막 스캔 기준"),
+            other => Some(other.label()),
         }
     }
 
@@ -2538,10 +2606,7 @@ impl DiskWeaveApp {
         let stale = sources
             .iter()
             .any(|s| self.scan.get(s.id).is_some_and(|e| e.stale));
-        let freshness = sources
-            .iter()
-            .filter_map(|s| self.size_freshness(s.id, s.generation))
-            .max();
+        let size_note = self.size_note(&sources);
         let size = if !has_results {
             SizeDisplay {
                 text: "—".into(),
@@ -2583,9 +2648,9 @@ impl DiskWeaveApp {
                 } else {
                     size.text
                 };
-            if let Some(freshness) = freshness {
+            if let Some(note) = size_note {
                 size_text.push_str(" · ");
-                size_text.push_str(freshness.label());
+                size_text.push_str(note);
             }
             ui.label(egui::RichText::new(size_text).size(12.0)).on_hover_text(size.exact);
             ui.small(format!("파일 {}개", crate::ui_style::count(files)));
@@ -3462,7 +3527,8 @@ impl DiskWeaveApp {
                         .color(crate::ui_style::MUTED),
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(&size).size(12.0)).truncate())
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&size).size(12.0)).wrap())
                         .on_hover_text(format!("{}\n{}", info.size.exact, freshness.label()));
                 });
             });
@@ -3588,14 +3654,7 @@ impl DiskWeaveApp {
             .map
             .output
             .as_ref()
-            .and_then(|output| {
-                output
-                    .sources
-                    .iter()
-                    .filter_map(|s| self.size_freshness(s.id, s.generation))
-                    .max()
-            })
-            .map(SizeFreshness::label);
+            .and_then(|output| self.size_note(&output.sources));
         if let Some(event) = self.map_view.show(ui, &self.map, selected, size_note) {
             match event {
                 MapEvent::Pick(row) => self.pick_map(row),
@@ -3657,15 +3716,24 @@ impl eframe::App for DiskWeaveApp {
         if self.archive_record.is_some() {
             self.document_tick();
         }
-        if let crate::documents::View::Comparison(report) = &self.results.job.view {
+        let document = self
+            .quick_folder_scan
+            .is_none()
+            .then_some(&self.results.job.view);
+        if let Some(crate::documents::View::Comparison(report)) = document {
             self.visible_watches.clear();
             let report = Arc::clone(report);
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(bg()))
-                .show(ui, |ui| self.results.comparison(ui, &report));
+                .show(ui, |ui| {
+                    if let Some(error) = &self.input_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    self.results.comparison(ui, &report);
+                });
             return;
         }
-        if let crate::documents::View::Saved(record) = &self.results.job.view {
+        if let Some(crate::documents::View::Saved(record)) = document {
             let saved = crate::local_date::display(Some(record.saved));
             let busy = self
                 .saved_viewer
@@ -3673,7 +3741,11 @@ impl eframe::App for DiskWeaveApp {
                 .is_some_and(|viewer| viewer.results.busy());
             let mut back = false;
             egui::Panel::top("saved_navigation")
-                .exact_size(36.0)
+                .exact_size(if self.input_error.is_some() {
+                    60.0
+                } else {
+                    36.0
+                })
                 .frame(egui::Frame::new().fill(surface()).inner_margin(4))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -3682,6 +3754,9 @@ impl eframe::App for DiskWeaveApp {
                             .clicked();
                         ui.label(format!("저장된 결과 · {saved}"));
                     });
+                    if let Some(error) = &self.input_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
                 });
             if !back {
                 self.visible_watches.clear();
@@ -3692,6 +3767,7 @@ impl eframe::App for DiskWeaveApp {
             }
             self.results.job.back();
             self.saved_viewer = None;
+            self.input_error = None;
         }
         if self.map_height == 0.0 {
             self.map_height = 192.0;
@@ -5138,7 +5214,7 @@ mod session_tests {
         search(&mut app);
         app.quick.step(1);
         let target = app.quick.selected(&app.scan).unwrap();
-        app.open_quick_analysis(&ctx, target);
+        app.open_quick_analysis(&ctx, target).unwrap();
         assert!(app.quick.can_return_from_analysis());
         app.scan.start_background(other).unwrap();
         finish_quick_test_scan(&mut app, &ctx);
@@ -5179,5 +5255,203 @@ mod session_tests {
         assert!(app.desktop.life.exit);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod analysis_regressions {
+    use super::*;
+
+    fn finish_scan(app: &mut DiskWeaveApp) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn an_old_analysis_item_is_rejected_when_the_pending_scan_finishes() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let file = fixture.0.join("removed.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish_scan(&mut app);
+        let old = app.source().unwrap();
+        assert_eq!(old.scan.files.len(), 1);
+        std::fs::remove_file(&file).unwrap();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.source().unwrap().generation == old.generation {
+            app.analyze_at(old.id, old.generation, Item::File(0));
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let new = app.source().unwrap();
+        assert!(new.generation > old.generation, "새 스캔 결과 수신 필요");
+        assert!(app.input_error.is_some(), "이전 세대 요청 거부 필요");
+    }
+
+    #[test]
+    fn an_unchanged_ntfs_folder_from_direct_search_can_open_its_analysis() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let path = fixture.0.join("picked");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("old.dat"), [0; 256]).unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish_scan(&mut app);
+        app.quick.set_folder(fixture.0.clone());
+        app.quick.text = "picked".into();
+        app.quick.open();
+        app.quick.start_live().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.quick.pending() {
+            app.quick.tick(&app.scan, std::time::Instant::now());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        app.quick.step(1);
+        let hit = app.quick.selected_hit(&app.scan).unwrap();
+        assert_eq!(hit.path, path);
+        assert!(hit.identity.is_some(), "직접 검색에서 확인한 파일 ID 필요");
+        app.analyze_quick_path(&egui::Context::default(), hit)
+            .unwrap();
+        assert!(!app.quick.visible, "기존 분석 화면으로 이동 필요");
+    }
+    #[test]
+    fn cancelling_quick_analysis_keeps_the_open_saved_view() {
+        let previous = crate::duplicates::tests::Fixture::new();
+        let captured = Arc::new(crate::scanner::scan(&previous.0, || false).unwrap());
+        let now = std::time::SystemTime::now();
+        let saved = Arc::new(crate::snapshot::SavedScan::new(
+            captured,
+            now,
+            now,
+            Duration::ZERO,
+        ));
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let file = fixture.0.join("find.bin");
+        std::fs::write(&file, [0; 4]).unwrap();
+        let hit = crate::quick_search::Hit {
+            identity: crate::metadata::read(&file).values.identity.value(),
+            path: file,
+            kind: crate::file_open::TargetKind::File,
+            bytes: Some(4),
+        };
+        let mut app = DiskWeaveApp::new();
+        let ctx = egui::Context::default();
+        app.results.job.view = crate::documents::View::Saved(saved.clone());
+        assert!(matches!(
+            &app.results.job.view,
+            crate::documents::View::Saved(_)
+        ));
+        app.scan_quick_folder(&ctx, hit.clone()).unwrap();
+        app.scan.cancel();
+        finish_scan(&mut app);
+        app.finish_quick_folder_scan();
+        assert!(app.input_error.as_deref().unwrap().contains("취소"));
+        assert!(
+            matches!(&app.results.job.view, crate::documents::View::Saved(current)
+            if Arc::ptr_eq(current, &saved)),
+            "취소 시 열어 둔 Snapshot 화면을 복원해야 함"
+        );
+        app.analyze_quick_path(&ctx, hit.clone()).unwrap();
+        app.scan_quick_folder(&ctx, hit).unwrap();
+        finish_scan(&mut app);
+        app.finish_quick_folder_scan();
+        assert!(matches!(app.results.job.view, crate::documents::View::Live));
+        assert_eq!(app.source().unwrap().scan.folders[0].path, fixture.0);
+    }
+
+    #[test]
+    fn drive_and_extended_paths_reuse_the_same_scan() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let ordinary = fixture.0.join("find.bin");
+        std::fs::write(&ordinary, [0; 4]).unwrap();
+        let extended = std::fs::canonicalize(&ordinary).unwrap();
+        assert_ne!(ordinary, extended);
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish_scan(&mut app);
+        let hit = crate::quick_search::Hit {
+            identity: crate::metadata::read(&extended).values.identity.value(),
+            path: extended,
+            kind: crate::file_open::TargetKind::File,
+            bytes: Some(4),
+        };
+        let ctx = egui::Context::default();
+        app.quick.open();
+        app.analyze_quick_path(&ctx, hit).unwrap();
+        assert!(!app.quick.visible);
+        assert_eq!(app.scan.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_new_file_in_an_existing_scan_requests_a_rescan() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let folder = fixture.0.join("child");
+        std::fs::create_dir(&folder).unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish_scan(&mut app);
+        let file = folder.join("new.bin");
+        std::fs::write(&file, [0; 4]).unwrap();
+        let hit = crate::quick_search::Hit {
+            identity: crate::metadata::read(&file).values.identity.value(),
+            path: file,
+            kind: TargetKind::File,
+            bytes: Some(4),
+        };
+        app.quick.open();
+        let error = app
+            .analyze_quick_path(&egui::Context::default(), hit)
+            .unwrap_err();
+        assert!(error.to_string().contains("다시 스캔"));
+        assert!(app.quick.visible);
+        assert_eq!(app.scan.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_replaced_search_folder_cannot_reuse_the_previous_analysis() {
+        use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let folder = fixture.0.join("child");
+        std::fs::create_dir(&folder).unwrap();
+        let older = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let set_created = |time| {
+            std::fs::File::options()
+                .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&folder)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_created(time))
+                .unwrap();
+        };
+        set_created(older);
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        finish_scan(&mut app);
+        std::fs::rename(&folder, fixture.0.join("old")).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        set_created(older + Duration::from_secs(60));
+        let hit = crate::quick_search::Hit {
+            identity: Some(
+                crate::file_ops::Target::capture(&folder)
+                    .unwrap()
+                    .identity(),
+            ),
+            path: folder.clone(),
+            kind: TargetKind::Folder,
+            bytes: None,
+        };
+        app.quick.open();
+        let error = app
+            .analyze_quick_path(&egui::Context::default(), hit)
+            .unwrap_err();
+        assert!(error.to_string().contains("다시 스캔"));
+        assert!(app.quick.visible);
     }
 }

@@ -37,7 +37,6 @@ impl DiskWeaveApp {
             None
         };
         self.scan.remove(id)?;
-        self.list_only_generations.remove(&id);
         if let Some(view) = current {
             self.clear_folder_pane();
             self.unavailable_pane = Some(view);

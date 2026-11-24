@@ -8,7 +8,7 @@ use crate::{
 use std::{
     io,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 mod live;
@@ -23,46 +23,51 @@ impl Hit {
         }
     }
 
-    pub fn verify_for_analysis(&self) -> io::Result<()> {
+    pub fn verify_for_analysis(&self) -> io::Result<std::fs::Metadata> {
         use std::os::windows::fs::MetadataExt;
         let folder = self
             .analysis_folder()
             .ok_or_else(|| io::Error::other("분석할 폴더를 확인할 수 없습니다"))?;
         live::check_root(folder)?;
         let current = std::fs::symlink_metadata(&self.path)?;
+        let changed = || io::Error::other("검색 결과의 항목이 바뀌었습니다. 다시 검색해 주세요");
         if current.is_dir() != (self.kind == TargetKind::Folder)
             || current.file_attributes() & 0x400 != 0
-            || self.identity.is_some_and(|expected| {
-                crate::metadata::read(&self.path).values.identity.value() != Some(expected)
-            })
         {
-            return Err(io::Error::other(
-                "검색 결과의 항목이 바뀌었습니다. 다시 검색해 주세요",
-            ));
+            return Err(changed());
         }
-        Ok(())
+        if let Some(expected) = self.identity {
+            let observed = crate::file_ops::Target::capture(&self.path)?;
+            if observed.directory != current.is_dir() || observed.identity() != expected {
+                return Err(changed());
+            }
+        }
+        Ok(current)
     }
 
     pub fn analysis_item(&self, scan: &crate::scanner::ScanResult) -> Option<Item> {
-        let root = &scan.folders[0].path;
-        let folder_path = self.analysis_folder()?;
-        let relative = if let Ok(relative) = folder_path.strip_prefix(root) {
-            relative
-        } else if crate::locations::contains_path(root, folder_path).ok()? {
-            let mut components = folder_path.components();
-            for _ in root.components() {
-                components.next();
-            }
-            components.as_path()
-        } else {
-            return None;
-        };
+        let relative =
+            crate::locations::relative_folder(&scan.folders[0].path, self.analysis_folder()?)
+                .ok()??;
+        self.analysis_item_at(scan, relative, None)
+    }
+
+    pub fn analysis_item_at(
+        &self,
+        scan: &crate::scanner::ScanResult,
+        relative: &Path,
+        created: Option<SystemTime>,
+    ) -> Option<Item> {
         let folder = scan.folder_index(relative).ok()?;
         if scan.folders[folder].access.unreadable() {
             return None;
         }
         match self.kind {
-            TargetKind::Folder => Some(Item::Folder(folder)),
+            TargetKind::Folder => (!scan.folders[folder]
+                .created
+                .zip(created)
+                .is_some_and(|(scanned, current)| scanned != current))
+            .then_some(Item::Folder(folder)),
             TargetKind::File => {
                 let file = scan.file_named(folder, self.path.file_name()?)?;
                 let observed = scan.files[file].extra.identity.value();

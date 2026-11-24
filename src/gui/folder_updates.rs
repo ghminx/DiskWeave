@@ -22,6 +22,7 @@ struct Row {
 struct Key {
     folder: PathBuf,
     version: (u64, u64),
+    location: u64,
     generation: u64,
     sort: SortField,
     descending: bool,
@@ -31,12 +32,17 @@ struct Key {
 pub(super) struct LiveRows {
     key: Option<Key>,
     rows: Vec<Row>,
-    differs_from_scan: bool,
     selection: ListSelection,
     seed: Option<Vec<PathBuf>>,
 }
 
 impl LiveRows {
+    fn matches_scan(&self, path: &Path, source: &Snapshot) -> bool {
+        self.key.as_ref().is_some_and(|key| {
+            key.folder == path && key.location == source.id && key.generation == source.generation
+        })
+    }
+
     pub(super) fn restore(&mut self, paths: Vec<PathBuf>) {
         *self = Self {
             seed: Some(paths),
@@ -72,6 +78,7 @@ impl LiveRows {
         let key = Key {
             folder: root.clone(),
             version: watch.version(),
+            location: source.id,
             generation: source.generation,
             sort: query.sort,
             descending: query.descending,
@@ -106,7 +113,6 @@ impl LiveRows {
             .iter()
             .map(|&id| (scan.files[id].name.as_os_str(), id))
             .collect();
-        let mut differs_from_scan = entries.len() != scanned_folders.len() + scanned_files.len();
         let mut rows: Vec<_> = entries
             .iter()
             .map(|(name, current)| {
@@ -123,18 +129,6 @@ impl LiveRows {
                         .filter(|&id| scan.files[id].created == current.created)
                         .map(Item::File)
                 };
-                differs_from_scan = differs_from_scan
-                    || match known {
-                        None => true,
-                        Some(Item::Folder(id)) => scan.folders[id]
-                            .modified
-                            .zip(current.modified)
-                            .is_some_and(|(scanned, observed)| scanned != observed),
-                        Some(Item::File(id)) => {
-                            scan.files[id].logical_bytes != current.bytes
-                                || scan.files[id].modified != current.modified
-                        }
-                    };
                 let bytes = if current.folder {
                     known.map(|item| item_bytes(scan, item))
                 } else {
@@ -183,7 +177,6 @@ impl LiveRows {
             })
             .collect();
         self.key = Some(key);
-        self.differs_from_scan = differs_from_scan;
         true
     }
 
@@ -299,10 +292,9 @@ impl DiskWeaveApp {
         let path = self.current_live_folder()?;
         let entries = self.visible_watches.get(&path)?.entries()?;
         let source = self.source()?;
-        self.live_rows
-            .key
-            .as_ref()
-            .filter(|key| key.folder == path && key.generation == source.generation)?;
+        if !self.live_rows.matches_scan(&path, &source) {
+            return None;
+        }
         if self.live_rows.selection.count() == 0 {
             return Some(
                 self.explorer
@@ -326,14 +318,12 @@ impl DiskWeaveApp {
         let Some(path) = self.current_live_folder() else {
             return;
         };
-        if self
-            .source()
-            .is_none_or(|source| source.id != id || source.generation != generation)
-            || self
-                .live_rows
-                .key
-                .as_ref()
-                .is_none_or(|key| key.folder != path || key.generation != generation)
+        let Some(source) = self.source() else {
+            return;
+        };
+        if source.id != id
+            || source.generation != generation
+            || !self.live_rows.matches_scan(&path, &source)
         {
             return;
         }
@@ -374,12 +364,10 @@ impl DiskWeaveApp {
         let Some(folder) = self.current_live_folder() else {
             return false;
         };
-        if self
-            .live_rows
-            .key
-            .as_ref()
-            .is_none_or(|key| key.folder != folder)
-        {
+        let Some(source) = self.source() else {
+            return false;
+        };
+        if !self.live_rows.matches_scan(&folder, &source) {
             return false;
         }
         let Some(entries) = self
@@ -411,7 +399,7 @@ impl DiskWeaveApp {
         if entry.folder && row.known.is_some() {
             return false;
         }
-        if let (Some(Item::File(id)), Some(source)) = (row.known, self.source()) {
+        if let Some(Item::File(id)) = row.known {
             let file = &source.scan.files[id];
             if file.logical_bytes == entry.bytes && file.modified == entry.modified {
                 return false;
@@ -466,14 +454,6 @@ impl DiskWeaveApp {
             .order(watch, source, folder, &self.search.input, seed)
         {
             return false;
-        }
-        if self.live_rows.differs_from_scan
-            && self
-                .list_only_generations
-                .insert(source.id, source.generation)
-                != Some(source.generation)
-        {
-            ui.ctx().request_repaint();
         }
         self.search.headers(ui);
         if self.live_rows.rows.is_empty() {
@@ -701,14 +681,6 @@ impl DiskWeaveApp {
         {
             return None;
         }
-        if self.parked_live_rows.differs_from_scan
-            && self
-                .list_only_generations
-                .insert(source.id, source.generation)
-                != Some(source.generation)
-        {
-            ui.ctx().request_repaint();
-        }
         let label = super::folders::pane_path_label(ui, path, ui.available_width());
         ui.add(egui::Label::new(label).truncate())
             .on_hover_text(path.display().to_string());
@@ -847,7 +819,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::ui_style::apply(&ctx);
         observe(&mut app, &ctx, &["cleanup.bin", "목록 자동 갱신"], &[]);
-        assert_summary(&app, &ctx, "12 B");
+        assert_summary(&app, &ctx, "12 B · 마지막 스캔 기준");
         fs::remove_file(removed).unwrap();
         observe(&mut app, &ctx, &["keep.bin"], &["cleanup.bin"]);
         assert_summary(&app, &ctx, "12 B · 마지막 스캔 기준");
@@ -875,17 +847,21 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert_summary(&app, &ctx, "7 B");
-        assert_drawn(&ctx, 208.0, "7 B", |ui| app.details(ui));
+        assert_summary(&app, &ctx, "7 B · 마지막 스캔 기준");
+        assert_drawn(&ctx, 208.0, "7 B · 마지막 스캔 기준", |ui| {
+            app.details(ui)
+        });
         fs::write(fixture.0.join("keep.bin"), [0; 2]).unwrap();
         observe(&mut app, &ctx, &["keep.bin", "2 B"], &[]);
         assert_summary(&app, &ctx, "7 B · 마지막 스캔 기준");
     }
 
+    #[track_caller]
     fn assert_summary(app: &DiskWeaveApp, ctx: &egui::Context, text: &str) {
         assert_drawn(ctx, 760.0, text, |ui| app.summary(ui));
     }
 
+    #[track_caller]
     fn assert_drawn(
         ctx: &egui::Context,
         width: f32,
@@ -903,7 +879,10 @@ mod tests {
         frame.textures_delta.clear();
         assert!(frame.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(label)
             if label.galley.text() == text && shape.clip_rect.contains_rect(label.visual_bounding_rect()))),
-            "{text} 표시 필요");
+            "{text} 표시 필요. 그린 텍스트: {:?}", frame.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) => Some(label.galley.text()),
+                _ => None,
+            }).collect::<Vec<_>>());
     }
 
     #[test]
@@ -930,14 +909,14 @@ mod tests {
         app.file_refresh
             .begin(&app.scan, std::slice::from_ref(&file), None)
             .unwrap();
-        assert_summary(&app, &ctx, "3 B");
+        assert_summary(&app, &ctx, "3 B · 마지막 스캔 기준");
         app.select_registered_location(touched_id);
         assert_summary(&app, &ctx, "11 B · 갱신 중 · 이전 값");
         while app.file_refresh.busy() {
             app.file_tick();
             assert!(Instant::now() < deadline);
         }
-        assert_summary(&app, &ctx, "8 B");
+        assert_summary(&app, &ctx, "8 B · 마지막 스캔 기준");
 
         let offline = fixture.0.join("offline");
         fs::rename(&touched, &offline).unwrap();
@@ -958,7 +937,7 @@ mod tests {
             app.file_tick();
             assert!(Instant::now() < deadline);
         }
-        assert_summary(&app, &ctx, "8 B");
+        assert_summary(&app, &ctx, "8 B · 마지막 스캔 기준");
 
         fs::remove_file(&file).unwrap();
         app.file_refresh.begin(&app.scan, &[file], None).unwrap();
@@ -1225,5 +1204,61 @@ mod tests {
         assert_eq!(app.live_rows.rows.len(), 1);
         assert_eq!(app.source().unwrap().scan.folders[0].logical_bytes, 350);
         app.tracking.stop();
+    }
+    #[test]
+    fn nested_change_marks_the_previous_scan_total() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let child = fixture.0.join("child");
+        fs::create_dir(&child).unwrap();
+        let file = child.join("nested.bin");
+        fs::write(&file, [0; 5]).unwrap();
+        let mut app = analyze(&fixture.0);
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["child", "목록 자동 갱신"], &[]);
+        let before = fs::metadata(&child).unwrap().modified().unwrap();
+        fs::write(&file, [0; 20]).unwrap();
+        assert_eq!(fs::metadata(&child).unwrap().modified().unwrap(), before);
+        observe(&mut app, &ctx, &["child", "5 B"], &[]);
+        assert_summary(&app, &ctx, "5 B · 마지막 스캔 기준");
+    }
+    #[test]
+    fn details_do_not_use_previous_rows_after_file_refresh() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let a = fixture.0.join("a.bin");
+        let z = fixture.0.join("z.bin");
+        fs::write(&a, [0; 5]).unwrap();
+        fs::write(&z, [0; 20]).unwrap();
+        let mut app = analyze(&fixture.0);
+        let old = app.source().unwrap();
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["a.bin", "z.bin", "목록 자동 갱신"], &[]);
+        let index = app
+            .live_rows
+            .rows
+            .iter()
+            .position(|row| row.known == Some(Item::File(1)))
+            .unwrap();
+        let removed = if app.live_rows.rows[index].name == "a.bin" {
+            z
+        } else {
+            a
+        };
+        app.live_rows.selection.clear();
+        app.live_rows.selection.insert(index);
+        fs::remove_file(&removed).unwrap();
+        app.file_refresh.begin(&app.scan, &[removed], None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.file_refresh.busy() {
+            app.file_tick();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let new = app.source().unwrap();
+        assert!(new.generation > old.generation);
+        assert_eq!(new.scan.files.len(), 1);
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| app.details(ui));
+        frame.textures_delta.clear();
     }
 }
