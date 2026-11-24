@@ -4,18 +4,23 @@ use crate::{
     locations::Locations,
     presentation::SizeDisplay,
     quick_search::{Hit, QuickSearch, Scope},
-    quick_settings::{Preferences, Shortcut},
 };
 use eframe::egui;
 pub enum Action {
     ShowMain,
-    Apply(Preferences),
+    Settings,
     Open(OpenRequest),
     Analyze((u64, u64, Item)),
     AnalyzePath(Hit),
     ScanFolder(Hit),
     Copy(std::path::PathBuf),
     Recycle(Hit),
+}
+
+pub enum InlineAction {
+    Scope(crate::search_view::ScopeChoice),
+    Close,
+    Result(Action),
 }
 
 #[derive(Clone, Copy)]
@@ -26,33 +31,14 @@ enum RowAction {
     Analyze,
     Recycle,
 }
+#[derive(Default)]
 pub struct QuickUi {
     pub error: Option<String>,
-    pub pending: bool,
     pub opening: bool,
-    pub settings: bool,
     pub focused: bool,
     seen_focus: bool,
-    draft: Preferences,
-    key: String,
     scroll: Option<usize>,
     scan_confirmation: Option<Hit>,
-}
-impl Default for QuickUi {
-    fn default() -> Self {
-        Self {
-            error: None,
-            pending: false,
-            opening: false,
-            settings: false,
-            focused: false,
-            seen_focus: false,
-            draft: Preferences::default(),
-            key: "Space".into(),
-            scroll: None,
-            scan_confirmation: None,
-        }
-    }
 }
 pub struct Layout {
     pub width: f32,
@@ -69,68 +55,37 @@ impl Layout {
     }
 }
 impl QuickUi {
-    pub fn open_settings(&mut self, p: Preferences) {
-        self.draft = p;
-        self.key = p.shortcut.key_name();
-        self.settings = true;
-    }
-
     pub fn confirm_folder_scan(&mut self, hit: Hit) {
         self.scan_confirmation = Some(hit);
     }
 
-    fn draw_search_fields(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) -> bool {
-        let gap = if ui.available_height() < 300.0 {
-            1.0
-        } else {
-            6.0
-        };
-        ui.spacing_mut().interact_size.y = crate::ui_style::FIELD_HEIGHT;
-        ui.horizontal(|ui| {
-            let response = crate::ui_style::scope_button(ui, quick.scope().label(), 118.0);
-            egui::Popup::menu(&response).show(|ui| {
-                crate::ui_style::menu_spacing(ui);
-                for scope in [Scope::Scanned, Scope::Folder, Scope::Computer] {
-                    if ui
-                        .selectable_label(quick.scope() == scope, scope.label())
-                        .clicked()
-                    {
-                        quick.set_scope(scope);
-                        self.error = None;
-                        ui.close();
-                    }
-                }
-            });
-            if quick.scope() == Scope::Folder {
-                let mut path = quick.folder().to_string_lossy().into_owned();
-                let width = (ui.available_width() - 92.0).max(80.0);
-                let folder_input = ui.add(
-                    crate::ui_style::text_field(&mut path, width)
-                        .hint_text("폴더를 끌어놓거나 경로 입력"),
-                );
-                if folder_input.changed() {
-                    quick.set_folder(path.into());
-                    self.error = None;
-                }
-                if folder_input.has_focus() || folder_input.lost_focus() {
-                    ui.input_mut(|input| {
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    });
-                }
-                if ui.button("폴더 선택").clicked() {
-                    let mut dialog = rfd::FileDialog::new();
-                    if quick.folder().is_absolute() {
-                        dialog = dialog.set_directory(quick.folder());
-                    }
-                    if let Some(path) = dialog.pick_folder() {
-                        quick.set_folder(path);
-                        self.error = None;
-                    }
-                    quick.focus = true;
-                }
+    fn folder_field(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) {
+        let mut path = quick.folder().to_string_lossy().into_owned();
+        let width = (ui.available_width() - 92.0).max(80.0);
+        let folder_input = ui.add(
+            crate::ui_style::text_field(&mut path, width).hint_text("폴더를 끌어놓거나 경로 입력"),
+        );
+        if folder_input.changed() {
+            quick.set_folder(path.into());
+            self.error = None;
+        }
+        if folder_input.has_focus() || folder_input.lost_focus() {
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
+        if ui.button("폴더 선택").clicked() {
+            let mut dialog = rfd::FileDialog::new();
+            if quick.folder().is_absolute() {
+                dialog = dialog.set_directory(quick.folder());
             }
-        });
-        ui.add_space(gap);
+            if let Some(path) = dialog.pick_folder() {
+                quick.set_folder(path);
+                self.error = None;
+            }
+            quick.focus = true;
+        }
+    }
+
+    fn matching_fields(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) {
         ui.horizontal(|ui| {
             use crate::search::{EntryKind, SearchMode};
             for (kind, label) in [
@@ -160,6 +115,190 @@ impl QuickUi {
                     });
             });
         });
+    }
+
+    fn folder_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        escape: bool,
+        id: &'static str,
+    ) -> Option<Action> {
+        if let Some(hit) = self.scan_confirmation.as_ref() {
+            let mut start = false;
+            let mut cancel = escape;
+            egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading(if hit.kind == TargetKind::Folder {
+                    "이 폴더 분석"
+                } else {
+                    "이 파일이 있는 폴더 분석"
+                });
+                if let Some(folder) = hit.analysis_folder() {
+                    ui.add(egui::Label::new(folder.display().to_string()).wrap());
+                }
+                ui.horizontal(|ui| {
+                    start = ui.button("분석 시작").clicked();
+                    cancel |= ui.button("취소").clicked();
+                });
+            });
+            if cancel {
+                self.scan_confirmation = None;
+            } else if start {
+                return self.scan_confirmation.take().map(Action::ScanFolder);
+            }
+        }
+        None
+    }
+
+    pub fn close_inline(&mut self, quick: &mut QuickSearch) {
+        quick.hide();
+        quick.live.clear();
+        self.scan_confirmation = None;
+        self.error = None;
+        self.scroll = None;
+    }
+
+    pub fn show_inline(
+        &mut self,
+        ui: &mut egui::Ui,
+        quick: &mut QuickSearch,
+        locations: &Locations,
+        interactive: bool,
+    ) -> Option<InlineAction> {
+        use crate::search_view::{scope_picker, ScopeChoice};
+        let interactive = interactive && self.scan_confirmation.is_none();
+        let mut enter = false;
+        let scope = ui
+            .add_enabled_ui(interactive, |ui| {
+                ui.horizontal(|ui| {
+                    let width = 170.0_f32.min(ui.available_width() * 0.55);
+                    let response = ui.add(
+                        crate::ui_style::text_field(
+                            &mut quick.text,
+                            (ui.available_width() - width - ui.spacing().item_spacing.x).max(70.0),
+                        )
+                        .id(egui::Id::unique("search_query"))
+                        .hint_text("파일·폴더 검색"),
+                    );
+                    if quick.focus {
+                        response.request_focus();
+                        quick.focus = false;
+                    }
+                    if response.changed() {
+                        self.error = None;
+                    }
+                    enter = (response.has_focus() || response.lost_focus())
+                        && ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        });
+                    scope_picker(ui, ScopeChoice::Direct(quick.scope()), width, true)
+                })
+                .inner
+            })
+            .inner;
+        if let Some(scope) = scope {
+            return Some(InlineAction::Scope(scope));
+        }
+
+        if quick.scope() == Scope::Folder {
+            ui.add_enabled_ui(interactive, |ui| {
+                ui.horizontal(|ui| self.folder_field(ui, quick))
+            });
+        }
+        ui.add_enabled_ui(interactive, |ui| self.matching_fields(ui, quick));
+        quick.invalidate_live();
+        let (start, close) = ui
+            .add_enabled_ui(interactive, |ui| {
+                ui.horizontal(|ui| {
+                    let ready = !quick.live.running() && !quick.text.trim().is_empty();
+                    let start = ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new("검색").fill(crate::ui_style::SELECTED),
+                        )
+                        .clicked()
+                        || ready && enter;
+                    (start, ui.button("검색 닫기").clicked())
+                })
+            })
+            .inner
+            .inner;
+        if close {
+            return Some(InlineAction::Close);
+        }
+        if start {
+            self.error = quick.start_live().err().map(|error| error.to_string());
+        }
+        live_status(ui, quick);
+        if let Some(error) = &self.error {
+            ui.add(
+                egui::Label::new(egui::RichText::new(error).color(egui::Color32::LIGHT_RED)).wrap(),
+            );
+        }
+        if interactive && quick.count() > 0 {
+            let direction = ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    1
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if direction != 0 {
+                quick.step(direction);
+                self.scroll = quick.selection;
+            }
+        }
+        let allow_enter = interactive
+            && !start
+            && !enter
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !egui::Popup::is_any_open(ui.ctx());
+        if quick.count() > 0 {
+            let row = ui
+                .add_enabled_ui(interactive, |ui| self.draw_results(ui, quick, allow_enter))
+                .inner;
+            if let Some(row) = row {
+                match result_action(quick, locations, row) {
+                    Ok(action) => return Some(InlineAction::Result(action)),
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+        }
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        self.folder_confirmation(ui.ctx(), escape, "inline_folder_analysis")
+            .map(InlineAction::Result)
+    }
+
+    fn draw_search_fields(&mut self, ui: &mut egui::Ui, quick: &mut QuickSearch) -> bool {
+        let gap = if ui.available_height() < 300.0 {
+            1.0
+        } else {
+            6.0
+        };
+        ui.spacing_mut().interact_size.y = crate::ui_style::FIELD_HEIGHT;
+        ui.horizontal(|ui| {
+            let response = crate::ui_style::scope_button(ui, quick.scope().label(), 118.0);
+            egui::Popup::menu(&response).show(|ui| {
+                crate::ui_style::menu_spacing(ui);
+                for scope in [Scope::Scanned, Scope::Folder, Scope::Computer] {
+                    if ui
+                        .selectable_label(quick.scope() == scope, scope.label())
+                        .clicked()
+                    {
+                        quick.set_scope(scope);
+                        self.error = None;
+                        ui.close();
+                    }
+                }
+            });
+            if quick.scope() == Scope::Folder {
+                self.folder_field(ui, quick);
+            }
+        });
+        ui.add_space(gap);
+        self.matching_fields(ui, quick);
         ui.add_space(gap);
         let started = ui
             .horizontal(|ui| {
@@ -359,7 +498,7 @@ impl QuickUi {
         if let Some(row) = pick {
             quick.selection = Some(row);
         }
-        if allow_enter && !self.settings && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if allow_enter && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             quick.selection.get_or_insert(0);
             let ctrl = ui.input(|i| i.modifiers.ctrl);
             action = Some(if ctrl {
@@ -375,7 +514,6 @@ impl QuickUi {
         ctx: &egui::Context,
         quick: &mut QuickSearch,
         locations: &Locations,
-        applied: Preferences,
         keep_alive: bool,
     ) -> Option<Action> {
         if !quick.visible {
@@ -418,7 +556,7 @@ impl QuickUi {
                 ctx.request_repaint();
                 return;
             }
-            let interactive = !self.settings && self.scan_confirmation.is_none();
+            let interactive = self.scan_confirmation.is_none();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()
@@ -429,8 +567,8 @@ impl QuickUi {
                     ui.horizontal(|ui| {
                         ui.heading("빠른 검색");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("검색 설정").clicked() {
-                                self.open_settings(applied);
+                            if ui.button("설정").clicked() {
+                                action = Some(Action::Settings);
                             }
                             if ui.button("메인 창").clicked() {
                                 action = Some(Action::ShowMain);
@@ -511,87 +649,8 @@ impl QuickUi {
                         }
                     });
                 });
-            if let Some(hit) = self.scan_confirmation.as_ref() {
-                let mut start = false;
-                let mut cancel = escape;
-                egui::Modal::new(egui::Id::unique("quick_folder_analysis")).show(&ctx, |ui| {
-                    ui.set_width(360.0);
-                    ui.heading(if hit.kind == TargetKind::Folder {
-                        "이 폴더 분석"
-                    } else {
-                        "이 파일이 있는 폴더 분석"
-                    });
-                    if let Some(folder) = hit.analysis_folder() {
-                        ui.add(egui::Label::new(folder.display().to_string()).wrap());
-                    }
-                    ui.horizontal(|ui| {
-                        start = ui.button("분석 시작").clicked();
-                        cancel |= ui.button("취소").clicked();
-                    });
-                });
-                if cancel {
-                    self.scan_confirmation = None;
-                } else if start {
-                    action = self.scan_confirmation.take().map(Action::ScanFolder);
-                }
-            }
-            if self.settings {
-                let mut open = true;
-                let settings = |ui: &mut egui::Ui| {
-                    ui.set_max_width(380.0);
-                    ui.checkbox(&mut self.draft.enabled, "전역 단축키 사용");
-                    ui.horizontal(|ui| {
-                        for (bit, label) in [(2, "Ctrl"), (1, "Alt"), (4, "Shift"), (8, "Win")] {
-                            let mut selected = self.draft.shortcut.modifiers & bit != 0;
-                            if ui.checkbox(&mut selected, label).changed() {
-                                if selected {
-                                    self.draft.shortcut.modifiers |= bit;
-                                } else {
-                                    self.draft.shortcut.modifiers &= !bit;
-                                }
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("키");
-                        ui.text_edit_singleline(&mut self.key);
-                    });
-                    ui.small("Space, 영문자 또는 F1~F24");
-                    ui.separator();
-                    ui.checkbox(
-                        &mut self.draft.stay,
-                        "메인 창을 닫아도 트레이에서 계속 실행",
-                    );
-                    ui.small("스캔·파일 작업·실시간 갱신이 계속됩니다. 트레이에서 완전 종료할 수 있습니다.");
-                    ui.small(format!(
-                        "현재 적용: 단축키 {} · 상주 {}",
-                        if applied.enabled { "켜짐" } else { "꺼짐" },
-                        if applied.stay { "켜짐" } else { "꺼짐" }
-                    ));
-                    if ui
-                        .add_enabled(!self.pending, egui::Button::new("적용"))
-                        .clicked()
-                    {
-                        match Shortcut::parse_key(&self.key).and_then(|key| {
-                            self.draft.shortcut.key = key;
-                            self.draft.validate()
-                        }) {
-                            Ok(()) => action = Some(Action::Apply(self.draft)),
-                            Err(e) => self.error = Some(e.to_string()),
-                        }
-                    }
-                    if self.pending {
-                        ui.label("Windows 설정 적용 중…");
-                    }
-                    if let Some(error) = &self.error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
-                    }
-                };
-                egui::Window::new("검색창 설정")
-                    .open(&mut open)
-                    .default_width(380.0)
-                    .show(&ctx, settings);
-                self.settings = open;
+            if let Some(next) = self.folder_confirmation(&ctx, escape, "quick_folder_analysis") {
+                action = Some(next);
             }
         };
         ctx.show_viewport_immediate(
@@ -838,7 +897,7 @@ mod tests {
                 input.dropped_files.push(Arc::new(FolderDrop(path.clone())));
             }
             let mut output = ctx.run_ui(input, |root| {
-                ui.show(root.ctx(), quick, &locations, Preferences::default(), false);
+                ui.show(root.ctx(), quick, &locations, false);
             });
             output.textures_delta.clear();
             output
@@ -923,13 +982,7 @@ mod tests {
             }
             let mut action = None;
             let mut frame = ctx.run_ui(input, |root| {
-                action = ui.show(
-                    root.ctx(),
-                    &mut quick,
-                    &locations,
-                    Preferences::default(),
-                    false,
-                );
+                action = ui.show(root.ctx(), &mut quick, &locations, false);
             });
             frame.textures_delta.clear();
             (action, frame)
@@ -978,7 +1031,7 @@ mod tests {
                 .unwrap()
                 .focused = Some(true);
             let mut frame = ctx.run_ui(raw, |root| {
-                ui.show(root.ctx(), quick, locations, Preferences::default(), false);
+                ui.show(root.ctx(), quick, locations, false);
             });
             frame.textures_delta.clear();
             frame
@@ -1120,13 +1173,7 @@ mod tests {
                 .unwrap()
                 .focused = Some(focused);
             let mut output = ctx.run_ui(input, |root| {
-                ui.show(
-                    root.ctx(),
-                    &mut quick,
-                    &locations,
-                    Preferences::default(),
-                    false,
-                );
+                ui.show(root.ctx(), &mut quick, &locations, false);
             });
             output.textures_delta.clear();
         }
@@ -1139,13 +1186,7 @@ mod tests {
             .unwrap()
             .focused = Some(false);
         let mut output = ctx.run_ui(input, |root| {
-            ui.show(
-                root.ctx(),
-                &mut quick,
-                &locations,
-                Preferences::default(),
-                false,
-            );
+            ui.show(root.ctx(), &mut quick, &locations, false);
         });
         output.textures_delta.clear();
         assert!(

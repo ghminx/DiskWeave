@@ -251,6 +251,11 @@ impl DiskWeaveApp {
     pub(super) fn folder_workspace(&mut self, ui: &mut egui::Ui) {
         use crate::workspace::folders::{split_widths, SPLIT_DIVIDER};
         self.folder_tab_bar(ui);
+        if self.inline_search.visible {
+            self.visible_watches.clear();
+            self.center(ui);
+            return;
+        }
         let tab_id = self.folder_tabs.id();
         if !self.folder_tabs.is_split() {
             self.sync_visible_watches(ui.ctx(), false);

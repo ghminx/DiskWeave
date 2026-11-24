@@ -21,18 +21,61 @@ pub enum SearchScope {
     Registered,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScopeChoice {
     Scan(SearchScope),
-    QuickSearch,
+    Direct(crate::quick_search::Scope),
 }
 impl SearchScope {
     pub fn label(self) -> &'static str {
         match self {
             Self::Folder => "현재 폴더 안에서",
             Self::Location => "현재 스캔 위치 전체",
-            Self::Registered => "완료된 모든 스캔 위치",
+            Self::Registered => "스캔한 위치 모두",
         }
     }
+}
+
+pub fn scope_picker(
+    ui: &mut egui::Ui,
+    current: ScopeChoice,
+    width: f32,
+    direct: bool,
+) -> Option<ScopeChoice> {
+    use crate::quick_search::Scope;
+    let label = |choice: ScopeChoice| match choice {
+        ScopeChoice::Scan(scope) => scope.label(),
+        ScopeChoice::Direct(Scope::Folder) => "다른 폴더 지정",
+        ScopeChoice::Direct(scope) => scope.label(),
+    };
+    let mut chosen = None;
+    let response =
+        crate::ui_style::scope_button(ui, label(current), width).on_hover_text("검색 범위");
+    egui::Popup::menu(&response).show(|ui| {
+        crate::ui_style::menu_spacing(ui);
+        let mut select = |ui: &mut egui::Ui, choice| {
+            if ui
+                .selectable_label(current == choice, label(choice))
+                .clicked()
+            {
+                chosen = Some(choice);
+                ui.close();
+            }
+        };
+        for scope in [
+            SearchScope::Folder,
+            SearchScope::Location,
+            SearchScope::Registered,
+        ] {
+            select(ui, ScopeChoice::Scan(scope));
+        }
+        if direct {
+            ui.separator();
+            select(ui, ScopeChoice::Direct(Scope::Folder));
+            select(ui, ScopeChoice::Direct(Scope::Computer));
+        }
+    });
+    chosen
 }
 
 type LiveSelection = (
@@ -424,13 +467,11 @@ impl SearchView {
         &mut self,
         ui: &mut egui::Ui,
         global: bool,
-        multiple: bool,
-        quick_search_available: bool,
+        direct: bool,
     ) -> Option<ScopeChoice> {
         self.editing = false;
         let current = self.scope(global);
-        let mut chosen = None;
-        let scope_width = 170.0;
+        let scope_width = 170.0_f32.min(ui.available_width() * 0.55);
         let input_width =
             (ui.available_width() - scope_width - ui.spacing().item_spacing.x).max(70.0);
         ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
@@ -445,48 +486,12 @@ impl SearchView {
                     }),
             )
             .has_focus();
+        let mut chosen = None;
         crate::ui_style::slot(
             ui,
             egui::vec2(scope_width, crate::ui_style::FIELD_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let response = crate::ui_style::scope_button(ui, current.label(), scope_width)
-                    .on_hover_text("목록 검색 범위");
-                egui::Popup::menu(&response).show(|ui| {
-                    crate::ui_style::menu_spacing(ui);
-                    for scope in [
-                        SearchScope::Folder,
-                        SearchScope::Location,
-                        SearchScope::Registered,
-                    ] {
-                        if scope == SearchScope::Registered
-                            && !multiple
-                            && current != SearchScope::Registered
-                        {
-                            continue;
-                        }
-                        if ui
-                            .selectable_label(current == scope, scope.label())
-                            .clicked()
-                        {
-                            chosen = Some(ScopeChoice::Scan(scope));
-                            ui.close();
-                        }
-                    }
-                    if quick_search_available {
-                        ui.separator();
-                        if ui.button("다른 위치에서 찾기…").clicked() {
-                            chosen = Some(ScopeChoice::QuickSearch);
-                            ui.close();
-                        }
-                    }
-                    ui.small("현재 폴더와 하위 항목");
-                    ui.small("현재 스캔 위치 전체는 스캔을 시작한 경로부터 검색합니다.");
-                    if multiple {
-                        ui.small("완료된 모든 스캔 위치는 여러 위치를 함께 검색합니다.");
-                    }
-                });
-            },
+            |ui| chosen = scope_picker(ui, ScopeChoice::Scan(current), scope_width, direct),
         );
         chosen
     }
