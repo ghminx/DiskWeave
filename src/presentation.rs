@@ -157,27 +157,6 @@ impl ColumnWidths {
             eframe::egui::vec2(width, crate::ui_style::ROW),
             eframe::egui::Sense::hover(),
         );
-        let value_width = 88.0;
-        if width > 145.0 {
-            let track = eframe::egui::Rect::from_min_size(
-                rect.left_center() + eframe::egui::vec2(12.0, -2.5),
-                eframe::egui::vec2((width - value_width - 30.0).min(55.0), 5.0),
-            );
-            ui.painter()
-                .rect_filled(track, 3.0, eframe::egui::Color32::from_rgb(39, 52, 65));
-            let fraction = values
-                .parent_bytes
-                .filter(|&n| n > 0)
-                .map_or(0.0, |n| values.bytes as f64 / n as f64);
-            ui.painter().rect_filled(
-                eframe::egui::Rect::from_min_size(
-                    track.min,
-                    eframe::egui::vec2(track.width() * fraction.clamp(0.0, 1.0) as f32, 5.0),
-                ),
-                3.0,
-                crate::ui_style::ACCENT,
-            );
-        }
         crate::ui_style::text(
             ui,
             rect.shrink2(eframe::egui::vec2(12.0, 0.0)),
@@ -193,7 +172,41 @@ impl ColumnWidths {
                 .on_hover_text(allocation.exact);
         }
         if !self.result_mode {
-            crate::ui_style::cell(ui, self.get(4), &values.parent_percentage(), true);
+            let (rect, response) = ui.allocate_exact_size(
+                eframe::egui::vec2(self.get(4), crate::ui_style::ROW),
+                eframe::egui::Sense::hover(),
+            );
+            let area = rect.shrink2(eframe::egui::vec2(8.0, 0.0));
+            let label = values.parent_percentage();
+            if let Some(parent) = values
+                .parent_bytes
+                .filter(|&parent| parent > 0 && !values.access.unreadable())
+            {
+                let track = eframe::egui::Rect::from_min_size(
+                    area.left_center() + eframe::egui::vec2(0.0, 8.0),
+                    eframe::egui::vec2(area.width(), 3.0),
+                );
+                let fraction = (values.bytes as f64 / parent as f64).min(1.0) as f32;
+                ui.painter().rect_filled(track, 1.5, crate::ui_style::LINE);
+                if fraction > 0.0 {
+                    let fill = eframe::egui::Rect::from_min_size(
+                        track.min,
+                        eframe::egui::vec2(track.width() * fraction, track.height()),
+                    );
+                    ui.painter().rect_filled(fill, 1.5, crate::ui_style::ACCENT);
+                }
+                crate::ui_style::text(
+                    ui,
+                    area.translate(eframe::egui::vec2(0.0, -4.0)),
+                    &label,
+                    true,
+                    crate::ui_style::TEXT,
+                    12.0,
+                );
+            } else {
+                crate::ui_style::text(ui, area, &label, true, crate::ui_style::TEXT, 12.0);
+            }
+            response.on_hover_text("상위 폴더 전체 용량에서 이 항목이 차지하는 비율");
         }
         if modified {
             let date = crate::local_date::display(crate::search::item_modified(scan, item));

@@ -562,7 +562,7 @@ impl SearchView {
                         (0, Some(SortField::Name), "이름"),
                         (2, Some(SortField::Size), "크기"),
                         (7, None, "할당 크기"),
-                        (4, None, "부모 대비"),
+                        (4, None, "비중"),
                         (3, Some(SortField::Modified), "수정 날짜"),
                         (5, None, "파일"),
                         (6, None, "폴더"),
@@ -606,14 +606,27 @@ impl SearchView {
                             [rect.left_bottom(), rect.right_bottom()],
                             egui::Stroke::new(1.0, crate::ui_style::LINE),
                         );
-                        crate::ui_style::text(
-                            ui,
-                            rect.shrink2(egui::vec2(12.0, 0.0)),
-                            &format!("{label}{suffix}"),
-                            !matches!(column, 0 | 1 | 3),
-                            crate::ui_style::MUTED,
-                            12.0,
-                        );
+                        if column == 4 {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                label,
+                                egui::FontId::proportional(12.0),
+                                crate::ui_style::MUTED,
+                            );
+                            response
+                                .clone()
+                                .on_hover_text("상위 폴더 전체 용량에서 이 항목이 차지하는 비율");
+                        } else {
+                            crate::ui_style::text(
+                                ui,
+                                rect.shrink2(egui::vec2(12.0, 0.0)),
+                                &format!("{label}{suffix}"),
+                                !matches!(column, 0 | 1 | 3),
+                                crate::ui_style::MUTED,
+                                12.0,
+                            );
+                        }
                         let edge = egui::Rect::from_min_max(
                             egui::pos2(response.rect.right() - 6.0, response.rect.top()),
                             response.rect.right_bottom(),

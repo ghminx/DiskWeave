@@ -157,6 +157,55 @@ fn surface() -> egui::Color32 {
 fn accent() -> egui::Color32 {
     crate::ui_style::ACCENT
 }
+
+fn resize_main_window(ctx: &egui::Context) {
+    use egui::{CursorIcon, ResizeDirection, ViewportCommand};
+
+    let rect = ctx.viewport_rect();
+    let (pos, pressed) = ctx.input(|input| {
+        let viewport = input.viewport();
+        let resizable =
+            !viewport.maximized.unwrap_or(false) && !viewport.fullscreen.unwrap_or(false);
+        (
+            input.pointer.hover_pos().filter(|_| resizable),
+            input.pointer.primary_pressed(),
+        )
+    });
+    let Some(pos) = pos.filter(|pos| rect.contains(*pos)) else {
+        return;
+    };
+    let edge = 6.0;
+    let horizontal = if pos.x < rect.left() + edge {
+        -1
+    } else if pos.x > rect.right() - edge {
+        1
+    } else {
+        0
+    };
+    let vertical = if pos.y < rect.top() + edge {
+        -1
+    } else if pos.y > rect.bottom() - edge {
+        1
+    } else {
+        0
+    };
+    let (direction, cursor) = match (horizontal, vertical) {
+        (-1, -1) => (ResizeDirection::NorthWest, CursorIcon::ResizeNwSe),
+        (1, -1) => (ResizeDirection::NorthEast, CursorIcon::ResizeNeSw),
+        (-1, 1) => (ResizeDirection::SouthWest, CursorIcon::ResizeNeSw),
+        (1, 1) => (ResizeDirection::SouthEast, CursorIcon::ResizeNwSe),
+        (-1, _) => (ResizeDirection::West, CursorIcon::ResizeHorizontal),
+        (1, _) => (ResizeDirection::East, CursorIcon::ResizeHorizontal),
+        (_, -1) => (ResizeDirection::North, CursorIcon::ResizeVertical),
+        (_, 1) => (ResizeDirection::South, CursorIcon::ResizeVertical),
+        _ => return,
+    };
+    ctx.set_cursor_icon(cursor);
+    if pressed {
+        ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+    }
+}
+
 fn type_chart(ui: &mut egui::Ui, stats: &crate::analysis::Statistics) {
     let mut groups: Vec<_> = stats
         .extensions
@@ -1673,29 +1722,49 @@ impl DiskWeaveApp {
             return;
         };
         let dialog = egui::Modal::new(egui::Id::unique("replace_scan_root")).show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width((ctx.viewport_rect().width() - 48.0).clamp(240.0, 420.0));
             ui.heading("새 최상위 폴더 스캔");
-            ui.add(egui::Label::new(plan.path.display().to_string()).wrap());
-            ui.add_space(8.0);
-            ui.label(format!(
-                "완료되면 겹치는 기존 분석 {}곳을 교체합니다.",
-                plan.overlaps.len()
-            ));
-            for path in plan
+            ui.add_space(12.0);
+            egui::Frame::new()
+                .fill(crate::ui_style::RAISED)
+                .corner_radius(6.0)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.small("새 스캔 대상");
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(plan.path.display().to_string()).wrap());
+                });
+            ui.add_space(12.0);
+            ui.strong(format!("교체할 분석 결과 ({}곳)", plan.overlaps.len()));
+            ui.add_space(4.0);
+            for entry in plan
                 .overlaps
                 .iter()
                 .take(3)
                 .filter_map(|id| self.scan.get(*id))
             {
-                ui.add(egui::Label::new(path.path.display().to_string()).truncate());
+                let path = entry.path.display().to_string();
+                ui.add(egui::Label::new(&path).truncate())
+                    .on_hover_text(path);
             }
-            ui.small("취소하거나 실패하면 기존 분석을 유지합니다.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                (
-                    ui.button("취소").clicked(),
-                    ui.button("새 최상위로 스캔").clicked(),
-                )
+            if plan.overlaps.len() > 3 {
+                ui.small(format!("외 {}곳", plan.overlaps.len() - 3));
+            }
+            ui.add_space(10.0);
+            ui.small(
+                "스캔이 완료된 뒤에만 교체합니다. 취소하거나 실패하면 기존 분석을 유지합니다.",
+            );
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let start = ui
+                    .button(
+                        egui::RichText::new("새 최상위로 스캔")
+                            .strong()
+                            .color(accent()),
+                    )
+                    .clicked();
+                (ui.button("취소").clicked(), start)
             })
             .inner
         });
@@ -3677,6 +3746,7 @@ impl eframe::App for DiskWeaveApp {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        resize_main_window(ui.ctx());
         if self.archive_record.is_none() {
             self.quick_window(ui.ctx());
         }
@@ -4242,6 +4312,9 @@ mod session_tests {
         };
         draw(Vec::new());
         let frame = draw(Vec::new());
+        let target_label = visible_text(&frame, "새 스캔 대상").unwrap();
+        let overlap_label = visible_text(&frame, "교체할 분석 결과 (1곳)").unwrap();
+        assert!(target_label.bottom() < overlap_label.top());
         let button = visible_text(&frame, "새 최상위로 스캔").unwrap();
         click_at(&mut draw, button.center());
         assert!(app.scan.is_running());
@@ -4249,6 +4322,57 @@ mod session_tests {
         finish(&mut app);
         assert_eq!(app.scan.snapshots().len(), 1);
         assert_eq!(app.source().unwrap().scan.folders[0].path, child);
+    }
+
+    #[test]
+    fn window_frame_resizes_only_at_edges_and_corners_when_restored() {
+        use egui::{PointerButton, ResizeDirection as Direction, ViewportCommand, ViewportId};
+
+        for (x, y, maximized, fullscreen, expected) in [
+            (1.0, 1.0, false, false, Some(Direction::NorthWest)),
+            (400.0, 1.0, false, false, Some(Direction::North)),
+            (799.0, 1.0, false, false, Some(Direction::NorthEast)),
+            (1.0, 300.0, false, false, Some(Direction::West)),
+            (799.0, 300.0, false, false, Some(Direction::East)),
+            (1.0, 599.0, false, false, Some(Direction::SouthWest)),
+            (400.0, 599.0, false, false, Some(Direction::South)),
+            (799.0, 599.0, false, false, Some(Direction::SouthEast)),
+            (400.0, 300.0, false, false, None),
+            (799.0, 599.0, true, false, None),
+            (799.0, 599.0, false, true, None),
+        ] {
+            let ctx = egui::Context::default();
+            let pos = egui::pos2(x, y);
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let viewport = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
+            viewport.maximized = Some(maximized);
+            viewport.fullscreen = Some(fullscreen);
+            let mut output = ctx.run_ui(input, |ui| resize_main_window(ui.ctx()));
+            output.textures_delta.clear();
+            let direction = output.viewport_output[&ViewportId::ROOT]
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    ViewportCommand::BeginResize(direction) => Some(*direction),
+                    _ => None,
+                });
+            assert_eq!(direction, expected, "{pos:?}");
+        }
     }
 
     #[test]
@@ -4629,7 +4753,7 @@ mod session_tests {
             assert!(visible_text(&frame, &child.display().to_string()).is_some());
             if scope != crate::search_view::SearchScope::Registered {
                 let date = visible_text(&frame, "수정 날짜").expect("창 안의 수정 날짜 열");
-                let ratio = visible_text(&frame, "부모 대비").expect("창 안의 비중 열");
+                let ratio = visible_text(&frame, "비중").expect("창 안의 비중 열");
                 assert!(ratio.right() < date.left());
                 assert!(search.bottom() < date.top());
             }
