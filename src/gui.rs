@@ -320,6 +320,7 @@ impl DiskWeaveApp {
     pub fn active_locations(&self) -> &Locations {
         &self.scan
     }
+    #[cfg(test)]
     pub fn selected_path(&self) -> Option<&std::path::Path> {
         self.target.path()
     }
@@ -886,6 +887,7 @@ impl DiskWeaveApp {
             self.locations_view.preserve_live_selection(&self.scan);
         }
     }
+    #[allow(dead_code, reason = "개발용 NTFS 도우미 GUI 대조의 추적 진입점")]
     fn start_tracking(&mut self, fresh: bool) {
         if self.file_blocked() {
             self.input_error = Some("파일 작업과 목록 갱신을 마친 뒤 시작하세요".into());
@@ -920,160 +922,6 @@ impl DiskWeaveApp {
             self.tracking.start(id, path, detailed, resume)
         })();
         self.input_error = action.err().map(|e| e.to_string());
-    }
-    fn tracking_controls(&mut self, ui: &mut egui::Ui) {
-        if self.archive_record.is_some() {
-            return;
-        }
-        ui.separator();
-        ui.strong("실시간 갱신");
-        ui.add(
-            egui::Label::new(format!(
-                "추적 대상: {}",
-                (if self.tracking.running() {
-                    self.tracking
-                        .location
-                        .and_then(|id| self.scan.get(id))
-                        .map(|e| e.path.as_path())
-                } else {
-                    self.selected_path()
-                })
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-            ))
-            .wrap(),
-        );
-        ui.small("로컬 NTFS 드라이브 또는 폴더 한 곳의 변경을 확인합니다.");
-        if self.tracking.running() {
-            ui.label(self.tracking.label());
-            if matches!(self.tracking.status, crate::tracking::Status::Starting)
-                || self.tracking.applying()
-            {
-                let progress = self.tracking.progress();
-                ui.horizontal(|ui| {
-                    crate::ui_style::activity_indicator(ui);
-                    ui.small(format!(
-                        "조회 파일 {}개 · 폴더 {}개",
-                        progress.files_scanned, progress.folders_scanned
-                    ));
-                });
-            }
-            if ui.button("실시간 갱신 중지").clicked() {
-                self.tracking.stop();
-            }
-        } else {
-            let resumable = self
-                .scan
-                .entries
-                .iter()
-                .find(|e| self.target.path() == Some(e.path.as_path()))
-                .and_then(|e| e.scan.completed())
-                .is_some_and(|c| c.tracking.is_some());
-            if ui
-                .add_enabled(
-                    !self.scan.is_running() && !self.file_blocked() && self.target.path().is_some(),
-                    egui::Button::new(if resumable {
-                        "갱신 다시 시작"
-                    } else {
-                        "실시간 갱신 시작"
-                    }),
-                )
-                .clicked()
-            {
-                self.start_tracking(false);
-            }
-            if resumable
-                && ui
-                    .add_enabled(
-                        !self.scan.is_running() && !self.file_blocked(),
-                        egui::Button::new("기준 다시 수집"),
-                    )
-                    .clicked()
-            {
-                self.start_tracking(true);
-            }
-        }
-        if let crate::tracking::Status::Failed(error) = &self.tracking.status {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "실시간 갱신을 시작하거나 계속할 수 없습니다",
-            );
-            ui.add(egui::Label::new(error).wrap());
-            ui.small("마지막 스캔 결과는 유지되지만 이후 변경 사항은 반영되지 않습니다.");
-            if error.contains("os error 32") {
-                ui.small("Windows가 사용 중인 파일·시스템 영역과의 공유 충돌입니다. 일반 작업 폴더로 범위를 줄여 시도할 수 있습니다.");
-            }
-        }
-        if let Some((root, state)) = self
-            .tracking
-            .location
-            .and_then(|id| self.scan.get(id))
-            .and_then(|entry| {
-                entry
-                    .scan
-                    .completed()
-                    .and_then(|c| c.tracking.as_ref().map(|s| (&entry.path, s)))
-            })
-        {
-            if !state.unavailable.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(235, 194, 120),
-                    format!(
-                        "확인 불가 {}개 · 검색과 용량 합계에서 제외",
-                        state.unavailable.len()
-                    ),
-                );
-                ui.small("제외된 폴더 내부는 미확인입니다. 항목별 최소 30초 간격으로 최대 64개씩 다시 확인합니다.");
-                egui::CollapsingHeader::new("제외된 항목 · 이유 · 마지막 확인")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_height(220.0).show_rows(
-                            ui,
-                            64.0,
-                            state.unavailable.len(),
-                            |ui, rows| {
-                                for row in rows {
-                                    let e = &state.unavailable[row];
-                                    let path = root.join(e.relative());
-                                    ui.add(egui::Label::new(path.display().to_string()).truncate())
-                                        .on_hover_text(path.display().to_string());
-                                    let error = e.reason.error().to_string();
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(format!(
-                                                "{} · {}",
-                                                if e.listing {
-                                                    "하위 목록 미확인"
-                                                } else {
-                                                    "항목 정보 미확인"
-                                                },
-                                                e.reason.label()
-                                            ))
-                                            .small(),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(error);
-                                    ui.small(format!(
-                                        "확인 {}",
-                                        crate::local_date::display(Some(e.checked))
-                                    ));
-                                    ui.separator();
-                                }
-                            },
-                        );
-                    });
-            }
-        }
-        if let Some(checked) = self.tracking.checked {
-            ui.small(format!(
-                "마지막 확인 {}",
-                crate::local_date::display(Some(checked))
-            ));
-        }
-        ui.small("처음에는 기준 스캔을 수행하며 Windows 권한 승인이 필요합니다.");
-        ui.small("큰 폴더나 쓰기 중인 파일은 반영이 늦어질 수 있습니다.");
-        ui.small("완전 종료하면 추적이 끝납니다. 트레이 상주 중에는 계속 갱신합니다.");
     }
     pub fn new() -> Self {
         Self::default()
@@ -2157,6 +2005,9 @@ impl DiskWeaveApp {
                 || self.tracking.checked.is_some()
                 || matches!(self.tracking.status, crate::tracking::Status::Failed(_)))
         {
+            if let crate::tracking::Status::Failed(reason) = &self.tracking.status {
+                return format!("{} · {reason}", self.tracking.label());
+            }
             return format!(
                 "{} · 마지막 확인 {}",
                 self.tracking.label(),
@@ -2442,11 +2293,6 @@ impl DiskWeaveApp {
                                     None => {}
                                 }
                             });
-                        });
-                        ui.menu_button("실시간 갱신", |ui| {
-                            ui.set_max_width(380.0);
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                            self.tracking_controls(ui);
                         });
                         ui.separator();
                         ui.menu_button("결과 · 파일 작업", |ui| {
@@ -4192,6 +4038,35 @@ mod session_tests {
         };
         draw(input(true));
         draw(input(false))
+    }
+
+    #[test]
+    fn target_menu_keeps_location_management_without_a_volume_tracking_action() {
+        let mut app = DiskWeaveApp::new();
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        let mut draw = |events| {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.toolbar(ui),
+            );
+            frame.textures_delta.clear();
+            frame
+        };
+        let frame = draw(Vec::new());
+        let target = visible_text(&frame, "C:").expect("드라이브 선택 메뉴");
+        click_at(&mut draw, target.center());
+        let frame = draw(Vec::new());
+        assert!(visible_text(&frame, "분석 위치 관리").is_some());
+        assert!(visible_text(&frame, "결과 · 파일 작업").is_some());
+        assert!(visible_text(&frame, "실시간 갱신").is_none());
     }
 
     #[test]

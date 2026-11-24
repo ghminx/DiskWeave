@@ -992,6 +992,48 @@ mod tests {
     }
 
     #[test]
+    fn navigating_to_a_child_live_refreshes_its_list_and_rechecks_the_parent_on_return() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        let child = fixture.0.join("data");
+        fs::create_dir(&child).unwrap();
+        let mut app = analyze(&fixture.0);
+        let scan = app.source().unwrap().scan;
+        let child_id = scan.folder_index(std::path::Path::new("data")).unwrap();
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        observe(&mut app, &ctx, &["data", "목록 자동 갱신"], &[]);
+
+        let child_file = child.join("visible-child.txt");
+        fs::write(&child_file, b"first").unwrap();
+        app.navigate(child_id, true);
+        observe(
+            &mut app,
+            &ctx,
+            &["visible-child.txt", "목록 자동 갱신"],
+            &[],
+        );
+        let parent_file = fixture.0.join("added-in-parent.txt");
+        fs::write(&parent_file, b"parent").unwrap();
+        fs::remove_file(&child_file).unwrap();
+        observe(
+            &mut app,
+            &ctx,
+            &["이 폴더는 비어 있습니다."],
+            &["visible-child.txt", "added-in-parent.txt"],
+        );
+
+        app.navigate(0, true);
+        observe(
+            &mut app,
+            &ctx,
+            &["data", "added-in-parent.txt"],
+            &["visible-child.txt"],
+        );
+        assert!(Arc::ptr_eq(&scan, &app.source().unwrap().scan));
+        assert!(!app.scan.is_running() && !app.tracking.running());
+    }
+
+    #[test]
     fn live_watch_follows_visible_panes_and_reconciles_returning_tabs() {
         let fixture = crate::duplicates::tests::Fixture::new();
         let left = fixture.0.join("left");

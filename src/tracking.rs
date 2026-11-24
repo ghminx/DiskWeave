@@ -348,6 +348,7 @@ impl Controller {
                 crate::engine::Stage::Metadata | crate::engine::Stage::Transferring
             )
     }
+    #[allow(dead_code, reason = "개발용 NTFS 도우미 GUI 대조의 수집 건수")]
     pub fn progress(&self) -> crate::scanner::ScanProgress {
         self.progress.lock().unwrap().counts
     }
