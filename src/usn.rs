@@ -196,41 +196,94 @@ fn unavailable_reason(error: &io::Error) -> Option<UnavailableReason> {
         _ => None,
     }
 }
-fn confirmed_missing(source: &mut impl Source, path: &Path) -> io::Result<bool> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("조회 대상의 부모가 없습니다"))?;
-    let entries = source.list(parent).map_err(|e| context(parent, e))?;
-    if entries.iter().any(|p| p.parent() != Some(parent)) {
-        return Err(invalid("삭제 재확인의 부모 경로 오류"));
+enum Presence<T> {
+    Present(T),
+    Missing(PathBuf),
+}
+
+fn confirmed_missing(
+    source: &mut impl Source,
+    root: &Path,
+    path: &Path,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<Option<PathBuf>> {
+    let mut missing = path;
+    loop {
+        crate::output::check(cancelled)?;
+        let parent = missing
+            .parent()
+            .filter(|parent| parent.starts_with(root))
+            .ok_or_else(|| invalid("삭제 재확인 중 추적 범위를 벗어났습니다"))?;
+        let entries = match source.list(parent) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && parent != root => {
+                missing = parent;
+                continue;
+            }
+            Err(e) => return Err(context(parent, e)),
+        };
+        crate::output::check(cancelled)?;
+        let mut present = false;
+        for entry in entries {
+            if entry.parent() != Some(parent) {
+                return Err(invalid("삭제 재확인의 부모 경로 오류"));
+            }
+            present |= entry == missing;
+        }
+        return if present {
+            Ok(None)
+        } else {
+            Ok(Some(
+                missing
+                    .strip_prefix(root)
+                    .map_err(|_| invalid("삭제 재확인 중 추적 범위를 벗어났습니다"))?
+                    .to_owned(),
+            ))
+        };
     }
-    Ok(!entries.iter().any(|p| p == path))
 }
 fn context(path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
-fn inspect_present(
-    source: &mut impl Source,
+fn read_present<S: Source, T>(
+    source: &mut S,
+    root: &Path,
     path: &Path,
-    detailed: bool,
-) -> io::Result<Option<crate::ntfs::Info>> {
-    match source.inspect(path, detailed) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if confirmed_missing(source, path)? {
-                return Ok(None);
-            }
-            // 삭제·재생성 경합에서 부모가 이름을 확인한 경우에만 한 번 재조회.
-            match source.inspect(path, detailed) {
-                Err(e)
-                    if e.kind() == io::ErrorKind::NotFound && confirmed_missing(source, path)? =>
-                {
-                    Ok(None)
-                }
-                value => value.map(Some),
-            }
+    cancelled: &impl Fn() -> bool,
+    read: impl Fn(&mut S, &Path) -> io::Result<T>,
+) -> io::Result<Presence<T>> {
+    let first = read(source, path);
+    if path != root
+        && first
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    {
+        if let Some(missing) = confirmed_missing(source, root, path, cancelled)? {
+            return Ok(Presence::Missing(missing));
         }
-        value => value.map(Some),
+        // 가까운 상위 폴더가 여전히 이름을 보고한 경우에만 한 번 재조회.
+        match read(source, path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(missing) = confirmed_missing(source, root, path, cancelled)? {
+                    return Ok(Presence::Missing(missing));
+                }
+                Err(e)
+            }
+            value => value.map(Presence::Present),
+        }
+    } else {
+        first.map(Presence::Present)
     }
+}
+
+fn remove_missing(
+    nodes: &mut entries::Entries,
+    unavailable: &mut edit::Issues,
+    missing: &Path,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<()> {
+    nodes.remove_subtree(missing, false, cancelled)?;
+    unavailable.remove_subtree(missing, cancelled)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -629,9 +682,16 @@ impl Index {
         let mut pending = vec![relative.to_owned()];
         while let Some(parent) = pending.pop() {
             crate::output::check(cancelled)?;
+            if !nodes.contains_key(&parent) {
+                continue;
+            }
             let absolute = root.join(&parent);
-            let children = match source.list(&absolute) {
-                Ok(v) => v,
+            let children = match read_present(source, root, &absolute, cancelled, Source::list) {
+                Ok(Presence::Present(children)) => children,
+                Ok(Presence::Missing(path)) => {
+                    remove_missing(nodes, unavailable, &path, cancelled)?;
+                    continue;
+                }
                 Err(e) if !parent.as_os_str().is_empty() && unavailable_reason(&e).is_some() => {
                     Self::exclude(
                         &parent,
@@ -655,9 +715,17 @@ impl Index {
                     .strip_prefix(root)
                     .map_err(|_| invalid("추적 범위 밖 항목"))?
                     .to_owned();
-                let info = match inspect_present(source, &path, detailed) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => continue,
+                let info = match read_present(source, root, &path, cancelled, |source, path| {
+                    source.inspect(path, detailed)
+                }) {
+                    Ok(Presence::Present(info)) => info,
+                    Ok(Presence::Missing(missing)) => {
+                        remove_missing(nodes, unavailable, &missing, cancelled)?;
+                        if parent.starts_with(&missing) {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(e) if unavailable_reason(&e).is_some() => {
                         Self::exclude(
                             &rel,
@@ -983,7 +1051,7 @@ impl Index {
             directories.dedup();
             let mut batch = std::mem::take(&mut directories).into_iter();
             let mut rechecking = false;
-            while let Some(directory) = batch.next() {
+            'parents: while let Some(directory) = batch.next() {
                 crate::output::check(cancelled)?;
                 if !next
                     .get(&directory)
@@ -997,13 +1065,12 @@ impl Index {
                     continue;
                 }
                 let absolute = self.root.join(&directory);
-                let observed = if directory.as_os_str().is_empty() {
-                    source.inspect(&absolute, false).map(Some)
-                } else {
-                    inspect_present(source, &absolute, false)
-                };
+                let inspect_directory =
+                    |source: &mut _, path: &Path| Source::inspect(source, path, false);
+                let observed =
+                    read_present(source, &self.root, &absolute, cancelled, inspect_directory);
                 let info = match observed {
-                    Ok(Some(v)) => v,
+                    Ok(Presence::Present(info)) => info,
                     Err(e)
                         if !directory.as_os_str().is_empty()
                             && unavailable_reason(&e).is_some() =>
@@ -1019,9 +1086,8 @@ impl Index {
                         )?;
                         continue;
                     }
-                    Ok(None) => {
-                        next.remove_subtree(&directory, false, cancelled)?;
-                        unavailable.remove_subtree(&directory, cancelled)?;
+                    Ok(Presence::Missing(missing)) => {
+                        remove_missing(next, unavailable, &missing, cancelled)?;
                         continue;
                     }
                     Err(e) => return Err(context(&absolute, e)),
@@ -1072,13 +1138,14 @@ impl Index {
                     }
                     Err(e) => return Err(context(&absolute, e)),
                 };
-                let verified = if directory.as_os_str().is_empty() {
-                    source.inspect(&absolute, false).map(Some)
-                } else {
-                    inspect_present(source, &absolute, false)
-                };
+                let verified =
+                    read_present(source, &self.root, &absolute, cancelled, inspect_directory);
                 let after = match verified {
-                    Ok(info) => info.map(Node::from_info).transpose()?,
+                    Ok(Presence::Present(info)) => Node::from_info(info)?,
+                    Ok(Presence::Missing(missing)) => {
+                        remove_missing(next, unavailable, &missing, cancelled)?;
+                        continue;
+                    }
                     Err(e)
                         if !directory.as_os_str().is_empty()
                             && unavailable_reason(&e).is_some() =>
@@ -1096,9 +1163,7 @@ impl Index {
                     }
                     Err(e) => return Err(context(&absolute, e)),
                 };
-                if after.as_ref().is_none_or(|value| {
-                    value.id != next[&directory].id || !value.dir() || value.excluded()
-                }) {
+                if after.id != next[&directory].id || !after.dir() || after.excluded() {
                     attempted.remove(&directory);
                     recheck_directory_parent(
                         &directory,
@@ -1109,7 +1174,7 @@ impl Index {
                     rechecking = true;
                     break;
                 }
-                next.insert(directory.clone(), after.unwrap())?;
+                next.insert(directory.clone(), after)?;
                 unavailable.remove(&directory)?;
                 let mut seen = HashSet::new();
                 for path in children {
@@ -1127,26 +1192,33 @@ impl Index {
                     {
                         continue;
                     }
-                    let info = match inspect_present(source, &path, self.detailed) {
-                        Ok(Some(v)) => v,
-                        Err(e) if unavailable_reason(&e).is_some() => {
-                            Self::exclude(
-                                &rel,
-                                unavailable_reason(&e).unwrap(),
-                                false,
-                                now,
-                                next,
-                                unavailable,
-                                cancelled,
-                            )?;
-                            continue;
-                        }
-                        Ok(None) => {
-                            seen.remove(&rel);
-                            continue;
-                        }
-                        Err(e) => return Err(context(&path, e)),
-                    };
+                    let info =
+                        match read_present(source, &self.root, &path, cancelled, |source, path| {
+                            source.inspect(path, self.detailed)
+                        }) {
+                            Ok(Presence::Present(info)) => info,
+                            Err(e) if unavailable_reason(&e).is_some() => {
+                                Self::exclude(
+                                    &rel,
+                                    unavailable_reason(&e).unwrap(),
+                                    false,
+                                    now,
+                                    next,
+                                    unavailable,
+                                    cancelled,
+                                )?;
+                                continue;
+                            }
+                            Ok(Presence::Missing(missing)) => {
+                                remove_missing(next, unavailable, &missing, cancelled)?;
+                                if directory.starts_with(&missing) {
+                                    continue 'parents;
+                                }
+                                seen.remove(&rel);
+                                continue;
+                            }
+                            Err(e) => return Err(context(&path, e)),
+                        };
                     let node = Node::from_info(info)?;
                     if replacements
                         .get(&rel)
@@ -1186,6 +1258,9 @@ impl Index {
                             next,
                             unavailable,
                         )?;
+                        if !next.contains_key(&directory) {
+                            continue 'parents;
+                        }
                     }
                 }
                 let removed: Vec<_> = next
@@ -1217,8 +1292,14 @@ impl Index {
                         continue;
                     }
                     let absolute = self.root.join(&path);
-                    let info = match inspect_present(source, &absolute, self.detailed) {
-                        Ok(Some(v)) => v,
+                    let info = match read_present(
+                        source,
+                        &self.root,
+                        &absolute,
+                        cancelled,
+                        |source, path| source.inspect(path, self.detailed),
+                    ) {
+                        Ok(Presence::Present(info)) => info,
                         Err(e) if unavailable_reason(&e).is_some() => {
                             Self::exclude(
                                 &path,
@@ -1231,9 +1312,8 @@ impl Index {
                             )?;
                             continue;
                         }
-                        Ok(None) => {
-                            next.remove_subtree(&path, false, cancelled)?;
-                            unavailable.remove_subtree(&path, cancelled)?;
+                        Ok(Presence::Missing(missing)) => {
+                            remove_missing(next, unavailable, &missing, cancelled)?;
                             continue;
                         }
                         Err(e) => return Err(context(&absolute, e)),
@@ -1462,6 +1542,7 @@ mod tests {
         replace_on_read: Vec<(PathBuf, u64, u64)>,
         list_budget: HashMap<PathBuf, usize>,
         move_on_list: Option<(PathBuf, PathBuf, PathBuf)>,
+        move_on_inspect: Option<(PathBuf, PathBuf, PathBuf)>,
         cancel_on_list: Option<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>,
         identity_alias: Option<(PathBuf, u64)>,
         replace_directory_on_inspect: Option<PathBuf>,
@@ -1507,6 +1588,15 @@ mod tests {
         }
         fn inspect(&mut self, path: &Path, detailed: bool) -> io::Result<crate::ntfs::Info> {
             self.queries.push(path.to_owned());
+            if self
+                .move_on_inspect
+                .as_ref()
+                .is_some_and(|(trigger, _, _)| trigger == path)
+            {
+                let (_, before, after) = self.move_on_inspect.take().unwrap();
+                fs::rename(before, after)?;
+                return Err(io::Error::from_raw_os_error(2));
+            }
             if self.redirected.contains(path) {
                 return Err(io::Error::other(RedirectedDirectory));
             }
@@ -1645,6 +1735,7 @@ mod tests {
                 replace_on_read: vec![],
                 list_budget: HashMap::new(),
                 move_on_list: None,
+                move_on_inspect: None,
                 cancel_on_list: None,
                 identity_alias: None,
                 replace_directory_on_inspect: None,
@@ -2298,6 +2389,93 @@ mod tests {
             .validate(&after.scan)
             .unwrap();
     }
+    #[test]
+    fn initial_collection_continues_after_the_listed_files_parent_disappears() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let removed = scope.join("updater");
+        let file = removed.join("version/racing.bin");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"12345").unwrap();
+        fs::create_dir(scope.join("updater-keep")).unwrap();
+        fs::write(scope.join("updater-keep/keep.bin"), b"123").unwrap();
+        f.move_on_inspect = Some((file, removed, f.root.join("outside")));
+
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders.len(), 2);
+        assert_eq!(record.scan.files.len(), 1);
+        assert_eq!(record.scan.files[0].name, "keep.bin");
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+        assert_eq!(record.scan.error_count, 0);
+        record
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&record.scan)
+            .unwrap();
+    }
+
+    #[test]
+    fn refresh_discards_an_absent_subtree_only_after_an_uncancelled_recheck() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let removed = scope.join("updater");
+        let folder = removed.join("version");
+        let file = folder.join("racing.bin");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(&file, b"12345").unwrap();
+        fs::write(folder.join("sibling.bin"), b"1234567").unwrap();
+        fs::write(scope.join("keep.bin"), b"123").unwrap();
+        let parent_id = f.id(&folder);
+        let file_id = f.id(&file);
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let before = index.snapshot(&|| false).unwrap();
+        assert_eq!(before.scan.folders[0].logical_bytes, 15);
+        f.event(file_id, parent_id, 0x80000001);
+        f.move_on_inspect = Some((file, removed, f.root.join("outside")));
+        let cancel = Arc::new(AtomicBool::new(false));
+        f.cancel_on_list = Some((scope, Arc::clone(&cancel)));
+        let error = index
+            .refresh(&mut f, &|| cancel.load(Ordering::Relaxed))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let cancelled = index.snapshot(&|| false).unwrap();
+        assert_eq!(cancelled.tracking, before.tracking);
+        assert!(Arc::ptr_eq(&cancelled.scan, &before.scan));
+
+        f.cancel_on_list = None;
+        assert!(index.refresh(&mut f, &|| false).unwrap());
+        let after = index.snapshot(&|| false).unwrap();
+        assert_eq!(after.scan.folders[0].logical_bytes, 3);
+        assert_eq!(after.scan.folders.len(), 1);
+        assert_eq!(after.scan.files.len(), 1);
+        assert_eq!(after.scan.files[0].name, "keep.bin");
+        after
+            .tracking
+            .as_ref()
+            .unwrap()
+            .validate(&after.scan)
+            .unwrap();
+    }
+
+    #[test]
+    fn initial_collection_skips_a_directory_removed_before_listing() {
+        let mut f = Fixture::new();
+        let scope = f.root.join("scope");
+        let pending = scope.join("pending");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("racing.bin"), b"12345").unwrap();
+        fs::write(scope.join("keep.bin"), b"123").unwrap();
+        f.move_on_list = Some((pending.clone(), pending, f.root.join("outside")));
+        let mut index = Index::begin(&scope, true, &mut f, &|| false).unwrap();
+        let record = index.snapshot(&|| false).unwrap();
+        assert_eq!(record.scan.folders.len(), 1);
+        assert_eq!(record.scan.files.len(), 1);
+        assert_eq!(record.scan.folders[0].logical_bytes, 3);
+    }
+
     #[test]
     fn transient_not_found_is_reconfirmed_once_when_the_parent_still_lists_the_name() {
         let mut f = Fixture::new();
