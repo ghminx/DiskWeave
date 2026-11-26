@@ -2015,6 +2015,21 @@ impl DiskWeaveApp {
             || self.root_replacement.is_some();
         let editing = ctx.egui_wants_keyboard_input();
         let busy = self.scan.is_running() || self.file_blocked() || self.results.busy();
+        if !popup && !busy && !self.inline_search.visible {
+            let direction = ctx.input(|input| {
+                if input.pointer.button_pressed(egui::PointerButton::Extra1) {
+                    Some(false)
+                } else if input.pointer.button_pressed(egui::PointerButton::Extra2) {
+                    Some(true)
+                } else {
+                    None
+                }
+            });
+            if let Some(forward) = direction {
+                self.history_move(forward);
+                return;
+            }
+        }
         let action = ctx.input_mut(|i| {
             let found = i.events.iter().find_map(|event| match event {
                 egui::Event::Key {
@@ -2786,6 +2801,7 @@ impl DiskWeaveApp {
                                 egui::Sense::click(),
                             )
                             .clicked()
+                            || response.double_clicked()
                         {
                             toggle = Some(folder);
                         }
@@ -2880,7 +2896,7 @@ impl DiskWeaveApp {
                 }
             });
         ui.add_space(5.0);
-        ui.small("   화살표를 눌러 펼쳐 보세요.");
+        ui.small("   화살표 또는 폴더 더블클릭으로 펼치기");
         if let Some(folder) = toggle {
             explorer.toggle_folder(&source.scan, folder);
         }
@@ -5397,6 +5413,95 @@ mod session_tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn mouse_buttons_follow_history_and_double_click_expands_the_tree() {
+        let fixture = crate::duplicates::tests::Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("child/grandchild")).unwrap();
+        std::fs::create_dir(fixture.0.join("sibling")).unwrap();
+        let mut app = DiskWeaveApp::new();
+        app.scan.start(fixture.0.clone()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.scan.is_running() {
+            app.sync_scan();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let source = app.source().unwrap();
+        let child = source
+            .scan
+            .folder_index(std::path::Path::new("child"))
+            .unwrap();
+        let sibling = source
+            .scan
+            .folder_index(std::path::Path::new("sibling"))
+            .unwrap();
+        app.navigate(sibling, false);
+
+        let ctx = egui::Context::default();
+        crate::ui_style::apply(&ctx);
+        let render = |app: &mut DiskWeaveApp, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.tree(ui);
+                    app.navigation_shortcuts(ui.ctx());
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let mut draw = |events| render(&mut app, events);
+        draw(Vec::new());
+        let pos = visible_text(&draw(Vec::new()), "child").unwrap().center();
+        let once = click_at(&mut draw, pos);
+        assert!(visible_text(&once, "grandchild").is_none());
+        click_at(&mut draw, pos);
+        assert!(visible_text(&draw(Vec::new()), "grandchild").is_some());
+        for (button, folder) in [
+            (egui::PointerButton::Extra1, sibling),
+            (egui::PointerButton::Extra2, child),
+        ] {
+            render(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(app.explorer.as_ref().unwrap().folder(), folder);
+            render(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        let mut draw_navigation = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.center(ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        draw_navigation(Vec::new());
+        let frame = draw_navigation(Vec::new());
+        let y = visible_text(&frame, "현재 폴더").unwrap().center().y;
+        click_at(&mut draw_navigation, egui::pos2(113.0, y));
+        assert_eq!(app.explorer.as_ref().unwrap().folder(), 0);
     }
 
     #[test]
