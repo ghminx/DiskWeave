@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.6/DiskWeave-0.1.6-windows-x64-preview.zip"><strong>Download for Windows</strong></a>
+  <a href="https://github.com/ghminx/DiskWeave/releases/download/v0.1.7/DiskWeave-0.1.7-windows-x64-preview.zip"><strong>Download for Windows</strong></a>
   · <a href="#getting-started">Getting Started</a>
   · <a href="docs/portable-readme.md">User Guide</a>
-  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.6">Release Notes</a>
+  · <a href="https://github.com/ghminx/DiskWeave/releases/tag/v0.1.7">Release Notes</a>
 </p>
 
 <p align="center"><sub>Windows 10/11 x64 · 설치 없이 실행하는 Portable ZIP</sub></p>
@@ -40,7 +40,7 @@
 
 ## Preview Notes
 
-v0.1.6는 개발 PC에서 ZIP을 풀어 실행과 재시작을 확인한 프리뷰입니다. 다른 Windows PC에서의 실행은 아직 확인하지 않았습니다. 실행 파일은 미서명 상태이며, Windows 11의 Smart App Control 설정에 따라 실행이 차단될 수 있습니다. [v0.1.6 릴리스 노트](https://github.com/ghminx/DiskWeave/releases/tag/v0.1.6)
+v0.1.7는 개발 PC에서 ZIP을 풀어 실행과 재시작을 확인한 프리뷰입니다. 다른 Windows PC에서의 실행은 아직 확인하지 않았습니다. 실행 파일은 미서명 상태이며, Windows 11의 Smart App Control 설정에 따라 실행이 차단될 수 있습니다. [v0.1.7 릴리스 노트](https://github.com/ghminx/DiskWeave/releases/tag/v0.1.7)
 
 ## Build from Source
 
